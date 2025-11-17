@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """
-STL -> voxel C3D8R hex mesh -> global CalculiX .inp job (layered build skeleton)
-+ optional run of CalculiX.
+STL -> voxel C3D8R/DC3D8 hex mesh -> thermal + mechanical CalculiX jobs
++ optional FFD deformation of the original STL (forward + pre-deformed)
++ optional lattice visualization as PLY point clouds.
 
-Simple layered thermal simulation:
-  - Each voxel Z-layer becomes one "printed" layer.
-  - For each layer we:
-      * Activate that layer's elements (MODEL CHANGE, ADD).
-      * Keep previously activated layers "solid".
-      * Apply a constant heat flux on the top face of that layer.
-      * Hold the base nodes at fixed temperature.
+Pipeline:
+
+1. Voxelize input STL into cubes of size cube_size.
+2. Build global hex mesh:
+   - thermal job: DC3D8, per-slice heating
+   - mechanical job: C3D8R, reads temps from thermal .frd, computes U
+3. If --run-ccx:
+   - run thermal job -> <job_name>_therm.frd
+   - run mech job    -> <job_name>_mech.frd
+   - read nodal displacements from mech .frd
+   - treat voxel node grid as FFD lattice
+   - forward:  deform input STL -> <job_name>_deformed.stl
+   - inverse: pre-deform input STL -> <job_name>_deformed_pre.stl
+   - if --export-lattice:
+        * <job_name>_lattice_orig.ply  (original lattice nodes)
+        * <job_name>_lattice_def.ply   (deformed lattice nodes)
 """
 
 import argparse
@@ -139,6 +149,7 @@ def _write_id_list_lines(f, ids: List[int], per_line: int = 16):
         chunk = ids[i:i + per_line]
         f.write(", ".join(str(x) for x in chunk) + "\n")
 
+
 def write_calculix_job(
     path: str,
     vertices: List[Tuple[float, float, float]],
@@ -155,9 +166,6 @@ def write_calculix_job(
       - ELSET per slice
       - base held at base_temp
       - each step: steady-state HEAT TRANSFER, heat only one slice via DFLUX.
-
-    This avoids mechanical DOFs and is robust even for finer voxel sizes
-    and disconnected components.
     """
     n_nodes = len(vertices)
     n_elems = len(hexes)
@@ -259,6 +267,7 @@ def write_calculix_job(
     print(f"[CCX] Wrote CalculiX job to: {path}")
     print(f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, slices: {len(z_slices)}")
 
+
 def write_mechanical_job(
     path: str,
     vertices: List[Tuple[float, float, float]],
@@ -357,6 +366,10 @@ def write_mechanical_job(
     print(f"[CCX] Wrote mechanical job to: {path}")
 
 
+# ============================================================
+#  CalculiX runner
+# ============================================================
+
 def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
     """
     Run CalculiX on given job (job_name without .inp).
@@ -385,23 +398,482 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
 
 
 # ============================================================
+#  FRD parsing + FFD helpers
+# ============================================================
+
+def read_frd_displacements(frd_path: str) -> Dict[int, np.ndarray]:
+    """
+    Very simple ASCII .frd parser that extracts the LAST displacement dataset.
+
+    Assumes a nodal results block like:
+
+        -4  DISP        3    1 ...
+        -5  D1 ...
+        -5  D2 ...
+        -5  D3 ...
+        -1  node  ux  uy  uz
+        ...
+        -3
+    """
+    if not os.path.isfile(frd_path):
+        print(f"[FRD] File not found: {frd_path}")
+        return {}
+
+    disp: Dict[int, np.ndarray] = {}
+    state = "search"
+
+    print(f"[FRD] Parsing displacements from: {frd_path}")
+
+    with open(frd_path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw_line in f:
+            line = raw_line.rstrip("\n")
+            stripped = line.lstrip()
+            if not stripped:
+                continue
+
+            if state == "search":
+                if stripped.startswith("-4") and ("DISP" in line or " U " in line or " U" in line):
+                    state = "in_header"
+                continue
+
+            elif state == "in_header":
+                s = stripped
+                if s.startswith("-1"):
+                    state = "in_data"
+                elif s.startswith("-3"):
+                    state = "search"
+                continue
+
+            if state == "in_data":
+                s = stripped
+                if s.startswith("-1"):
+                    parts = s.split()
+                    if len(parts) >= 5:
+                        try:
+                            nid = int(parts[1])
+                            ux = float(parts[2])
+                            uy = float(parts[3])
+                            uz = float(parts[4])
+                            disp[nid] = np.array([ux, uy, uz], dtype=float)
+                        except ValueError:
+                            pass
+                elif s.startswith("-3"):
+                    state = "search"
+                else:
+                    continue
+
+    print(f"[FRD] Parsed displacement data for {len(disp)} nodes.")
+    return disp
+
+
+def build_voxel_lattice_from_vertices(
+    vertices: List[Tuple[float, float, float]],
+    cube_size: float,
+):
+    """
+    Reconstruct a regular voxel lattice from the voxel node coordinates.
+
+    Returns:
+        origin: (x_min, y_min, z_min)  of lattice
+        node_map: Dict[(I,J,K) -> node_id]
+        nx_cells, ny_cells, nz_cells: number of voxel cells along each axis
+    """
+    coords = np.array(vertices, dtype=float)
+    x_min = float(coords[:, 0].min())
+    y_min = float(coords[:, 1].min())
+    z_min = float(coords[:, 2].min())
+
+    node_map: Dict[Tuple[int, int, int], int] = {}
+    imax = jmax = kmax = 0
+
+    inv_h = 1.0 / float(cube_size)
+
+    for nid, (x, y, z) in enumerate(vertices, start=1):
+        ix = int(round((x - x_min) * inv_h))
+        iy = int(round((y - y_min) * inv_h))
+        iz = int(round((z - z_min) * inv_h))
+
+        node_map[(ix, iy, iz)] = nid
+        if ix > imax:
+            imax = ix
+        if iy > jmax:
+            jmax = iy
+        if iz > kmax:
+            kmax = iz
+
+    nx_cells = max(imax, 1)
+    ny_cells = max(jmax, 1)
+    nz_cells = max(kmax, 1)
+
+    print(
+        "[FFD] Voxel lattice: nodes (0..{}, 0..{}, 0..{}), cells: {} x {} x {}".format(
+            imax, jmax, kmax, nx_cells, ny_cells, nz_cells
+        )
+    )
+
+    origin = (x_min, y_min, z_min)
+    return origin, node_map, nx_cells, ny_cells, nz_cells
+
+
+def deform_point_trilinear(
+    p: np.ndarray,
+    origin: Tuple[float, float, float],
+    cube_size: float,
+    node_map: Dict[Tuple[int, int, int], int],
+    nx_cells: int,
+    ny_cells: int,
+    nz_cells: int,
+    displacements: Dict[int, np.ndarray],
+) -> Tuple[np.ndarray, bool]:
+    """
+    Given a point p in world coordinates, compute its displacement
+    by trilinear interpolation from voxel lattice node displacements.
+
+    Returns:
+        (u, has_data):
+            u        - interpolated displacement
+            has_data - True if at least one lattice corner contributed
+    """
+    x_min, y_min, z_min = origin
+    h = float(cube_size)
+
+    rx = (p[0] - x_min) / h
+    ry = (p[1] - y_min) / h
+    rz = (p[2] - z_min) / h
+
+    eps = 1e-6
+    rx = max(0.0, min(rx, nx_cells - eps))
+    ry = max(0.0, min(ry, ny_cells - eps))
+    rz = max(0.0, min(rz, nz_cells - eps))
+
+    ix = int(np.floor(rx))
+    iy = int(np.floor(ry))
+    iz = int(np.floor(rz))
+
+    xi = rx - ix
+    eta = ry - iy
+    zeta = rz - iz
+
+    corners = [
+        (ix,     iy,     iz),
+        (ix + 1, iy,     iz),
+        (ix,     iy + 1, iz),
+        (ix + 1, iy + 1, iz),
+        (ix,     iy,     iz + 1),
+        (ix + 1, iy,     iz + 1),
+        (ix,     iy + 1, iz + 1),
+        (ix + 1, iy + 1, iz + 1),
+    ]
+
+    w000 = (1 - xi) * (1 - eta) * (1 - zeta)
+    w100 = xi       * (1 - eta) * (1 - zeta)
+    w010 = (1 - xi) * eta       * (1 - zeta)
+    w110 = xi       * eta       * (1 - zeta)
+    w001 = (1 - xi) * (1 - eta) * zeta
+    w101 = xi       * (1 - eta) * zeta
+    w011 = (1 - xi) * eta       * zeta
+    w111 = xi       * eta       * zeta
+    weights = [w000, w100, w010, w110, w001, w101, w011, w111]
+
+    u = np.zeros(3, dtype=float)
+    used_weight_sum = 0.0
+
+    for (ijk, w) in zip(corners, weights):
+        nid = node_map.get(ijk)
+        if nid is None:
+            continue
+        u_n = displacements.get(nid)
+        if u_n is None:
+            continue
+        u += w * u_n
+        used_weight_sum += w
+
+    if used_weight_sum > 0.0:
+        u /= used_weight_sum
+        return u, True
+    else:
+        return u, False
+
+
+def make_nearest_displacement_func(
+    vertices: List[Tuple[float, float, float]],
+    displacements: Dict[int, np.ndarray],
+):
+    """
+    Prepare a simple nearest-node displacement lookup.
+
+    Returns:
+        nearest_disp(p: np.ndarray) -> np.ndarray
+    """
+    if not displacements:
+        def zero_disp(_p: np.ndarray) -> np.ndarray:
+            return np.zeros(3, dtype=float)
+        return zero_disp
+
+    node_ids = np.array(sorted(displacements.keys()), dtype=int)
+    node_coords = np.array([vertices[nid - 1] for nid in node_ids], dtype=float)
+    node_u = np.array([displacements[nid] for nid in node_ids], dtype=float)
+
+    def nearest_disp(p: np.ndarray) -> np.ndarray:
+        diff = node_coords - p
+        dist2 = np.einsum("ij,ij->i", diff, diff)
+        idx = int(np.argmin(dist2))
+        return node_u[idx]
+
+    return nearest_disp
+
+
+def inverse_deform_point_fixedpoint(
+    p_target: np.ndarray,
+    origin: Tuple[float, float, float],
+    cube_size: float,
+    node_map: Dict[Tuple[int, int, int], int],
+    nx_cells: int,
+    ny_cells: int,
+    nz_cells: int,
+    displacements: Dict[int, np.ndarray],
+    nearest_disp,
+    max_iter: int = 15,
+    tol: float = 1e-4,
+) -> np.ndarray:
+    """
+    Given a target point p_target (desired *deformed* position),
+    find q such that q + u(q) ≈ p_target using fixed-point iteration:
+
+        q_{k+1} = q_k - (q_k + u(q_k) - p_target)
+
+    u(q) is obtained via trilinear interpolation with nearest-node fallback.
+    """
+    q = p_target.copy()
+
+    for _ in range(max_iter):
+        u_q, has_data = deform_point_trilinear(
+            q,
+            origin,
+            cube_size,
+            node_map,
+            nx_cells,
+            ny_cells,
+            nz_cells,
+            displacements,
+        )
+        if not has_data:
+            u_q = nearest_disp(q)
+
+        f_q = q + u_q
+        r = f_q - p_target
+        norm_r = np.linalg.norm(r)
+        if norm_r < tol:
+            break
+        q = q - r
+
+    return q
+
+
+# ============================================================
+#  Lattice visualization (two separate PLYs)
+# ============================================================
+
+def export_lattice_ply_split(
+    vertices: List[Tuple[float, float, float]],
+    displacements: Dict[int, np.ndarray],
+    orig_path: str,
+    def_path: str,
+    max_points: int = 20000,
+):
+    """
+    Export lattice as two PLY point clouds:
+
+        - orig_path : original lattice node positions
+        - def_path  : deformed lattice node positions
+
+    Both are ASCII PLY files of points (no colors, easy to view in ParaView).
+    """
+    if not vertices:
+        print("[PLY] No vertices, skipping lattice export.")
+        return
+
+    if not orig_path and not def_path:
+        return
+
+    verts = np.array(vertices, dtype=float)
+    n_nodes = verts.shape[0]
+
+    # Build full displacement array (zero where missing)
+    disp_arr = np.zeros_like(verts)
+    for nid, u in displacements.items():
+        if 1 <= nid <= n_nodes:
+            disp_arr[nid - 1] = u
+
+    original_points = verts
+    deformed_points = verts + disp_arr
+
+    # Subsample if too many points
+    def maybe_subsample(points):
+        total = points.shape[0]
+        if total > max_points:
+            step = int(np.ceil(total / max_points))
+            idx = np.arange(0, total, step, dtype=int)
+            return points[idx]
+        return points
+
+    original_points = maybe_subsample(original_points)
+    deformed_points = maybe_subsample(deformed_points)
+
+    if orig_path:
+        with open(orig_path, "w", encoding="utf-8") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {original_points.shape[0]}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("end_header\n")
+            for x, y, z in original_points:
+                f.write(f"{x} {y} {z}\n")
+        print(f"[PLY] Original lattice written to: {orig_path}")
+
+    if def_path:
+        with open(def_path, "w", encoding="utf-8") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {deformed_points.shape[0]}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("end_header\n")
+            for x, y, z in deformed_points:
+                f.write(f"{x} {y} {z}\n")
+        print(f"[PLY] Deformed lattice written to: {def_path}")
+
+
+# ============================================================
+#  STL deformation (forward + pre-deformed)
+# ============================================================
+
+def deform_input_stl_with_frd(
+    input_stl: str,
+    mech_frd_path: str,
+    vertices: List[Tuple[float, float, float]],
+    cube_size: float,
+    output_stl: str,
+    lattice_basepath: str = None,
+):
+    """
+    Full pipeline:
+
+      - Read displacements from mechanical .frd
+      - Optionally export lattice as two PLYs:
+            lattice_basepath + "_orig.ply"
+            lattice_basepath + "_def.ply"
+      - Build structured voxel lattice from 'vertices'
+      - Build nearest-node fallback displacement
+      - Load original STL (can be arbitrary shape)
+      - For each STL vertex:
+          * forward deformation -> deformed STL
+          * inverse map -> pre-deformed STL
+      - Save both STLs
+    """
+    displacements = read_frd_displacements(mech_frd_path)
+    if not displacements:
+        print("[FFD] No displacements found, skipping STL deformation.")
+        return
+
+    print(f"[FFD] Displacements available for {len(displacements)} nodes "
+          f"out of {len(vertices)} total.")
+
+    # Optional lattice export (original + deformed nodes as separate PLYs)
+    if lattice_basepath:
+        orig_ply = lattice_basepath + "_orig.ply"
+        def_ply = lattice_basepath + "_def.ply"
+        export_lattice_ply_split(vertices, displacements, orig_ply, def_ply)
+
+    origin, node_map, nx_cells, ny_cells, nz_cells = build_voxel_lattice_from_vertices(
+        vertices,
+        cube_size,
+    )
+
+    nearest_disp = make_nearest_displacement_func(vertices, displacements)
+
+    mesh = trimesh.load(input_stl)
+    if not isinstance(mesh, trimesh.Trimesh):
+        if isinstance(mesh, trimesh.Scene):
+            mesh = trimesh.util.concatenate(mesh.dump())
+        else:
+            print("[FFD] Could not load input STL mesh, aborting deformation.")
+            return
+
+    orig_verts = mesh.vertices.copy()
+    n_verts = orig_verts.shape[0]
+    print(f"[FFD] Deforming input STL with {n_verts} vertices ...")
+
+    # Forward deformation: p' = p + u(p)
+    deformed_verts = orig_verts.copy()
+    for i in range(n_verts):
+        p = orig_verts[i]
+        u, has_data = deform_point_trilinear(
+            p,
+            origin,
+            cube_size,
+            node_map,
+            nx_cells,
+            ny_cells,
+            nz_cells,
+            displacements,
+        )
+        if not has_data:
+            u = nearest_disp(p)
+        deformed_verts[i] = p + u
+
+    mesh.vertices = deformed_verts
+    mesh.export(output_stl)
+    print(f"[FFD] Deformed STL written to: {output_stl}")
+
+    # Inverse deformation: find q so that q + u(q) ≈ p_original
+    predeformed_verts = orig_verts.copy()
+    print("[FFD] Computing pre-deformed STL (inverse FFD) ...")
+
+    for i in range(n_verts):
+        p_target = orig_verts[i]
+        q = inverse_deform_point_fixedpoint(
+            p_target,
+            origin,
+            cube_size,
+            node_map,
+            nx_cells,
+            ny_cells,
+            nz_cells,
+            displacements,
+            nearest_disp=nearest_disp,
+        )
+        predeformed_verts[i] = q
+
+    predeformed_path = os.path.splitext(output_stl)[0] + "_pre.stl"
+    mesh.vertices = predeformed_verts
+    mesh.export(predeformed_path)
+    print(f"[FFD] Pre-deformed STL written to: {predeformed_path}")
+
+
+# ============================================================
 #  CLI
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Voxelize an STL and generate a single global CalculiX .inp job "
-            "with C3D8R hexahedra and layer-by-layer steady-state "
-            "heat-transfer steps (MODEL CHANGE + DFLUX)."
+            "Voxelize an STL and generate thermal + mechanical CalculiX jobs "
+            "with C3D8R/DC3D8 hexahedra and layer-by-layer steady-state "
+            "heat-transfer steps, then deform the input STL using the "
+            "mechanical displacements as an FFD lattice (forward + pre-deformed) "
+            "and optionally export the lattice as separate PLY point clouds."
         )
     )
     parser.add_argument("input_stl", help="Path to input STL file")
     parser.add_argument(
         "job_name",
         help=(
-            "Job name (output .inp will be '<job_name>.inp', "
-            "CalculiX will produce '<job_name>.frd', etc.)"
+            "Base job name (thermal/mech .inp will be '<job_name>_therm.inp' and "
+            "'<job_name>_mech.inp'; CalculiX will produce corresponding .frd)."
         ),
     )
     parser.add_argument(
@@ -426,13 +898,21 @@ def main():
     parser.add_argument(
         "--run-ccx",
         action="store_true",
-        help="If set, run CalculiX on the generated job.",
+        help="If set, run CalculiX on the generated jobs.",
     )
     parser.add_argument(
         "--ccx-cmd",
         default="ccx",
         help="CalculiX executable (default 'ccx'). Example: "
              "'ccx', 'ccx_static', 'C:\\\\path\\\\to\\\\ccx.exe'",
+    )
+    parser.add_argument(
+        "--export-lattice",
+        action="store_true",
+        help=(
+            "Export FFD lattice as '<job_name>_lattice_orig.ply' and "
+            "'<job_name>_lattice_def.ply' point clouds."
+        ),
     )
 
     args = parser.parse_args()
@@ -455,11 +935,11 @@ def main():
         print("No slices generated, aborting.")
         raise SystemExit(1)
 
-    # 2) Thermal job name
+    # 2) Thermal job
     thermal_job = args.job_name + "_therm"
     thermal_inp = thermal_job + ".inp"
 
-    write_calculix_job(  # <- your thermal-only DC3D8 writer
+    write_calculix_job(
         thermal_inp,
         vertices,
         hexes,
@@ -469,7 +949,7 @@ def main():
         heat_flux=args.heat_flux,
     )
 
-    # 3) Mechanical job name
+    # 3) Mechanical job
     mech_job = args.job_name + "_mech"
     mech_inp = mech_job + ".inp"
 
@@ -482,13 +962,31 @@ def main():
         n_slices=n_slices,
     )
 
-    # 4) Optional runs
+    # 4) Optional runs + FFD deformation + lattice export
     if args.run_ccx:
         ok_therm = run_calculix(thermal_job, ccx_cmd=args.ccx_cmd)
         if not ok_therm:
-            print("[RUN] Thermal job failed, skipping mechanical job.")
+            print("[RUN] Thermal job failed, skipping mechanical job and FFD.")
             return
-        run_calculix(mech_job, ccx_cmd=args.ccx_cmd)
+        ok_mech = run_calculix(mech_job, ccx_cmd=args.ccx_cmd)
+        if not ok_mech:
+            print("[RUN] Mechanical job failed, skipping FFD.")
+            return
+
+        mech_frd = mech_job + ".frd"
+        if os.path.isfile(mech_frd):
+            deformed_stl = args.job_name + "_deformed.stl"
+            lattice_basepath = args.job_name + "_lattice" if args.export_lattice else None
+            deform_input_stl_with_frd(
+                args.input_stl,
+                mech_frd,
+                vertices,
+                args.cube_size,
+                deformed_stl,
+                lattice_basepath=lattice_basepath,
+            )
+        else:
+            print(f"[FFD] Mechanical FRD '{mech_frd}' not found, skipping STL deformation.")
 
 
 if __name__ == "__main__":
