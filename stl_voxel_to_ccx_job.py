@@ -403,17 +403,19 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
 
 def read_frd_displacements(frd_path: str) -> Dict[int, np.ndarray]:
     """
-    Very simple ASCII .frd parser that extracts the LAST displacement dataset.
+    Read nodal displacements from a CalculiX .frd file.
 
-    Assumes a nodal results block like:
+    Parses the *DISP dataset in fixed-width format:
 
-        -4  DISP        3    1 ...
-        -5  D1 ...
-        -5  D2 ...
-        -5  D3 ...
-        -1  node  ux  uy  uz
-        ...
-        -3
+        columns:
+          1-2   : code  (should be '-1')
+          4-13  : node id (I10)
+          14-25 : Ux (E12.5)
+          26-37 : Uy (E12.5)
+          38-49 : Uz (E12.5)
+
+    Returns:
+        disp: dict { node_id: np.array([ux, uy, uz]) }
     """
     if not os.path.isfile(frd_path):
         print(f"[FRD] File not found: {frd_path}")
@@ -425,42 +427,47 @@ def read_frd_displacements(frd_path: str) -> Dict[int, np.ndarray]:
     print(f"[FRD] Parsing displacements from: {frd_path}")
 
     with open(frd_path, "r", encoding="utf-8", errors="ignore") as f:
-        for raw_line in f:
-            line = raw_line.rstrip("\n")
+        for line in f:
             stripped = line.lstrip()
             if not stripped:
                 continue
 
             if state == "search":
-                if stripped.startswith("-4") and ("DISP" in line or " U " in line or " U" in line):
+                # Look for the DISP result header
+                if stripped.startswith("-4") and "DISP" in stripped:
                     state = "in_header"
                 continue
 
             elif state == "in_header":
-                s = stripped
-                if s.startswith("-1"):
+                # Skip the -5 D1/D2/D3/ALL lines, go to data at first -1
+                if stripped.startswith("-1"):
                     state = "in_data"
-                elif s.startswith("-3"):
+                elif stripped.startswith("-3"):
+                    # no data after all, go back to search
                     state = "search"
                 continue
 
-            if state == "in_data":
-                s = stripped
-                if s.startswith("-1"):
-                    parts = s.split()
-                    if len(parts) >= 5:
-                        try:
-                            nid = int(parts[1])
-                            ux = float(parts[2])
-                            uy = float(parts[3])
-                            uz = float(parts[4])
-                            disp[nid] = np.array([ux, uy, uz], dtype=float)
-                        except ValueError:
-                            pass
-                elif s.startswith("-3"):
+            elif state == "in_data":
+                # End of this dataset
+                if stripped.startswith("-3"):
                     state = "search"
-                else:
                     continue
+
+                # Only process lines with code -1 in columns 1-3
+                code = line[1:3]
+                if code != "-1":
+                    continue
+
+                try:
+                    nid = int(line[3:13])
+                    ux = float(line[13:25])
+                    uy = float(line[25:37])
+                    uz = float(line[37:49])
+                except ValueError:
+                    # Badly formatted line, skip
+                    continue
+
+                disp[nid] = np.array([ux, uy, uz], dtype=float)
 
     print(f"[FRD] Parsed displacement data for {len(disp)} nodes.")
     return disp
