@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 STL -> voxel C3D8R/DC3D8 hex mesh -> thermal + mechanical CalculiX jobs
-+ optional FFD deformation of the original STL (forward + pre-deformed)
-+ optional lattice visualization as PLY point clouds.
++ FFD deformation of the original STL using PyGeM (forward + pre-deformed)
++ optional lattice visualization as separate PLY point clouds.
 
 Pipeline:
 
@@ -14,9 +14,9 @@ Pipeline:
    - run thermal job -> <job_name>_therm.frd
    - run mech job    -> <job_name>_mech.frd
    - read nodal displacements from mech .frd
-   - treat voxel node grid as FFD lattice
-   - forward:  deform input STL -> <job_name>_deformed.stl
-   - inverse: pre-deform input STL -> <job_name>_deformed_pre.stl
+   - build PyGeM FFD lattice matching voxel grid
+   - forward:  deform input STL -> <job_name>_deformed.stl  (PyGeM)
+   - inverse: pre-deform STL   -> <job_name>_deformed_pre.stl  (iterative inverse using PyGeM)
    - if --export-lattice:
         * <job_name>_lattice_orig.ply  (original lattice nodes)
         * <job_name>_lattice_def.ply   (deformed lattice nodes)
@@ -29,6 +29,15 @@ from typing import List, Tuple, Dict
 import numpy as np
 import trimesh
 import subprocess
+
+# --- PyGeM import (supports old/new layouts) ---
+try:
+    from pygem.ffd import FFD
+except ImportError:
+    try:
+        from pygem import FFD
+    except ImportError:
+        FFD = None
 
 
 # ============================================================
@@ -398,109 +407,123 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
 
 
 # ============================================================
-#  FRD parsing + FFD helpers
+#  FRD parsing
 # ============================================================
 
 def read_frd_displacements(frd_path: str) -> Dict[int, np.ndarray]:
     """
-    Read nodal displacements from a CalculiX .frd file.
+    Parse nodal displacements from a CalculiX .frd file.
 
-    Parses the *DISP dataset in fixed-width format:
+    We look for the last DISP dataset:
 
-        columns:
-          1-2   : code  (should be '-1')
-          4-13  : node id (I10)
-          14-25 : Ux (E12.5)
-          26-37 : Uy (E12.5)
-          38-49 : Uz (E12.5)
+        -4  DISP ...
+        -5  D1 ...
+        -5  D2 ...
+        -5  D3 ...
+        -5  ALL ...
+        -1  <node> <D1> <D2> <D3>
+        ...
+        -3
 
-    Returns:
-        disp: dict { node_id: np.array([ux, uy, uz]) }
+    Lines are parsed using fixed-width columns, because the node ID and
+    first value may be glued when the value is negative (so split() is unsafe).
     """
     if not os.path.isfile(frd_path):
         print(f"[FRD] File not found: {frd_path}")
         return {}
 
     disp: Dict[int, np.ndarray] = {}
-    state = "search"
+    in_disp = False
 
     print(f"[FRD] Parsing displacements from: {frd_path}")
 
     with open(frd_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            stripped = line.lstrip()
-            if not stripped:
+        for raw_line in f:
+            line = raw_line.rstrip("\n")
+            s = line.lstrip()
+            if not s:
                 continue
 
-            if state == "search":
-                # Look for the DISP result header
-                if stripped.startswith("-4") and "DISP" in stripped:
-                    state = "in_header"
+            # Start of a DISP result block
+            if s.startswith("-4") and "DISP" in s:
+                disp = {}
+                in_disp = True
                 continue
 
-            elif state == "in_header":
-                # Skip the -5 D1/D2/D3/ALL lines, go to data at first -1
-                if stripped.startswith("-1"):
-                    state = "in_data"
-                elif stripped.startswith("-3"):
-                    # no data after all, go back to search
-                    state = "search"
+            if not in_disp:
                 continue
 
-            elif state == "in_data":
-                # End of this dataset
-                if stripped.startswith("-3"):
-                    state = "search"
-                    continue
+            # End of this result block
+            if s.startswith("-3"):
+                in_disp = False
+                continue
 
-                # Only process lines with code -1 in columns 1-3
-                code = line[1:3]
-                if code != "-1":
-                    continue
-
+            # Nodal data line
+            if s.startswith("-1"):
                 try:
-                    nid = int(line[3:13])
-                    ux = float(line[13:25])
-                    uy = float(line[25:37])
-                    uz = float(line[37:49])
-                except ValueError:
-                    # Badly formatted line, skip
-                    continue
+                    nid_str = line[3:13]
+                    v1_str = line[13:25]
+                    v2_str = line[25:37]
+                    v3_str = line[37:49]
 
-                disp[nid] = np.array([ux, uy, uz], dtype=float)
+                    nid = int(nid_str)
+                    ux = float(v1_str)
+                    uy = float(v2_str)
+                    uz = float(v3_str)
+
+                    disp[nid] = np.array([ux, uy, uz], dtype=float)
+                except ValueError:
+                    continue
 
     print(f"[FRD] Parsed displacement data for {len(disp)} nodes.")
     return disp
 
 
-def build_voxel_lattice_from_vertices(
+# ============================================================
+#  PyGeM FFD lattice from voxel mesh
+# ============================================================
+
+def build_ffd_from_lattice(
     vertices: List[Tuple[float, float, float]],
     cube_size: float,
+    displacements: Dict[int, np.ndarray],
 ):
     """
-    Reconstruct a regular voxel lattice from the voxel node coordinates.
+    Build a PyGeM FFD object whose control points coincide (logically)
+    with the voxel lattice nodes, and whose control point displacements
+    come from the FE nodal displacements.
 
-    Returns:
-        origin: (x_min, y_min, z_min)  of lattice
-        node_map: Dict[(I,J,K) -> node_id]
-        nx_cells, ny_cells, nz_cells: number of voxel cells along each axis
+    This implementation is compatible with the *classic* PyGeM API:
+
+        FFD(n_control_points=[nx, ny, nz])
+        ffd.box_origin, ffd.box_length, ffd.rot_angle
+        ffd.array_mu_x / array_mu_y / array_mu_z
+
+    The FE displacements (in physical units) are converted to the
+    normalized weights used by PyGeM: array_mu_* = disp / box_length.
     """
+    if FFD is None:
+        raise RuntimeError("PyGeM FFD is not available. Please install 'pygem'.")
+
     coords = np.array(vertices, dtype=float)
     x_min = float(coords[:, 0].min())
+    x_max = float(coords[:, 0].max())
     y_min = float(coords[:, 1].min())
+    y_max = float(coords[:, 1].max())
     z_min = float(coords[:, 2].min())
-
-    node_map: Dict[Tuple[int, int, int], int] = {}
-    imax = jmax = kmax = 0
+    z_max = float(coords[:, 2].max())
 
     inv_h = 1.0 / float(cube_size)
+
+    # First pass: find max logical indices (ix, iy, iz), assuming regular grid
+    imax = jmax = kmax = 0
+    logical_idx: List[Tuple[int, int, int]] = []
 
     for nid, (x, y, z) in enumerate(vertices, start=1):
         ix = int(round((x - x_min) * inv_h))
         iy = int(round((y - y_min) * inv_h))
         iz = int(round((z - z_min) * inv_h))
-
-        node_map[(ix, iy, iz)] = nid
+        logical_idx.append((ix, iy, iz))
         if ix > imax:
             imax = ix
         if iy > jmax:
@@ -508,177 +531,52 @@ def build_voxel_lattice_from_vertices(
         if iz > kmax:
             kmax = iz
 
-    nx_cells = max(imax, 1)
-    ny_cells = max(jmax, 1)
-    nz_cells = max(kmax, 1)
+    nx = imax + 1  # number of control points in X
+    ny = jmax + 1  # in Y
+    nz = kmax + 1  # in Z
 
-    print(
-        "[FFD] Voxel lattice: nodes (0..{}, 0..{}, 0..{}), cells: {} x {} x {}".format(
-            imax, jmax, kmax, nx_cells, ny_cells, nz_cells
-        )
-    )
+    print(f"[FFD] Building PyGeM FFD: n_control_points = ({nx}, {ny}, {nz})")
 
-    origin = (x_min, y_min, z_min)
-    return origin, node_map, nx_cells, ny_cells, nz_cells
+    # --- Create FFD (classic PyGeM API) ---
+    ffd = FFD(n_control_points=[nx, ny, nz])
 
+    # Align FFD box with voxel lattice bounding box
+    Lx = max(x_max - x_min, 1e-12)
+    Ly = max(y_max - y_min, 1e-12)
+    Lz = max(z_max - z_min, 1e-12)
 
-def deform_point_trilinear(
-    p: np.ndarray,
-    origin: Tuple[float, float, float],
-    cube_size: float,
-    node_map: Dict[Tuple[int, int, int], int],
-    nx_cells: int,
-    ny_cells: int,
-    nz_cells: int,
-    displacements: Dict[int, np.ndarray],
-) -> Tuple[np.ndarray, bool]:
-    """
-    Given a point p in world coordinates, compute its displacement
-    by trilinear interpolation from voxel lattice node displacements.
+    ffd.box_origin[:] = np.array([x_min, y_min, z_min], dtype=float)
+    ffd.box_length[:] = np.array([Lx, Ly, Lz], dtype=float)
+    ffd.rot_angle[:] = np.array([0.0, 0.0, 0.0], dtype=float)
 
-    Returns:
-        (u, has_data):
-            u        - interpolated displacement
-            has_data - True if at least one lattice corner contributed
-    """
-    x_min, y_min, z_min = origin
-    h = float(cube_size)
-
-    rx = (p[0] - x_min) / h
-    ry = (p[1] - y_min) / h
-    rz = (p[2] - z_min) / h
-
-    eps = 1e-6
-    rx = max(0.0, min(rx, nx_cells - eps))
-    ry = max(0.0, min(ry, ny_cells - eps))
-    rz = max(0.0, min(rz, nz_cells - eps))
-
-    ix = int(np.floor(rx))
-    iy = int(np.floor(ry))
-    iz = int(np.floor(rz))
-
-    xi = rx - ix
-    eta = ry - iy
-    zeta = rz - iz
-
-    corners = [
-        (ix,     iy,     iz),
-        (ix + 1, iy,     iz),
-        (ix,     iy + 1, iz),
-        (ix + 1, iy + 1, iz),
-        (ix,     iy,     iz + 1),
-        (ix + 1, iy,     iz + 1),
-        (ix,     iy + 1, iz + 1),
-        (ix + 1, iy + 1, iz + 1),
-    ]
-
-    w000 = (1 - xi) * (1 - eta) * (1 - zeta)
-    w100 = xi       * (1 - eta) * (1 - zeta)
-    w010 = (1 - xi) * eta       * (1 - zeta)
-    w110 = xi       * eta       * (1 - zeta)
-    w001 = (1 - xi) * (1 - eta) * zeta
-    w101 = xi       * (1 - eta) * zeta
-    w011 = (1 - xi) * eta       * zeta
-    w111 = xi       * eta       * zeta
-    weights = [w000, w100, w010, w110, w001, w101, w011, w111]
-
-    u = np.zeros(3, dtype=float)
-    used_weight_sum = 0.0
-
-    for (ijk, w) in zip(corners, weights):
-        nid = node_map.get(ijk)
-        if nid is None:
-            continue
-        u_n = displacements.get(nid)
-        if u_n is None:
-            continue
-        u += w * u_n
-        used_weight_sum += w
-
-    if used_weight_sum > 0.0:
-        u /= used_weight_sum
-        return u, True
+    # Reset weights if available, otherwise zero arrays manually
+    if hasattr(ffd, "reset_weights"):
+        ffd.reset_weights()
     else:
-        return u, False
+        ffd.array_mu_x[:] = 0.0
+        ffd.array_mu_y[:] = 0.0
+        ffd.array_mu_z[:] = 0.0
 
+    # --- Map FE nodal displacements -> FFD weights ---
+    # displacements[nid] is in physical units
+    for nid, (ix, iy, iz) in enumerate(logical_idx, start=1):
+        if not (0 <= ix < nx and 0 <= iy < ny and 0 <= iz < nz):
+            continue
 
-def make_nearest_displacement_func(
-    vertices: List[Tuple[float, float, float]],
-    displacements: Dict[int, np.ndarray],
-):
-    """
-    Prepare a simple nearest-node displacement lookup.
+        u = displacements.get(nid)
+        if u is None:
+            continue
 
-    Returns:
-        nearest_disp(p: np.ndarray) -> np.ndarray
-    """
-    if not displacements:
-        def zero_disp(_p: np.ndarray) -> np.ndarray:
-            return np.zeros(3, dtype=float)
-        return zero_disp
+        # Convert physical displacement to normalized mu (per box length)
+        ffd.array_mu_x[ix, iy, iz] = u[0] / Lx
+        ffd.array_mu_y[ix, iy, iz] = u[1] / Ly
+        ffd.array_mu_z[ix, iy, iz] = u[2] / Lz
 
-    node_ids = np.array(sorted(displacements.keys()), dtype=int)
-    node_coords = np.array([vertices[nid - 1] for nid in node_ids], dtype=float)
-    node_u = np.array([displacements[nid] for nid in node_ids], dtype=float)
-
-    def nearest_disp(p: np.ndarray) -> np.ndarray:
-        diff = node_coords - p
-        dist2 = np.einsum("ij,ij->i", diff, diff)
-        idx = int(np.argmin(dist2))
-        return node_u[idx]
-
-    return nearest_disp
-
-
-def inverse_deform_point_fixedpoint(
-    p_target: np.ndarray,
-    origin: Tuple[float, float, float],
-    cube_size: float,
-    node_map: Dict[Tuple[int, int, int], int],
-    nx_cells: int,
-    ny_cells: int,
-    nz_cells: int,
-    displacements: Dict[int, np.ndarray],
-    nearest_disp,
-    max_iter: int = 15,
-    tol: float = 1e-4,
-) -> np.ndarray:
-    """
-    Given a target point p_target (desired *deformed* position),
-    find q such that q + u(q) ≈ p_target using fixed-point iteration:
-
-        q_{k+1} = q_k - (q_k + u(q_k) - p_target)
-
-    u(q) is obtained via trilinear interpolation with nearest-node fallback.
-    """
-    q = p_target.copy()
-
-    for _ in range(max_iter):
-        u_q, has_data = deform_point_trilinear(
-            q,
-            origin,
-            cube_size,
-            node_map,
-            nx_cells,
-            ny_cells,
-            nz_cells,
-            displacements,
-        )
-        if not has_data:
-            u_q = nearest_disp(q)
-
-        f_q = q + u_q
-        r = f_q - p_target
-        norm_r = np.linalg.norm(r)
-        if norm_r < tol:
-            break
-        q = q - r
-
-    return q
+    return ffd
 
 
 # ============================================================
-#  Lattice visualization (two separate PLYs)
+#  Lattice visualization (PLYs)
 # ============================================================
 
 def export_lattice_ply_split(
@@ -694,7 +592,7 @@ def export_lattice_ply_split(
         - orig_path : original lattice node positions
         - def_path  : deformed lattice node positions
 
-    Both are ASCII PLY files of points (no colors, easy to view in ParaView).
+    Both are ASCII PLY files of points (no colors).
     """
     if not vertices:
         print("[PLY] No vertices, skipping lattice export.")
@@ -706,7 +604,6 @@ def export_lattice_ply_split(
     verts = np.array(vertices, dtype=float)
     n_nodes = verts.shape[0]
 
-    # Build full displacement array (zero where missing)
     disp_arr = np.zeros_like(verts)
     for nid, u in displacements.items():
         if 1 <= nid <= n_nodes:
@@ -715,7 +612,6 @@ def export_lattice_ply_split(
     original_points = verts
     deformed_points = verts + disp_arr
 
-    # Subsample if too many points
     def maybe_subsample(points):
         total = points.shape[0]
         if total > max_points:
@@ -755,10 +651,17 @@ def export_lattice_ply_split(
 
 
 # ============================================================
-#  STL deformation (forward + pre-deformed)
+#  STL deformation with PyGeM (forward + pre-deformed)
 # ============================================================
 
-def deform_input_stl_with_frd(
+def ffd_apply_points(ffd, pts: np.ndarray) -> np.ndarray:
+    """Wrapper to handle PyGeM API (__call__ vs deform)."""
+    try:
+        return ffd(pts)
+    except TypeError:
+        return ffd.deform(pts)
+
+def deform_input_stl_with_frd_pygem(
     input_stl: str,
     mech_frd_path: str,
     vertices: List[Tuple[float, float, float]],
@@ -767,20 +670,19 @@ def deform_input_stl_with_frd(
     lattice_basepath: str = None,
 ):
     """
-    Full pipeline:
+    Full pipeline using PyGeM FFD:
 
       - Read displacements from mechanical .frd
-      - Optionally export lattice as two PLYs:
-            lattice_basepath + "_orig.ply"
-            lattice_basepath + "_def.ply"
-      - Build structured voxel lattice from 'vertices'
-      - Build nearest-node fallback displacement
-      - Load original STL (can be arbitrary shape)
-      - For each STL vertex:
-          * forward deformation -> deformed STL
-          * inverse map -> pre-deformed STL
-      - Save both STLs
+      - Optionally export lattice PLYs
+      - Build PyGeM FFD lattice from voxel nodes + displacements
+      - Load original STL
+      - Forward FFD deformation -> deformed STL
+      - Pre-deformed STL -> apply FFD with reversed control displacements
     """
+    if FFD is None:
+        print("[FFD] PyGeM FFD not available; skipping STL deformation.")
+        return
+
     displacements = read_frd_displacements(mech_frd_path)
     if not displacements:
         print("[FFD] No displacements found, skipping STL deformation.")
@@ -789,19 +691,16 @@ def deform_input_stl_with_frd(
     print(f"[FFD] Displacements available for {len(displacements)} nodes "
           f"out of {len(vertices)} total.")
 
-    # Optional lattice export (original + deformed nodes as separate PLYs)
+    # Optional lattice export
     if lattice_basepath:
         orig_ply = lattice_basepath + "_orig.ply"
         def_ply = lattice_basepath + "_def.ply"
         export_lattice_ply_split(vertices, displacements, orig_ply, def_ply)
 
-    origin, node_map, nx_cells, ny_cells, nz_cells = build_voxel_lattice_from_vertices(
-        vertices,
-        cube_size,
-    )
+    # Build FFD from voxel lattice + FE displacements
+    ffd = build_ffd_from_lattice(vertices, cube_size, displacements)
 
-    nearest_disp = make_nearest_displacement_func(vertices, displacements)
-
+    # Load original STL
     mesh = trimesh.load(input_stl)
     if not isinstance(mesh, trimesh.Trimesh):
         if isinstance(mesh, trimesh.Scene):
@@ -812,49 +711,38 @@ def deform_input_stl_with_frd(
 
     orig_verts = mesh.vertices.copy()
     n_verts = orig_verts.shape[0]
-    print(f"[FFD] Deforming input STL with {n_verts} vertices ...")
+    print(f"[FFD] Deforming input STL with {n_verts} vertices using PyGeM FFD...")
 
-    # Forward deformation: p' = p + u(p)
-    deformed_verts = orig_verts.copy()
-    for i in range(n_verts):
-        p = orig_verts[i]
-        u, has_data = deform_point_trilinear(
-            p,
-            origin,
-            cube_size,
-            node_map,
-            nx_cells,
-            ny_cells,
-            nz_cells,
-            displacements,
-        )
-        if not has_data:
-            u = nearest_disp(p)
-        deformed_verts[i] = p + u
-
+    # ------------------------------------------------------------------
+    # Forward deformation: FFD with +displacements -> deformed STL
+    # ------------------------------------------------------------------
+    deformed_verts = ffd_apply_points(ffd, orig_verts)
     mesh.vertices = deformed_verts
     mesh.export(output_stl)
-    print(f"[FFD] Deformed STL written to: {output_stl}")
+    print(f"[FFD] Deformed STL (PyGeM) written to: {output_stl}")
 
-    # Inverse deformation: find q so that q + u(q) ≈ p_original
-    predeformed_verts = orig_verts.copy()
-    print("[FFD] Computing pre-deformed STL (inverse FFD) ...")
+    # ------------------------------------------------------------------
+    # Pre-deformation: flip control displacements and apply to original
+    # ------------------------------------------------------------------
+    print("[FFD] Computing pre-deformed STL by reversing FFD control displacements...")
 
-    for i in range(n_verts):
-        p_target = orig_verts[i]
-        q = inverse_deform_point_fixedpoint(
-            p_target,
-            origin,
-            cube_size,
-            node_map,
-            nx_cells,
-            ny_cells,
-            nz_cells,
-            displacements,
-            nearest_disp=nearest_disp,
-        )
-        predeformed_verts[i] = q
+    # Restore original geometry
+    mesh.vertices = orig_verts
 
+    # Flip the FFD weights (classic PyGeM: array_mu_x/y/z)
+    try:
+        if hasattr(ffd, "array_mu_x") and hasattr(ffd, "array_mu_y") and hasattr(ffd, "array_mu_z"):
+            ffd.array_mu_x *= -1.0
+            ffd.array_mu_y *= -1.0
+            ffd.array_mu_z *= -1.0
+        else:
+            print("[FFD] WARNING: FFD inversion via weight flipping not supported by this PyGeM API.")
+            return
+    except Exception as e:
+        print(f"[FFD] Error while flipping FFD control weights for pre-deformation: {e}")
+        return
+
+    predeformed_verts = ffd_apply_points(ffd, orig_verts)
     predeformed_path = os.path.splitext(output_stl)[0] + "_pre.stl"
     mesh.vertices = predeformed_verts
     mesh.export(predeformed_path)
@@ -870,9 +758,9 @@ def main():
         description=(
             "Voxelize an STL and generate thermal + mechanical CalculiX jobs "
             "with C3D8R/DC3D8 hexahedra and layer-by-layer steady-state "
-            "heat-transfer steps, then deform the input STL using the "
-            "mechanical displacements as an FFD lattice (forward + pre-deformed) "
-            "and optionally export the lattice as separate PLY point clouds."
+            "heat-transfer steps, then deform the input STL using PyGeM FFD "
+            "(forward + pre-deformed) and optionally export the lattice as "
+            "separate PLY point clouds."
         )
     )
     parser.add_argument("input_stl", help="Path to input STL file")
@@ -969,7 +857,7 @@ def main():
         n_slices=n_slices,
     )
 
-    # 4) Optional runs + FFD deformation + lattice export
+    # 4) Optional runs + PyGeM FFD deformation + lattice export
     if args.run_ccx:
         ok_therm = run_calculix(thermal_job, ccx_cmd=args.ccx_cmd)
         if not ok_therm:
@@ -984,7 +872,7 @@ def main():
         if os.path.isfile(mech_frd):
             deformed_stl = args.job_name + "_deformed.stl"
             lattice_basepath = args.job_name + "_lattice" if args.export_lattice else None
-            deform_input_stl_with_frd(
+            deform_input_stl_with_frd_pygem(
                 args.input_stl,
                 mech_frd,
                 vertices,
