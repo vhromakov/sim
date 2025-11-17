@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
 STL -> voxel C3D8R hex mesh -> global CalculiX .inp job (layered build skeleton)
++ optional run of CalculiX.
 
-Pipeline:
-  1. Voxelize an STL into cubes with pitch = cube_size.
-  2. Build a single global C3D8R brick mesh (brick per voxel).
-  3. Group elements by Z "slice" and create ELSET=SLICE_xxx.
-  4. Detect bottom nodes as BASE NSET.
-  5. Write a CalculiX .inp file with:
-       * NODE, ELEMENT, ELSETs, NSETs
-       * Material stub
-       * Initial temperature
-       * Multi-step skeleton using *MODEL CHANGE, TYPE=ELEMENT
-  6. (Optional) Run CalculiX via --run-ccx.
+Simple layered thermal simulation:
+  - Each voxel Z-layer becomes one "printed" layer.
+  - For each layer we:
+      * Activate that layer's elements (MODEL CHANGE, ADD).
+      * Keep previously activated layers "solid".
+      * Apply a constant heat flux on the top face of that layer.
+      * Hold the base nodes at fixed temperature.
 """
 
 import argparse
@@ -24,9 +21,9 @@ import trimesh
 import subprocess
 
 
-# ------------------------------------------------------------
-# Mesh generation: global voxel C3D8R mesh
-# ------------------------------------------------------------
+# ============================================================
+#  Voxel mesh -> CalculiX job
+# ============================================================
 
 def generate_global_cubic_hex_mesh(
     input_stl: str,
@@ -44,7 +41,6 @@ def generate_global_cubic_hex_mesh(
     if cube_size <= 0:
         raise ValueError("cube_size must be positive")
 
-    # Load mesh
     mesh = trimesh.load(input_stl)
     if not isinstance(mesh, trimesh.Trimesh):
         if isinstance(mesh, trimesh.Scene):
@@ -59,7 +55,7 @@ def generate_global_cubic_hex_mesh(
     vox = mesh.voxelized(pitch=cube_size)
     vox.fill()
 
-    indices = vox.sparse_indices  # shape (N, 3) with (ix, iy, iz)
+    indices = vox.sparse_indices  # (N,3) with (ix,iy,iz)
     if indices.size == 0:
         print("[VOXEL] No voxels found – check cube size or input mesh.")
         return [], [], {}, []
@@ -67,28 +63,25 @@ def generate_global_cubic_hex_mesh(
     total_voxels = indices.shape[0]
     print(f"[VOXEL] Total filled voxels (cubes): {total_voxels}")
 
-    # Sort voxels: by iz (bottom->top), then iy, then ix
+    # sort by iz, iy, ix
     order = np.lexsort((indices[:, 0], indices[:, 1], indices[:, 2]))
     indices_sorted = indices[order]
 
-    # Build mapping from iz -> physical z (center)
+    # map iz -> physical z
     unique_iz = np.unique(indices_sorted[:, 2])
     layer_info = []
     for iz in unique_iz:
         idx_arr = np.array([[0, 0, iz]], dtype=float)
         z_center = float(vox.indices_to_points(idx_arr)[0, 2])
         layer_info.append((iz, z_center))
-    # sort by physical z
     layer_info.sort(key=lambda x: x[1])
 
-    # Map each iz to a slice index [0..S-1]
     iz_to_slice: Dict[int, int] = {}
     z_slices: List[float] = []
     for slice_idx, (iz, z_phys) in enumerate(layer_info):
-        iz_to_slice[iz] = slice_idx
+        iz_to_slice[int(iz)] = slice_idx
         z_slices.append(z_phys)
 
-    # Node + element building
     vertex_index_map: Dict[Tuple[int, int, int], int] = {}
     vertices: List[Tuple[float, float, float]] = []
     hexes: List[Tuple[int, int, int, int, int, int, int, int]] = []
@@ -98,10 +91,6 @@ def generate_global_cubic_hex_mesh(
         key: Tuple[int, int, int],
         coord: Tuple[float, float, float],
     ) -> int:
-        """
-        Return 1-based vertex index for given logical key (ix_node, iy_node, iz_node).
-        Create new vertex if needed.
-        """
         if key in vertex_index_map:
             return vertex_index_map[key]
         idx = len(vertices) + 1
@@ -121,21 +110,20 @@ def generate_global_cubic_hex_mesh(
         y0, y1 = cy - half, cy + half
         z0, z1 = cz - half, cz + half
 
-        # Bottom face (z0)
-        v0 = get_vertex_index((ix,   iy,   iz),   (x0, y0, z0))  # (x-,y-,z-)
-        v1 = get_vertex_index((ix+1, iy,   iz),   (x1, y0, z0))  # (x+,y-,z-)
-        v2 = get_vertex_index((ix+1, iy+1, iz),   (x1, y1, z0))  # (x+,y+,z-)
-        v3 = get_vertex_index((ix,   iy+1, iz),   (x0, y1, z0))  # (x-,y+,z-)
-
-        # Top face (z1)
-        v4 = get_vertex_index((ix,   iy,   iz+1), (x0, y0, z1))  # (x-,y-,z+)
-        v5 = get_vertex_index((ix+1, iy,   iz+1), (x1, y0, z1))  # (x+,y-,z+)
-        v6 = get_vertex_index((ix+1, iy+1, iz+1), (x1, y1, z1))  # (x+,y+,z+)
-        v7 = get_vertex_index((ix,   iy+1, iz+1), (x0, y1, z1))  # (x-,y+,z+)
+        # bottom face
+        v0 = get_vertex_index((ix,   iy,   iz),   (x0, y0, z0))  # x-,y-,z-
+        v1 = get_vertex_index((ix+1, iy,   iz),   (x1, y0, z0))  # x+,y-,z-
+        v2 = get_vertex_index((ix+1, iy+1, iz),   (x1, y1, z0))  # x+,y+,z-
+        v3 = get_vertex_index((ix,   iy+1, iz),   (x0, y1, z0))  # x-,y+,z-
+        # top face
+        v4 = get_vertex_index((ix,   iy,   iz+1), (x0, y0, z1))  # x-,y-,z+
+        v5 = get_vertex_index((ix+1, iy,   iz+1), (x1, y0, z1))  # x+,y-,z+
+        v6 = get_vertex_index((ix+1, iy+1, iz+1), (x1, y1, z1))  # x+,y+,z+
+        v7 = get_vertex_index((ix,   iy+1, iz+1), (x0, y1, z1))  # x-,y+,z+
 
         hexes.append((v0, v1, v2, v3, v4, v5, v6, v7))
 
-        eid = len(hexes)  # 1-based element id
+        eid = len(hexes)
         slice_idx = iz_to_slice[int(iz)]
         slice_to_eids[slice_idx].append(eid)
 
@@ -146,18 +134,10 @@ def generate_global_cubic_hex_mesh(
     return vertices, hexes, slice_to_eids, z_slices
 
 
-# ------------------------------------------------------------
-# CalculiX .inp writing
-# ------------------------------------------------------------
-
 def _write_id_list_lines(f, ids: List[int], per_line: int = 16):
-    """
-    Write a list of integer IDs split across multiple lines.
-    """
     for i in range(0, len(ids), per_line):
         chunk = ids[i:i + per_line]
         f.write(", ".join(str(x) for x in chunk) + "\n")
-
 
 def write_calculix_job(
     path: str,
@@ -166,46 +146,46 @@ def write_calculix_job(
     slice_to_eids: Dict[int, List[int]],
     z_slices: List[float],
     base_temp: float = 293.0,
+    heat_flux: float = 1.0e3,
 ):
     """
-    Write a single global CalculiX .inp job:
+    Pure thermal variant:
+      - DC3D8 heat-transfer elements
+      - all elements always active
+      - ELSET per slice
+      - base held at base_temp
+      - each step: steady-state HEAT TRANSFER, heat only one slice via DFLUX.
 
-      - *NODE, *ELEMENT, TYPE=C3D8R
-      - *ELSET for each slice: SLICE_000, SLICE_001, ...
-      - *NSET for base nodes: BASE
-      - *MATERIAL stub (edit as needed)
-      - *INITIAL CONDITIONS for temperature
-      - Multi-step skeleton using *MODEL CHANGE, TYPE=ELEMENT
-        (steady-state heat-transfer steps).
+    This avoids mechanical DOFs and is robust even for finer voxel sizes
+    and disconnected components.
     """
     n_nodes = len(vertices)
     n_elems = len(hexes)
 
-    # Find base (lowest z) nodes
+    # detect bottom nodes as "BASE"
     z_coords = np.array([v[2] for v in vertices], dtype=float)
     z_min = float(z_coords.min())
-    # tolerance: small fraction of overall height
     tol = (z_coords.max() - z_min + 1e-9) * 1e-3
     base_nodes = [i + 1 for i, z in enumerate(z_coords) if abs(z - z_min) <= tol]
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("*HEADING\n")
-        f.write("Layered voxel C3D8R build (auto-generated)\n")
+        f.write("Voxel DC3D8 build (all layers active, per-slice heating, thermal-only)\n")
 
-        # ---- Nodes ----
+        # Nodes
         f.write("*NODE\n")
         for i, (x, y, z) in enumerate(vertices, start=1):
             f.write(f"{i}, {x}, {y}, {z}\n")
 
-        # ---- Elements ----
-        f.write("*ELEMENT, TYPE=C3D8R, ELSET=ALL\n")
+        # Elements: thermal brick
+        f.write("*ELEMENT, TYPE=DC3D8, ELSET=ALL\n")
         for eid, (n0, n1, n2, n3, n4, n5, n6, n7) in enumerate(hexes, start=1):
             f.write(
                 f"{eid}, {n0}, {n1}, {n2}, {n3}, "
                 f"{n4}, {n5}, {n6}, {n7}\n"
             )
 
-        # ---- Node sets ----
+        # Node sets
         f.write("*NSET, NSET=ALLNODES, GENERATE\n")
         f.write(f"1, {n_nodes}, 1\n")
 
@@ -215,34 +195,38 @@ def write_calculix_job(
         else:
             f.write("** Warning: no base nodes detected.\n")
 
-        # ---- Element sets per slice ----
+        # ELSET per slice (sanitized)
         n_slices = len(z_slices)
         for slice_idx in range(n_slices):
             eids = slice_to_eids.get(slice_idx, [])
             if not eids:
                 continue
+            valid_eids = [eid for eid in eids if 1 <= eid <= n_elems]
+            if not valid_eids:
+                print(f"[WARN] Slice {slice_idx} has no valid element IDs within 1..{n_elems}")
+                continue
             name = f"SLICE_{slice_idx:03d}"
             f.write(f"*ELSET, ELSET={name}\n")
-            _write_id_list_lines(f, eids)
+            _write_id_list_lines(f, valid_eids)
 
-        # ---- Material stub ----
-        f.write("** --- MATERIAL DEFINITION (edit as needed) ---\n")
+        # --- Thermal material ---
+        f.write("** --- MATERIAL DEFINITION (thermal only) ---\n")
         f.write("*MATERIAL, NAME=MAT1\n")
         f.write("*DENSITY\n")
-        f.write("7800.\n")
+        f.write("7.8E-9\n")
         f.write("*CONDUCTIVITY\n")
         f.write("45.\n")
         f.write("*SPECIFIC HEAT\n")
         f.write("500.\n")
         f.write("*SOLID SECTION, ELSET=ALL, MATERIAL=MAT1\n")
 
-        # ---- Initial temperature ----
+        # Initial temperature
         f.write("** --- INITIAL CONDITIONS ---\n")
         f.write("*INITIAL CONDITIONS, TYPE=TEMPERATURE\n")
         f.write(f"ALLNODES, {base_temp}\n")
 
-        # ---- Steady-state heat-transfer steps per slice ----
-        f.write("** --- LAYER-BY-LAYER HEAT-TRANSFER STEPS ---\n")
+        # --- Steps: all elements active, heat one slice per step ---
+        f.write("** --- HEAT-TRANSFER STEPS, PER-SLICE HEATING ---\n")
 
         if n_slices == 0:
             f.write("** No slices found, no steps generated.\n")
@@ -252,48 +236,130 @@ def write_calculix_job(
                 z_val = z_slices[slice_idx]
 
                 f.write("** ----------------------------------------\n")
-                f.write(f"** Heat-transfer step for {name} at z = {z_val}\n")
+                f.write(f"** Heat-transfer step heating {name} at z = {z_val}\n")
                 f.write("*STEP\n")
                 f.write("*HEAT TRANSFER, STEADY STATE\n")
-                # Optionally an explicit time line; for steady-state,
-                # CalculiX will ignore the time but we can still give one:
                 f.write("1., 1.\n")
 
-                # Fix base temperature
                 if base_nodes:
                     f.write("*BOUNDARY\n")
+                    # Fix base temperature at base_temp (DOF 11)
                     f.write(f"BASE, 11, 11, {base_temp}\n")
 
-                # Model change: first step removes all, then add first slice;
-                # subsequent steps just add new slice on top.
-                if slice_idx == 0:
-                    f.write("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n")
-                    f.write("ALL\n")
+                # Output: nodal temperatures every step
+                f.write("*NODE FILE, FREQUENCY=1\n")
+                f.write("NT\n")
 
-                f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
-                f.write(f"{name}\n")
-
-                # Flux placeholder on this slice
-                f.write("** Example: uniform heat flux on this slice (edit or remove):\n")
-                f.write("** *DFLUX\n")
-                f.write(f"** {name}, S1, 1.E6\n")
+                # Heat only this slice
+                f.write("*DFLUX\n")
+                f.write(f"{name}, S2, {heat_flux:.6E}\n")
 
                 f.write("*END STEP\n")
 
-        # Done
     print(f"[CCX] Wrote CalculiX job to: {path}")
     print(f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, slices: {len(z_slices)}")
 
+def write_mechanical_job(
+    path: str,
+    vertices: List[Tuple[float, float, float]],
+    hexes: List[Tuple[int, int, int, int, int, int, int, int]],
+    base_temp: float,
+    thermal_job_name: str,
+    n_slices: int,
+):
+    """
+    Mechanical deformation job:
 
-# ------------------------------------------------------------
-# Optional: run CalculiX
-# ------------------------------------------------------------
+      - C3D8R thermo-elastic elements
+      - same mesh as thermal job
+      - base fixed mechanically
+      - reads final temperature field from thermal job .frd
+      - single STATIC step computes thermal expansion deformation
+    """
+    n_nodes = len(vertices)
+    n_elems = len(hexes)
+
+    # detect bottom nodes as "BASE" (same logic as thermal job)
+    z_coords = np.array([v[2] for v in vertices], dtype=float)
+    z_min = float(z_coords.min())
+    tol = (z_coords.max() - z_min + 1e-9) * 1e-3
+    base_nodes = [i + 1 for i, z in enumerate(z_coords) if abs(z - z_min) <= tol]
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("*HEADING\n")
+        f.write("Thermo-elastic deformation from thermal FRD (auto-generated)\n")
+
+        # Nodes (same coordinates)
+        f.write("*NODE\n")
+        for i, (x, y, z) in enumerate(vertices, start=1):
+            f.write(f"{i}, {x}, {y}, {z}\n")
+
+        # Elements: structural bricks now
+        f.write("*ELEMENT, TYPE=C3D8R, ELSET=ALL\n")
+        for eid, (n0, n1, n2, n3, n4, n5, n6, n7) in enumerate(hexes, start=1):
+            f.write(
+                f"{eid}, {n0}, {n1}, {n2}, {n3}, "
+                f"{n4}, {n5}, {n6}, {n7}\n"
+            )
+
+        # Node sets
+        f.write("*NSET, NSET=ALLNODES, GENERATE\n")
+        f.write(f"1, {n_nodes}, 1\n")
+
+        if base_nodes:
+            f.write("*NSET, NSET=BASE\n")
+            _write_id_list_lines(f, base_nodes)
+        else:
+            f.write("** Warning: no base nodes detected.\n")
+
+        # Material: linear thermo-elastic
+        f.write("** --- MATERIAL: thermo-elastic for deformation ---\n")
+        f.write("*MATERIAL, NAME=MAT1\n")
+        f.write("*ELASTIC\n")
+        f.write("210000., 0.30\n")
+        f.write("*EXPANSION\n")
+        f.write("1.2E-5\n")
+        f.write("*DENSITY\n")
+        f.write("7.8E-9\n")
+        f.write("*SOLID SECTION, ELSET=ALL, MATERIAL=MAT1\n")
+
+        # Initial temperature (must match thermal job reference)
+        f.write("** --- INITIAL TEMPERATURE (reference) ---\n")
+        f.write("*INITIAL CONDITIONS, TYPE=TEMPERATURE\n")
+        f.write(f"ALLNODES, {base_temp}\n")
+
+        # Mechanical step
+        f.write("** --- STATIC STEP: apply temperature field from thermal job ---\n")
+        f.write("*STEP\n")
+        f.write("*STATIC\n")
+        f.write("1., 1.\n")
+
+        # Fix base mechanically
+        if base_nodes:
+            f.write("*BOUNDARY\n")
+            f.write("BASE, 1, 3, 0.\n")
+
+        # Read temperatures from thermal job .frd, last step = n_slices
+        f.write(
+            f"*TEMPERATURE, FILE={thermal_job_name}.frd, "
+            f"BSTEP={n_slices}, ESTEP={n_slices}\n"
+        )
+        f.write("ALLNODES\n")
+
+        # Output: displacements + stresses
+        f.write("*NODE FILE, FREQUENCY=1\n")
+        f.write("U\n")
+        f.write("*EL FILE, FREQUENCY=1\n")
+        f.write("S, E\n")
+
+        f.write("*END STEP\n")
+
+    print(f"[CCX] Wrote mechanical job to: {path}")
+
 
 def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
     """
     Run CalculiX on given job (job_name without .inp).
-
-    ccx_cmd: executable name or full path, e.g. "ccx", "ccx_static", "C:\\path\\ccx.exe"
     """
     print(f"[RUN] Launching CalculiX: {ccx_cmd} {job_name}")
     try:
@@ -305,7 +371,7 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
         )
     except FileNotFoundError:
         print(f"[RUN] ERROR: CalculiX command not found: {ccx_cmd}")
-        return
+        return False
 
     print(f"[RUN] CalculiX return code: {result.returncode}")
     if result.stdout:
@@ -315,17 +381,19 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
         print("----- CalculiX STDERR -----")
         print(result.stderr)
     print("[RUN] Done.")
+    return result.returncode == 0
 
 
-# ------------------------------------------------------------
-# CLI
-# ------------------------------------------------------------
+# ============================================================
+#  CLI
+# ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
             "Voxelize an STL and generate a single global CalculiX .inp job "
-            "with C3D8R hexahedra and layer-by-layer heat-transfer steps."
+            "with C3D8R hexahedra and layer-by-layer steady-state "
+            "heat-transfer steps (MODEL CHANGE + DFLUX)."
         )
     )
     parser.add_argument("input_stl", help="Path to input STL file")
@@ -350,6 +418,12 @@ def main():
         help="Base/support temperature (K) for boundary condition (default 293)",
     )
     parser.add_argument(
+        "--heat-flux",
+        type=float,
+        default=1.0e3,
+        help="Heat flux value used in *DFLUX (default 1.0e3)",
+    )
+    parser.add_argument(
         "--run-ccx",
         action="store_true",
         help="If set, run CalculiX on the generated job.",
@@ -357,7 +431,8 @@ def main():
     parser.add_argument(
         "--ccx-cmd",
         default="ccx",
-        help="CalculiX executable (default 'ccx'). Example: 'ccx', 'ccx_static', 'C:\\\\ccx\\\\ccx.exe'",
+        help="CalculiX executable (default 'ccx'). Example: "
+             "'ccx', 'ccx_static', 'C:\\\\path\\\\to\\\\ccx.exe'",
     )
 
     args = parser.parse_args()
@@ -366,7 +441,7 @@ def main():
         print(f"Input STL not found: {args.input_stl}")
         raise SystemExit(1)
 
-    # 1) Generate global voxel mesh
+    # 1) Mesh
     vertices, hexes, slice_to_eids, z_slices = generate_global_cubic_hex_mesh(
         args.input_stl,
         args.cube_size,
@@ -375,20 +450,45 @@ def main():
         print("No mesh generated, aborting.")
         raise SystemExit(1)
 
-    # 2) Write CalculiX job
-    inp_path = args.job_name + ".inp"
-    write_calculix_job(
-        inp_path,
+    n_slices = len(z_slices)
+    if n_slices == 0:
+        print("No slices generated, aborting.")
+        raise SystemExit(1)
+
+    # 2) Thermal job name
+    thermal_job = args.job_name + "_therm"
+    thermal_inp = thermal_job + ".inp"
+
+    write_calculix_job(  # <- your thermal-only DC3D8 writer
+        thermal_inp,
         vertices,
         hexes,
         slice_to_eids,
         z_slices,
         base_temp=args.base_temp,
+        heat_flux=args.heat_flux,
     )
 
-    # 3) Optionally run CalculiX
+    # 3) Mechanical job name
+    mech_job = args.job_name + "_mech"
+    mech_inp = mech_job + ".inp"
+
+    write_mechanical_job(
+        mech_inp,
+        vertices,
+        hexes,
+        base_temp=args.base_temp,
+        thermal_job_name=thermal_job,
+        n_slices=n_slices,
+    )
+
+    # 4) Optional runs
     if args.run_ccx:
-        run_calculix(args.job_name, ccx_cmd=args.ccx_cmd)
+        ok_therm = run_calculix(thermal_job, ccx_cmd=args.ccx_cmd)
+        if not ok_therm:
+            print("[RUN] Thermal job failed, skipping mechanical job.")
+            return
+        run_calculix(mech_job, ccx_cmd=args.ccx_cmd)
 
 
 if __name__ == "__main__":
