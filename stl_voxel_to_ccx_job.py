@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-STL -> voxel C3D8R/DC3D8 hex mesh -> thermal + mechanical CalculiX jobs
+STL -> voxel C3D8R hex mesh -> uncoupled thermo-mechanical CalculiX job
 + FFD deformation of the original STL using PyGeM (forward + pre-deformed)
 + optional lattice visualization as separate PLY point clouds.
 
 Pipeline:
 
 1. Voxelize input STL into cubes of size cube_size.
-2. Build global hex mesh:
-   - thermal job: DC3D8, per-slice heating
-   - mechanical job: C3D8R, reads temps from thermal .frd, computes U
-3. If --run-ccx:
-   - run thermal job -> <job_name>_therm.frd
-   - run mech job    -> <job_name>_mech.frd
-   - read nodal displacements from mech .frd
-   - build PyGeM FFD lattice matching voxel grid
+2. Build global hex mesh (C3D8R elements).
+3. Single CalculiX job:
+   - Procedure: *UNCOUPLED TEMPERATURE-DISPLACEMENT
+   - One step per slice ("layer" in Z):
+       * Apply heat flux to that layer's ELSET.
+       * Base nodes mechanically fixed (UX, UY, UZ = 0).
+       * Base nodes thermally fixed at base_temp.
+       * Temperatures and displacements carry over between steps.
+4. If --run-ccx:
+   - Run the thermo-mechanical job -> <job_name>_utd.frd
+   - Read nodal displacements from that .frd
+   - Build PyGeM FFD lattice matching voxel grid
    - forward:  deform input STL -> <job_name>_deformed.stl  (PyGeM)
-   - inverse: pre-deform STL   -> <job_name>_deformed_pre.stl  (iterative inverse using PyGeM)
+   - inverse: pre-deform STL   -> <job_name>_deformed_pre.stl  (by flipping FFD control weights)
    - if --export-lattice:
         * <job_name>_lattice_orig.ply  (original lattice nodes)
         * <job_name>_lattice_def.ply   (deformed lattice nodes)
@@ -165,16 +169,30 @@ def write_calculix_job(
     hexes: List[Tuple[int, int, int, int, int, int, int, int]],
     slice_to_eids: Dict[int, List[int]],
     z_slices: List[float],
-    base_temp: float = 293.0,
-    heat_flux: float = 1.0e3,
+    base_temp: float = 20.0,
+    heat_flux: float = 1.0,
 ):
     """
-    Pure thermal variant:
-      - DC3D8 heat-transfer elements
-      - all elements always active
-      - ELSET per slice
-      - base held at base_temp
-      - each step: steady-state HEAT TRANSFER, heat only one slice via DFLUX.
+    Single uncoupled temperature-displacement job, modeled after the
+    PrePoMax ABS example:
+
+      - C3D8R bricks
+      - ABS material with thermal + mechanical properties
+      - Reference temperature 20 C (Expansion, Zero=20)
+      - NSET=BASE (bottom nodes) fixed mechanically and held at base_temp
+      - One *UNCOUPLED TEMPERATURE-DISPLACEMENT step per slice:
+          * In step k:
+              - clear previous flux (OP=NEW)
+              - apply body flux (BF) only to ELSET=SLICE_k
+          * Temperatures and displacements carry over between steps.
+
+    Parameters
+    ----------
+    base_temp : float
+        Clamp temperature for the base (deg C). Default 20 to match Zero=20.
+    heat_flux : float
+        Body heat generation value used in *DFLUX ... BF, value.
+        Units are consistent with your MM_TON_S_C system (W/mm^3).
     """
     n_nodes = len(vertices)
     n_elems = len(hexes)
@@ -185,24 +203,33 @@ def write_calculix_job(
     tol = (z_coords.max() - z_min + 1e-9) * 1e-3
     base_nodes = [i + 1 for i, z in enumerate(z_coords) if abs(z - z_min) <= tol]
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("*HEADING\n")
-        f.write("Voxel DC3D8 build (all layers active, per-slice heating, thermal-only)\n")
+    n_slices = len(z_slices)
 
-        # Nodes
+    # choose a simple time scheme: 1.0 per slice
+    time_per_layer = 1.0
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("**\n** Auto-generated SLA-style thermo-mechanical job\n**\n")
+        f.write("*HEADING\n")
+        f.write("Voxel C3D8R uncoupled temperature-displacement (layer-wise BF heating)\n")
+
+        # -------------------- NODES --------------------
+        f.write("** Nodes +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
         f.write("*NODE\n")
         for i, (x, y, z) in enumerate(vertices, start=1):
             f.write(f"{i}, {x}, {y}, {z}\n")
 
-        # Elements: thermal brick
-        f.write("*ELEMENT, TYPE=DC3D8, ELSET=ALL\n")
+        # -------------------- ELEMENTS --------------------
+        f.write("** Elements ++++++++++++++++++++++++++++++++++++++++++++++++\n")
+        f.write("*ELEMENT, TYPE=C3D8R, ELSET=ALL\n")
         for eid, (n0, n1, n2, n3, n4, n5, n6, n7) in enumerate(hexes, start=1):
             f.write(
                 f"{eid}, {n0}, {n1}, {n2}, {n3}, "
                 f"{n4}, {n5}, {n6}, {n7}\n"
             )
 
-        # Node sets
+        # -------------------- SETS --------------------
+        f.write("** Node sets +++++++++++++++++++++++++++++++++++++++++++++++\n")
         f.write("*NSET, NSET=ALLNODES, GENERATE\n")
         f.write(f"1, {n_nodes}, 1\n")
 
@@ -210,10 +237,9 @@ def write_calculix_job(
             f.write("*NSET, NSET=BASE\n")
             _write_id_list_lines(f, base_nodes)
         else:
-            f.write("** Warning: no base nodes detected.\n")
+            f.write("** Warning: no base nodes detected for BASE set.\n")
 
-        # ELSET per slice (sanitized)
-        n_slices = len(z_slices)
+        f.write("** Element sets (per slice) ++++++++++++++++++++++++++++++++\n")
         for slice_idx in range(n_slices):
             eids = slice_to_eids.get(slice_idx, [])
             if not eids:
@@ -226,153 +252,81 @@ def write_calculix_job(
             f.write(f"*ELSET, ELSET={name}\n")
             _write_id_list_lines(f, valid_eids)
 
-        # --- Thermal material ---
-        f.write("** --- MATERIAL DEFINITION (thermal only) ---\n")
-        f.write("*MATERIAL, NAME=MAT1\n")
+        # -------------------- MATERIAL (ABS) --------------------
+        f.write("** Materials +++++++++++++++++++++++++++++++++++++++++++++++\n")
+        f.write("*MATERIAL, NAME=ABS\n")
         f.write("*DENSITY\n")
-        f.write("7.8E-9\n")
+        f.write("1.02E-09\n")
+        f.write("*ELASTIC\n")
+        f.write("2000., 0.394\n")
+        f.write("*EXPANSION, ZERO=20.\n")
+        f.write("7.4E-05\n")
         f.write("*CONDUCTIVITY\n")
-        f.write("45.\n")
+        f.write("0.2256\n")
         f.write("*SPECIFIC HEAT\n")
-        f.write("500.\n")
-        f.write("*SOLID SECTION, ELSET=ALL, MATERIAL=MAT1\n")
+        f.write("1386000000.\n")
+        f.write("*SOLID SECTION, ELSET=ALL, MATERIAL=ABS\n")
 
-        # Initial temperature
-        f.write("** --- INITIAL CONDITIONS ---\n")
+        # -------------------- INITIAL TEMPERATURE --------------------
+        f.write("** Initial conditions ++++++++++++++++++++++++++++++++++++++\n")
         f.write("*INITIAL CONDITIONS, TYPE=TEMPERATURE\n")
         f.write(f"ALLNODES, {base_temp}\n")
 
-        # --- Steps: all elements active, heat one slice per step ---
-        f.write("** --- HEAT-TRANSFER STEPS, PER-SLICE HEATING ---\n")
-
+        # -------------------- STEPS --------------------
+        f.write("** Steps +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
         if n_slices == 0:
-            f.write("** No slices found, no steps generated.\n")
+            f.write("** No slices -> no steps.\n")
         else:
             for slice_idx in range(n_slices):
                 name = f"SLICE_{slice_idx:03d}"
                 z_val = z_slices[slice_idx]
+                step_name = f"LAYER_{slice_idx:03d}"
+                t_end = (slice_idx + 1) * time_per_layer
 
-                f.write("** ----------------------------------------\n")
-                f.write(f"** Heat-transfer step heating {name} at z = {z_val}\n")
+                f.write("** --------------------------------------------------------\n")
+                f.write(f"** Step {slice_idx+1}: heat slice {name} at z = {z_val}\n")
+                f.write("** --------------------------------------------------------\n")
                 f.write("*STEP\n")
-                f.write("*HEAT TRANSFER, STEADY STATE\n")
-                f.write("1., 1.\n")
+                f.write(f"*UNCOUPLED TEMPERATURE-DISPLACEMENT\n")
+                f.write(f"{t_end:.6f}, {time_per_layer:.6f}\n")
 
+                # Boundary conditions: base fixed mechanically + thermally
                 if base_nodes:
-                    f.write("*BOUNDARY\n")
-                    # Fix base temperature at base_temp (DOF 11)
+                    f.write("** Boundary conditions +++++++++++++++++++++++++++++++++++++\n")
+                    f.write("*BOUNDARY, OP=NEW\n")
+                    # mechanical clamp
+                    f.write("BASE, 1, 6, 0.\n")
+                    # temperature clamp (DOF 11)
                     f.write(f"BASE, 11, 11, {base_temp}\n")
 
-                # Output: nodal temperatures every step
-                f.write("*NODE FILE, FREQUENCY=1\n")
-                f.write("NT\n")
+                # Outputs (similar to PrePoMax Node/El file)
+                f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
+                f.write("*NODE FILE\n")
+                f.write("RF, U, NT, RFL\n")
+                f.write("*EL FILE\n")
+                f.write("S, E, HFL, NOE\n")
 
-                # Heat only this slice
-                f.write("*DFLUX\n")
-                f.write(f"{name}, S2, {heat_flux:.6E}\n")
+                # Loads: body flux only on this slice, previous flux cleared
+                f.write("** Loads (body flux on current slice) ++++++++++++++++++++++\n")
+                f.write("*DFLUX, OP=NEW\n")
+                f.write(f"{name}, BF, {heat_flux:.6E}\n")
 
                 f.write("*END STEP\n")
 
-    print(f"[CCX] Wrote CalculiX job to: {path}")
-    print(f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, slices: {len(z_slices)}")
+    print(f"[CCX] Wrote PrePoMax-style UT-D job to: {path}")
+    print(f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, slices: {n_slices}")
 
 
-def write_mechanical_job(
-    path: str,
-    vertices: List[Tuple[float, float, float]],
-    hexes: List[Tuple[int, int, int, int, int, int, int, int]],
-    base_temp: float,
-    thermal_job_name: str,
-    n_slices: int,
-):
+# ============================================================
+#  (Old mechanical job writer – now unused, kept only for reference)
+# ============================================================
+
+def write_mechanical_job(*args, **kwargs):
     """
-    Mechanical deformation job:
-
-      - C3D8R thermo-elastic elements
-      - same mesh as thermal job
-      - base fixed mechanically
-      - reads final temperature field from thermal job .frd
-      - single STATIC step computes thermal expansion deformation
+    Deprecated: the pipeline now uses a single *UNCOUPLED TEMPERATURE-DISPLACEMENT job.
+    This function is kept only to avoid breaking imports; it is not used in main().
     """
-    n_nodes = len(vertices)
-    n_elems = len(hexes)
-
-    # detect bottom nodes as "BASE" (same logic as thermal job)
-    z_coords = np.array([v[2] for v in vertices], dtype=float)
-    z_min = float(z_coords.min())
-    tol = (z_coords.max() - z_min + 1e-9) * 1e-3
-    base_nodes = [i + 1 for i, z in enumerate(z_coords) if abs(z - z_min) <= tol]
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("*HEADING\n")
-        f.write("Thermo-elastic deformation from thermal FRD (auto-generated)\n")
-
-        # Nodes (same coordinates)
-        f.write("*NODE\n")
-        for i, (x, y, z) in enumerate(vertices, start=1):
-            f.write(f"{i}, {x}, {y}, {z}\n")
-
-        # Elements: structural bricks now
-        f.write("*ELEMENT, TYPE=C3D8R, ELSET=ALL\n")
-        for eid, (n0, n1, n2, n3, n4, n5, n6, n7) in enumerate(hexes, start=1):
-            f.write(
-                f"{eid}, {n0}, {n1}, {n2}, {n3}, "
-                f"{n4}, {n5}, {n6}, {n7}\n"
-            )
-
-        # Node sets
-        f.write("*NSET, NSET=ALLNODES, GENERATE\n")
-        f.write(f"1, {n_nodes}, 1\n")
-
-        if base_nodes:
-            f.write("*NSET, NSET=BASE\n")
-            _write_id_list_lines(f, base_nodes)
-        else:
-            f.write("** Warning: no base nodes detected.\n")
-
-        # Material: linear thermo-elastic
-        f.write("** --- MATERIAL: thermo-elastic for deformation ---\n")
-        f.write("*MATERIAL, NAME=MAT1\n")
-        f.write("*ELASTIC\n")
-        f.write("210000., 0.30\n")
-        f.write("*EXPANSION\n")
-        f.write("1.2E-5\n")
-        f.write("*DENSITY\n")
-        f.write("7.8E-9\n")
-        f.write("*SOLID SECTION, ELSET=ALL, MATERIAL=MAT1\n")
-
-        # Initial temperature (must match thermal job reference)
-        f.write("** --- INITIAL TEMPERATURE (reference) ---\n")
-        f.write("*INITIAL CONDITIONS, TYPE=TEMPERATURE\n")
-        f.write(f"ALLNODES, {base_temp}\n")
-
-        # Mechanical step
-        f.write("** --- STATIC STEP: apply temperature field from thermal job ---\n")
-        f.write("*STEP\n")
-        f.write("*STATIC\n")
-        f.write("1., 1.\n")
-
-        # Fix base mechanically
-        if base_nodes:
-            f.write("*BOUNDARY\n")
-            f.write("BASE, 1, 3, 0.\n")
-
-        # Read temperatures from thermal job .frd, last step = n_slices
-        f.write(
-            f"*TEMPERATURE, FILE={thermal_job_name}.frd, "
-            f"BSTEP={n_slices}, ESTEP={n_slices}\n"
-        )
-        f.write("ALLNODES\n")
-
-        # Output: displacements + stresses
-        f.write("*NODE FILE, FREQUENCY=1\n")
-        f.write("U\n")
-        f.write("*EL FILE, FREQUENCY=1\n")
-        f.write("S, E\n")
-
-        f.write("*END STEP\n")
-
-    print(f"[CCX] Wrote mechanical job to: {path}")
+    print("[WARN] write_mechanical_job() is deprecated and not used in this script.")
 
 
 # ============================================================
@@ -661,6 +615,7 @@ def ffd_apply_points(ffd, pts: np.ndarray) -> np.ndarray:
     except TypeError:
         return ffd.deform(pts)
 
+
 def deform_input_stl_with_frd_pygem(
     input_stl: str,
     mech_frd_path: str,
@@ -672,7 +627,7 @@ def deform_input_stl_with_frd_pygem(
     """
     Full pipeline using PyGeM FFD:
 
-      - Read displacements from mechanical .frd
+      - Read displacements from thermo-mechanical .frd
       - Optionally export lattice PLYs
       - Build PyGeM FFD lattice from voxel nodes + displacements
       - Load original STL
@@ -756,19 +711,18 @@ def deform_input_stl_with_frd_pygem(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Voxelize an STL and generate thermal + mechanical CalculiX jobs "
-            "with C3D8R/DC3D8 hexahedra and layer-by-layer steady-state "
-            "heat-transfer steps, then deform the input STL using PyGeM FFD "
-            "(forward + pre-deformed) and optionally export the lattice as "
-            "separate PLY point clouds."
+            "Voxelize an STL and generate an uncoupled thermo-mechanical CalculiX job "
+            "with C3D8R hexahedra and layer-by-layer *UNCOUPLED TEMPERATURE-DISPLACEMENT "
+            "steps, then deform the input STL using PyGeM FFD (forward + pre-deformed) "
+            "and optionally export the lattice as separate PLY point clouds."
         )
     )
     parser.add_argument("input_stl", help="Path to input STL file")
     parser.add_argument(
         "job_name",
         help=(
-            "Base job name (thermal/mech .inp will be '<job_name>_therm.inp' and "
-            "'<job_name>_mech.inp'; CalculiX will produce corresponding .frd)."
+            "Base job name (UTD .inp will be '<job_name>_utd.inp'; CalculiX will "
+            "produce '<job_name>_utd.frd')."
         ),
     )
     parser.add_argument(
@@ -793,7 +747,7 @@ def main():
     parser.add_argument(
         "--run-ccx",
         action="store_true",
-        help="If set, run CalculiX on the generated jobs.",
+        help="If set, run CalculiX on the generated job.",
     )
     parser.add_argument(
         "--ccx-cmd",
@@ -830,12 +784,12 @@ def main():
         print("No slices generated, aborting.")
         raise SystemExit(1)
 
-    # 2) Thermal job
-    thermal_job = args.job_name + "_therm"
-    thermal_inp = thermal_job + ".inp"
+    # 2) Single uncoupled thermo-mechanical job
+    utd_job = args.job_name + "_utd"
+    utd_inp = utd_job + ".inp"
 
     write_calculix_job(
-        thermal_inp,
+        utd_inp,
         vertices,
         hexes,
         slice_to_eids,
@@ -844,44 +798,27 @@ def main():
         heat_flux=args.heat_flux,
     )
 
-    # 3) Mechanical job
-    mech_job = args.job_name + "_mech"
-    mech_inp = mech_job + ".inp"
-
-    write_mechanical_job(
-        mech_inp,
-        vertices,
-        hexes,
-        base_temp=args.base_temp,
-        thermal_job_name=thermal_job,
-        n_slices=n_slices,
-    )
-
-    # 4) Optional runs + PyGeM FFD deformation + lattice export
+    # 3) Optional run + PyGeM FFD deformation + lattice export
     if args.run_ccx:
-        ok_therm = run_calculix(thermal_job, ccx_cmd=args.ccx_cmd)
-        if not ok_therm:
-            print("[RUN] Thermal job failed, skipping mechanical job and FFD.")
-            return
-        ok_mech = run_calculix(mech_job, ccx_cmd=args.ccx_cmd)
-        if not ok_mech:
-            print("[RUN] Mechanical job failed, skipping FFD.")
+        ok = run_calculix(utd_job, ccx_cmd=args.ccx_cmd)
+        if not ok:
+            print("[RUN] UTD job failed, skipping FFD.")
             return
 
-        mech_frd = mech_job + ".frd"
-        if os.path.isfile(mech_frd):
+        utd_frd = utd_job + ".frd"
+        if os.path.isfile(utd_frd):
             deformed_stl = args.job_name + "_deformed.stl"
             lattice_basepath = args.job_name + "_lattice" if args.export_lattice else None
             deform_input_stl_with_frd_pygem(
                 args.input_stl,
-                mech_frd,
+                utd_frd,
                 vertices,
                 args.cube_size,
                 deformed_stl,
                 lattice_basepath=lattice_basepath,
             )
         else:
-            print(f"[FFD] Mechanical FRD '{mech_frd}' not found, skipping STL deformation.")
+            print(f"[FFD] Thermo-mechanical FRD '{utd_frd}' not found, skipping STL deformation.")
 
 
 if __name__ == "__main__":
