@@ -297,7 +297,7 @@ def write_calculix_job(
                     # mechanical clamp
                     f.write("BASE, 1, 6, 0.\n")
                     # temperature clamp (DOF 11)
-                    f.write(f"BASE, 11, 11, {base_temp}\n")
+                    # f.write(f"BASE, 11, 11, {base_temp}\n")
 
                 # Outputs (similar to PrePoMax Node/El file)
                 f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
@@ -306,10 +306,11 @@ def write_calculix_job(
                 f.write("*EL FILE\n")
                 f.write("S, E, HFL, NOE\n")
 
-                # Loads: body flux only on this slice, previous flux cleared
-                f.write("** Loads (body flux on current slice) ++++++++++++++++++++++\n")
+                # Loads: surface flux on TOP face (S2) of this slice, previous flux cleared
+                # S2 is the top surface for our C3D8R element ordering (1-4 bottom, 5-8 top).
+                f.write("** Loads (surface flux on top of current slice) ++++++++++++\n")
                 f.write("*DFLUX, OP=NEW\n")
-                f.write(f"{name}, BF, {heat_flux:.6E}\n")
+                f.write(f"{name}, S2, {heat_flux:.6E}\n")
 
                 f.write("*END STEP\n")
 
