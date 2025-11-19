@@ -173,26 +173,42 @@ def write_calculix_job(
     heat_flux: float = 1.0,
 ):
     """
-    Single uncoupled temperature-displacement job, modeled after the
-    PrePoMax ABS example:
+    Additive-style uncoupled temperature-displacement job with MODEL CHANGE:
 
       - C3D8R bricks
       - ABS material with thermal + mechanical properties
-      - Reference temperature 20 C (Expansion, Zero=20)
-      - NSET=BASE (bottom nodes) fixed mechanically and held at base_temp
-      - One *UNCOUPLED TEMPERATURE-DISPLACEMENT step per slice:
-          * In step k:
-              - clear previous flux (OP=NEW)
-              - apply body flux (BF) only to ELSET=SLICE_k
-          * Temperatures and displacements carry over between steps.
+      - Reference temperature 20 C (Expansion, ZERO=20)
+      - NSET=BASE (bottom nodes) fixed mechanically (and optionally thermally)
+
+      Steps:
+        Step 1:
+          - Full model active (all slices)
+          - No MODEL CHANGE
+          - No heat flux (dummy step)
+        Step 2:
+          - MODEL CHANGE: remove all slices except the first
+          - Apply SURFACE heat flux to the top of first slice
+        Step 3:
+          - MODEL CHANGE: add second slice
+          - Apply SURFACE heat flux to the top of second slice
+        Step 4:
+          - MODEL CHANGE: add third slice
+          - Apply SURFACE heat flux to the top of third slice
+        ...
+        Step (1 + k):
+          - MODEL CHANGE: add slice k (for k > 0)
+          - Apply SURFACE heat flux to the top of slice k
+
+      All steps are *UNCOUPLED TEMPERATURE-DISPLACEMENT*, so
+      temperatures and displacements carry over automatically.
 
     Parameters
     ----------
     base_temp : float
-        Clamp temperature for the base (deg C). Default 20 to match Zero=20.
+        Clamp temperature for the base (deg C). Default 20 to match ZERO=20.
     heat_flux : float
-        Body heat generation value used in *DFLUX ... BF, value.
-        Units are consistent with your MM_TON_S_C system (W/mm^3).
+        Surface heat flux value used in *DFLUX ... S2, value.
+        Units are W/mm^2 in a mm-ton-s-C system.
     """
     n_nodes = len(vertices)
     n_elems = len(hexes)
@@ -205,13 +221,17 @@ def write_calculix_job(
 
     n_slices = len(z_slices)
 
-    # choose a simple time scheme: 1.0 per slice
-    time_per_layer = 1.0
+    # simple time scheme: 1.0 per step
+    time_per_layer = 1
+    time_per_layer_step = 1
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write("**\n** Auto-generated SLA-style thermo-mechanical job\n**\n")
+        f.write("**\n** Auto-generated additive-style thermo-mechanical job\n**\n")
         f.write("*HEADING\n")
-        f.write("Voxel C3D8R uncoupled temperature-displacement (layer-wise BF heating)\n")
+        f.write(
+            "Voxel C3D8R uncoupled temperature-displacement "
+            "(layer-wise MODEL CHANGE + surface heating)\n"
+        )
 
         # -------------------- NODES --------------------
         f.write("** Nodes +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
@@ -240,15 +260,20 @@ def write_calculix_job(
             f.write("** Warning: no base nodes detected for BASE set.\n")
 
         f.write("** Element sets (per slice) ++++++++++++++++++++++++++++++++\n")
+        slice_names: List[str] = []
         for slice_idx in range(n_slices):
             eids = slice_to_eids.get(slice_idx, [])
             if not eids:
                 continue
             valid_eids = [eid for eid in eids if 1 <= eid <= n_elems]
             if not valid_eids:
-                print(f"[WARN] Slice {slice_idx} has no valid element IDs within 1..{n_elems}")
+                print(
+                    f"[WARN] Slice {slice_idx} has no valid element "
+                    f"IDs within 1..{n_elems}"
+                )
                 continue
             name = f"SLICE_{slice_idx:03d}"
+            slice_names.append(name)
             f.write(f"*ELSET, ELSET={name}\n")
             _write_id_list_lines(f, valid_eids)
 
@@ -274,47 +299,87 @@ def write_calculix_job(
 
         # -------------------- STEPS --------------------
         f.write("** Steps +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
-        if n_slices == 0:
+        if n_slices == 0 or not slice_names:
             f.write("** No slices -> no steps.\n")
         else:
-            for slice_idx in range(n_slices):
+            # Map to existing slice indices (sorted)
+            existing_slice_idxs = [int(name.split("_")[1]) for name in slice_names]
+            existing_slice_idxs.sort()
+
+            step_counter = 1
+
+            # ---------- Step 1: full model, do nothing (no heat, no MODEL CHANGE) ----------
+            f.write("** --------------------------------------------------------\n")
+            f.write("** Step 1: initial dummy step with full model (no heating)\n")
+            f.write("** --------------------------------------------------------\n")
+            f.write("*STEP\n")
+            f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT\n")
+            f.write(f"{time_per_layer_step:.6f}, {time_per_layer:.6f}\n")
+
+            # ---- Boundary conditions ----
+            if base_nodes:
+                f.write("** Boundary conditions +++++++++++++++++++++++++++++++++++++\n")
+                f.write("*BOUNDARY, OP=NEW\n")
+                f.write("BASE, 1, 6, 0.\n")
+                # Optional thermal clamp:
+                # f.write(f"BASE, 11, 11, {base_temp}\n")
+
+            f.write("*END STEP\n")
+            step_counter += 1
+
+            # ---------- Subsequent steps: one per slice ----------
+            for slice_idx in existing_slice_idxs:
                 name = f"SLICE_{slice_idx:03d}"
                 z_val = z_slices[slice_idx]
                 step_name = f"LAYER_{slice_idx:03d}"
-                t_end = (slice_idx + 1) * time_per_layer
 
                 f.write("** --------------------------------------------------------\n")
-                f.write(f"** Step {slice_idx+1}: heat slice {name} at z = {z_val}\n")
+                f.write(
+                    f"** Step {step_counter}: activate/heat slice {name} "
+                    f"at z = {z_val}\n"
+                )
                 f.write("** --------------------------------------------------------\n")
                 f.write("*STEP\n")
-                f.write(f"*UNCOUPLED TEMPERATURE-DISPLACEMENT\n")
-                f.write(f"{t_end:.6f}, {time_per_layer:.6f}\n")
+                f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT\n")
+                # per-step time period (not cumulative; this is fine)
+                f.write(f"{time_per_layer_step:.6f}, {time_per_layer:.6f}\n")
 
-                # Boundary conditions: base fixed mechanically + thermally
-                if base_nodes:
-                    f.write("** Boundary conditions +++++++++++++++++++++++++++++++++++++\n")
-                    f.write("*BOUNDARY, OP=NEW\n")
-                    # mechanical clamp
-                    f.write("BASE, 1, 6, 0.\n")
-                    # temperature clamp (DOF 11)
-                    # f.write(f"BASE, 11, 11, {base_temp}\n")
+                # ---- MODEL CHANGE ----
+                if slice_idx == existing_slice_idxs[0]:
+                    # First slice step: remove all *other* slices, keep only this one.
+                    remove = [
+                        f"SLICE_{other:03d}"
+                        for other in existing_slice_idxs
+                        if other != slice_idx
+                    ]
+                    if remove:
+                        f.write("** Model change: keep only the first slice active\n")
+                        f.write("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n")
+                        for nm in remove:
+                            f.write(f"{nm}\n")
+                else:
+                    # Subsequent slice steps: add this slice on top of already active ones
+                    f.write("** Model change: add new slice\n")
+                    f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
+                    f.write(f"{name}\n")
 
-                # Outputs (similar to PrePoMax Node/El file)
+                # ---- Outputs ----
                 f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
                 f.write("*NODE FILE\n")
                 f.write("RF, U, NT, RFL\n")
                 f.write("*EL FILE\n")
                 f.write("S, E, HFL, NOE\n")
 
-                # Loads: surface flux on TOP face (S2) of this slice, previous flux cleared
-                # S2 is the top surface for our C3D8R element ordering (1-4 bottom, 5-8 top).
+                # ---- Loads: surface flux on top of current slice ----
                 f.write("** Loads (surface flux on top of current slice) ++++++++++++\n")
                 f.write("*DFLUX, OP=NEW\n")
+                # S2 assumed to be the "top" surface (1–4 bottom, 5–8 top)
                 f.write(f"{name}, S2, {heat_flux:.6E}\n")
 
                 f.write("*END STEP\n")
+                step_counter += 1
 
-    print(f"[CCX] Wrote PrePoMax-style UT-D job to: {path}")
+    print(f"[CCX] Wrote additive-style UT-D job to: {path}")
     print(f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, slices: {n_slices}")
 
 
