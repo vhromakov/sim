@@ -169,47 +169,46 @@ def write_calculix_job(
     hexes: List[Tuple[int, int, int, int, int, int, int, int]],
     slice_to_eids: Dict[int, List[int]],
     z_slices: List[float],
-    base_temp: float = 20.0,
-    heat_flux: float = 1.0,
+    base_temp: float = 0.0,
+    heat_flux: float = 1.0,          # kept for compatibility, NOT used
+    exposure_cure: float = 0.6,      # cure level when a slice is first printed
+    post_cure_increment: float = 0.05,  # extra cure added to older slices each step
+    max_cure: float = 1.0,           # cap for cure (fully cured)
+    cure_shrink_per_unit: float = 0.2,  # ≈2% linear shrink per unit cure
 ):
     """
-    Additive-style uncoupled temperature-displacement job with MODEL CHANGE:
+    Additive-style uncoupled temperature-displacement job with MODEL CHANGE
+    and incremental curing (approach 1 with time-dependent cure).
 
-      - C3D8R bricks
-      - ABS material with thermal + mechanical properties
-      - Reference temperature 20 C (Expansion, ZERO=20)
-      - NSET=BASE (bottom nodes) fixed mechanically (and optionally thermally)
+    Interpretation:
+      - Temperature DOF (T) is a cure variable, not real °C.
+      - T = 0   -> uncured (no shrink)
+      - T in (0, max_cure] -> partially / fully cured (shrink via negative CTE)
 
-      Steps:
-        Step 1:
-          - Full model active (all slices)
-          - No MODEL CHANGE
-          - No heat flux (dummy step)
-        Step 2:
-          - MODEL CHANGE: remove all slices except the first
-          - Apply SURFACE heat flux to the top of first slice
-        Step 3:
-          - MODEL CHANGE: add second slice
-          - Apply SURFACE heat flux to the top of second slice
-        Step 4:
-          - MODEL CHANGE: add third slice
-          - Apply SURFACE heat flux to the top of third slice
-        ...
-        Step (1 + k):
-          - MODEL CHANGE: add slice k (for k > 0)
-          - Apply SURFACE heat flux to the top of slice k
+    Curing model (incremental):
+      - We track a cure_state[k] for each slice k.
+      - Initially: cure_state[k] = 0 for all k.
+      - For slice k's step:
+          • All previously printed slices (j < k) get:
+              cure_state[j] += post_cure_increment (capped to max_cure)
+          • Newly printed slice k gets:
+              cure_state[k] = max(exposure_cure, cure_state[k])
+      - In subsequent steps (for higher slices), old slices keep getting
+        post_cure_increment each time until they reach max_cure.
 
-      All steps are *UNCOUPLED TEMPERATURE-DISPLACEMENT*, so
-      temperatures and displacements carry over automatically.
+    Implementation in .inp:
+      - *EXPANSION, ZERO=0., alpha = -cure_shrink_per_unit
+      - In each slice step, we set:
+          *BOUNDARY, OP=MOD
+            BASE, 1, 6, 0.               (mechanical clamp)
+            SLICE_000_NODES, 11, 11, T0  (current cure_state[0])
+            SLICE_001_NODES, 11, 11, T1
+            ...
+            SLICE_k_NODES,   11, 11, Tk  (up to current slice)
 
-    Parameters
-    ----------
-    base_temp : float
-        Clamp temperature for the base (deg C). Default 20 to match ZERO=20.
-    heat_flux : float
-        Surface heat flux value used in *DFLUX ... S2, value.
-        Units are W/mm^2 in a mm-ton-s-C system.
+    No *DFLUX is used here; this is a purely cure-driven eigenstrain model.
     """
+
     n_nodes = len(vertices)
     n_elems = len(hexes)
 
@@ -222,15 +221,15 @@ def write_calculix_job(
     n_slices = len(z_slices)
 
     # simple time scheme: 1.0 per step
-    time_per_layer = 1
-    time_per_layer_step = 1
+    time_per_layer = 1.0
+    time_per_layer_step = 1.0
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write("**\n** Auto-generated additive-style thermo-mechanical job\n**\n")
+        f.write("**\n** Auto-generated incremental-cure shrink job\n**\n")
         f.write("*HEADING\n")
         f.write(
             "Voxel C3D8R uncoupled temperature-displacement "
-            "(layer-wise MODEL CHANGE + surface heating)\n"
+            "(layer-wise MODEL CHANGE + incremental cure-driven shrinkage)\n"
         )
 
         # -------------------- NODES --------------------
@@ -259,8 +258,10 @@ def write_calculix_job(
         else:
             f.write("** Warning: no base nodes detected for BASE set.\n")
 
-        f.write("** Element sets (per slice) ++++++++++++++++++++++++++++++++\n")
+        f.write("** Element + node sets (per slice) +++++++++++++++++++++++++\n")
         slice_names: List[str] = []
+        slice_node_ids: Dict[int, List[int]] = {}
+
         for slice_idx in range(n_slices):
             eids = slice_to_eids.get(slice_idx, [])
             if not eids:
@@ -272,81 +273,115 @@ def write_calculix_job(
                     f"IDs within 1..{n_elems}"
                 )
                 continue
+
+            # Element set
             name = f"SLICE_{slice_idx:03d}"
             slice_names.append(name)
             f.write(f"*ELSET, ELSET={name}\n")
             _write_id_list_lines(f, valid_eids)
 
-        # -------------------- MATERIAL (ABS) --------------------
+            # Node set from element connectivity
+            nodes_in_slice: Set[int] = set()
+            for eid in valid_eids:
+                n0, n1, n2, n3, n4, n5, n6, n7 = hexes[eid - 1]
+                nodes_in_slice.update([n0, n1, n2, n3, n4, n5, n6, n7])
+
+            node_list = sorted(nodes_in_slice)
+            slice_node_ids[slice_idx] = node_list
+
+            nset_name = f"{name}_NODES"
+            f.write(f"*NSET, NSET={nset_name}\n")
+            _write_id_list_lines(f, node_list)
+
+        # -------------------- MATERIAL (ABS with cure-shrink) ----------------
         f.write("** Materials +++++++++++++++++++++++++++++++++++++++++++++++\n")
         f.write("*MATERIAL, NAME=ABS\n")
         f.write("*DENSITY\n")
         f.write("1.02E-09\n")
         f.write("*ELASTIC\n")
         f.write("2000., 0.394\n")
-        f.write("*EXPANSION, ZERO=20.\n")
-        f.write("7.4E-05\n")
+
+        # Cure-shrink interpreted via negative CTE
+        alpha = -float(cure_shrink_per_unit)  # higher T -> shrink
+        f.write("*EXPANSION, ZERO=0.\n")
+        f.write(f"{alpha:.6E}\n")
+
+        # Thermal props can stay; they’re unused physically here
         f.write("*CONDUCTIVITY\n")
         f.write("0.2256\n")
         f.write("*SPECIFIC HEAT\n")
         f.write("1386000000.\n")
         f.write("*SOLID SECTION, ELSET=ALL, MATERIAL=ABS\n")
 
-        # -------------------- INITIAL TEMPERATURE --------------------
-        f.write("** Initial conditions ++++++++++++++++++++++++++++++++++++++\n")
+        # -------------------- INITIAL "TEMPERATURE" (CURE) -------------------
+        f.write("** Initial conditions (cure variable) ++++++++++++++++++++++\n")
         f.write("*INITIAL CONDITIONS, TYPE=TEMPERATURE\n")
-        f.write(f"ALLNODES, {base_temp}\n")
+        f.write(f"ALLNODES, {base_temp}\n")  # typically 0.0
 
         # -------------------- STEPS --------------------
         f.write("** Steps +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
         if n_slices == 0 or not slice_names:
             f.write("** No slices -> no steps.\n")
         else:
-            # Map to existing slice indices (sorted)
             existing_slice_idxs = [int(name.split("_")[1]) for name in slice_names]
             existing_slice_idxs.sort()
 
+            # Track cure_state per slice index
+            cure_state: Dict[int, float] = {idx: 0.0 for idx in existing_slice_idxs}
+
             step_counter = 1
 
-            # ---------- Step 1: full model, do nothing (no heat, no MODEL CHANGE) ----------
+            # Step 1: dummy, full model, uncured
             f.write("** --------------------------------------------------------\n")
-            f.write("** Step 1: initial dummy step with full model (no heating)\n")
+            f.write("** Step 1: initial dummy step with full model (no curing)\n")
             f.write("** --------------------------------------------------------\n")
             f.write("*STEP\n")
             f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT\n")
             f.write(f"{time_per_layer_step:.6f}, {time_per_layer:.6f}\n")
 
-            # ---- Boundary conditions ----
             if base_nodes:
-                f.write("** Boundary conditions +++++++++++++++++++++++++++++++++++++\n")
+                f.write("** Boundary conditions (mechanical) +++++++++++++++++++++++\n")
                 f.write("*BOUNDARY, OP=NEW\n")
                 f.write("BASE, 1, 6, 0.\n")
-                # Optional thermal clamp:
-                # f.write(f"BASE, 11, 11, {base_temp}\n")
 
             f.write("*END STEP\n")
             step_counter += 1
 
-            # ---------- Subsequent steps: one per slice ----------
+            # One incremental-curing step per slice
             for slice_idx in existing_slice_idxs:
                 name = f"SLICE_{slice_idx:03d}"
+                nset_name = f"{name}_NODES"
                 z_val = z_slices[slice_idx]
-                step_name = f"LAYER_{slice_idx:03d}"
+
+                # ---- Update cure_state before writing the step ----
+                # Older slices get extra post-cure
+                for j in existing_slice_idxs:
+                    if j < slice_idx:
+                        cure_state[j] = min(
+                            max_cure,
+                            cure_state[j] + post_cure_increment,
+                        )
+
+                # New slice gets exposure cure
+                cure_state[slice_idx] = max(
+                    cure_state[slice_idx],
+                    min(exposure_cure, max_cure),
+                )
 
                 f.write("** --------------------------------------------------------\n")
                 f.write(
-                    f"** Step {step_counter}: activate/heat slice {name} "
+                    f"** Step {step_counter}: incremental cure of slice {name} "
                     f"at z = {z_val}\n"
                 )
+                f.write("** (MODEL CHANGE + updated cure state for all printed slices)\n")
                 f.write("** --------------------------------------------------------\n")
                 f.write("*STEP\n")
                 f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT\n")
-                # per-step time period (not cumulative; this is fine)
                 f.write(f"{time_per_layer_step:.6f}, {time_per_layer:.6f}\n")
 
-                # ---- MODEL CHANGE ----
+                # MODEL CHANGE
                 if slice_idx == existing_slice_idxs[0]:
-                    # First slice step: remove all *other* slices, keep only this one.
+                    # First slice: keep only this slice active
                     remove = [
                         f"SLICE_{other:03d}"
                         for other in existing_slice_idxs
@@ -358,29 +393,45 @@ def write_calculix_job(
                         for nm in remove:
                             f.write(f"{nm}\n")
                 else:
-                    # Subsequent slice steps: add this slice on top of already active ones
+                    # Later slices: add this slice on top of existing ones
                     f.write("** Model change: add new slice\n")
                     f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
                     f.write(f"{name}\n")
 
-                # ---- Outputs ----
+                # Outputs
                 f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
                 f.write("*NODE FILE\n")
                 f.write("RF, U, NT, RFL\n")
                 f.write("*EL FILE\n")
                 f.write("S, E, HFL, NOE\n")
 
-                # ---- Loads: surface flux on top of current slice ----
-                f.write("** Loads (surface flux on top of current slice) ++++++++++++\n")
-                f.write("*DFLUX, OP=NEW\n")
-                # S2 assumed to be the "top" surface (1–4 bottom, 5–8 top)
-                f.write(f"{name}, S2, {heat_flux:.6E}\n")
+                # ---- Boundary conditions: base + cure for all printed slices ----
+                f.write("** Boundary conditions (base + incremental cure) ++++++++++\n")
+                f.write("*BOUNDARY, OP=MOD\n")
+                # Mechanical base clamp
+                if base_nodes:
+                    f.write("BASE, 1, 6, 0.\n")
+
+                # Apply cure_state to all slices that should already be "printed"
+                for j in existing_slice_idxs:
+                    if j > slice_idx:
+                        continue  # not printed yet in this simple model
+                    cure_val = cure_state[j]
+                    if cure_val == 0.0:
+                        continue  # uncured, no need to BC it
+                    nset_j = f"SLICE_{j:03d}_NODES"
+                    f.write(f"{nset_j}, 11, 11, {cure_val:.6f}\n")
 
                 f.write("*END STEP\n")
                 step_counter += 1
 
-    print(f"[CCX] Wrote additive-style UT-D job to: {path}")
-    print(f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, slices: {n_slices}")
+    print(f"[CCX] Wrote incremental-cure UT-D job to: {path}")
+    print(
+        f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, "
+        f"slices: {n_slices}, exposure_cure={exposure_cure}, "
+        f"post_cure_increment={post_cure_increment}, "
+        f"cure_shrink_per_unit={cure_shrink_per_unit}"
+    )
 
 
 # ============================================================
@@ -860,8 +911,8 @@ def main():
         hexes,
         slice_to_eids,
         z_slices,
-        base_temp=args.base_temp,
-        heat_flux=args.heat_flux,
+        # base_temp=args.base_temp,
+        # heat_flux=args.heat_flux,
     )
 
     # 3) Optional run + PyGeM FFD deformation + lattice export
