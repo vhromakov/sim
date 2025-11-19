@@ -171,7 +171,7 @@ def write_calculix_job(
     z_slices: List[float],
     base_temp: float = 0.0,
     heat_flux: float = 1.0,          # kept for compatibility, NOT used
-    shrinkage_curve: List[float] = [0.05, 0.1, 0.15, 0.2, 0.2, 0.3],
+    shrinkage_curve: List[float] = [5, 4, 3, 2, 1],
     max_cure: float = 1.0,           # cap for cure (fully cured)
     cure_shrink_per_unit: float = 0.05,  # ≈5% linear shrink at cure=1.0
 ):
@@ -184,10 +184,15 @@ def write_calculix_job(
       - T = 0   -> uncured (no shrink)
       - T in (0, max_cure] -> partially / fully cured (shrink via negative CTE)
 
-    Curing model (shrinkage_curve):
-      - We track a cure_state[k] and an applied_count[k] for each slice k.
-      - `shrinkage_curve = [c0, c1, c2, ...]` defines cure *increments* per
-        global curing step since the slice appeared:
+    Curing model (shrinkage_curve as weights):
+      - User specifies `shrinkage_curve` as *weights*, e.g.:
+            [1, 1]           -> [0.5, 0.5]
+            [10, 10, 10, 10] -> [0.25, 0.25, 0.25, 0.25]
+            [2, 4, 6, 8]     -> [0.1, 0.2, 0.3, 0.4]
+        We normalize internally so that the resulting values sum to 1.0.
+
+      - After normalization, `shrinkage_curve = [c0, c1, c2, ...]` defines cure
+        *increments* per global curing step since the slice appeared:
 
           step when slice appears      -> +c0
           next global curing step      -> +c1
@@ -198,7 +203,8 @@ def write_calculix_job(
         starting from c0 at the step it is first added, then c1, c2, etc.
 
       - We run additional post-cure steps *after* the last slice is added so
-        that even the top layer experiences the *full* shrinkage_curve.
+        that even the top layer experiences the *full* normalized curve
+        (sum of all increments = 1.0, then capped by max_cure).
 
       - Cure is always capped at `max_cure`.
 
@@ -227,9 +233,18 @@ def write_calculix_job(
     time_per_layer = 1.0
     time_per_layer_step = 1.0
 
+    # --- Normalize shrinkage_curve as weights so entries sum to 1.0 ----------
     # Make sure shrinkage_curve is non-empty
     if not shrinkage_curve:
-        shrinkage_curve = [0.0]
+        shrinkage_curve = [1.0]
+
+    total_weight = float(sum(shrinkage_curve))
+    if total_weight <= 0.0:
+        # Fallback: single full increment
+        shrinkage_curve = [1.0]
+        total_weight = 1.0
+
+    shrinkage_curve = [float(w) / total_weight for w in shrinkage_curve]
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("**\n** Auto-generated incremental-cure shrink job\n**\n")
@@ -483,11 +498,14 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
     """
     print(f"[RUN] Launching CalculiX: {ccx_cmd} {job_name}")
     try:
+        my_env = os.environ.copy()
+        my_env["OMP_NUM_THREADS"] = "12"
         result = subprocess.run(
             [ccx_cmd, job_name],
             check=False,
             capture_output=True,
             text=True,
+            env=my_env
         )
     except FileNotFoundError:
         print(f"[RUN] ERROR: CalculiX command not found: {ccx_cmd}")
