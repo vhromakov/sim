@@ -171,42 +171,45 @@ def write_calculix_job(
     z_slices: List[float],
     base_temp: float = 0.0,
     heat_flux: float = 1.0,          # kept for compatibility, NOT used
-    exposure_cure: float = 0.6,      # cure level when a slice is first printed
-    post_cure_increment: float = 0.05,  # extra cure added to older slices each step
+    shrinkage_curve: List[float] = [0.05, 0.1, 0.15, 0.2, 0.2, 0.3],
     max_cure: float = 1.0,           # cap for cure (fully cured)
-    cure_shrink_per_unit: float = 0.2,  # ≈2% linear shrink per unit cure
+    cure_shrink_per_unit: float = 0.05,  # ≈5% linear shrink at cure=1.0
 ):
     """
     Additive-style uncoupled temperature-displacement job with MODEL CHANGE
-    and incremental curing (approach 1 with time-dependent cure).
+    and incremental curing driven by a per-layer shrinkage curve.
 
     Interpretation:
-      - Temperature DOF (T) is a cure variable, not real °C.
+      - Temperature DOF (T, DOF 11) is a cure variable, not real °C.
       - T = 0   -> uncured (no shrink)
       - T in (0, max_cure] -> partially / fully cured (shrink via negative CTE)
 
-    Curing model (incremental):
-      - We track a cure_state[k] for each slice k.
-      - Initially: cure_state[k] = 0 for all k.
-      - For slice k's step:
-          • All previously printed slices (j < k) get:
-              cure_state[j] += post_cure_increment (capped to max_cure)
-          • Newly printed slice k gets:
-              cure_state[k] = max(exposure_cure, cure_state[k])
-      - In subsequent steps (for higher slices), old slices keep getting
-        post_cure_increment each time until they reach max_cure.
+    Curing model (shrinkage_curve):
+      - We track a cure_state[k] and an applied_count[k] for each slice k.
+      - `shrinkage_curve = [c0, c1, c2, ...]` defines cure *increments* per
+        global curing step since the slice appeared:
+
+          step when slice appears      -> +c0
+          next global curing step      -> +c1
+          next                         -> +c2
+          ...
+
+      - Each slice gets ONE entry from shrinkage_curve per global curing step,
+        starting from c0 at the step it is first added, then c1, c2, etc.
+
+      - We run additional post-cure steps *after* the last slice is added so
+        that even the top layer experiences the *full* shrinkage_curve.
+
+      - Cure is always capped at `max_cure`.
 
     Implementation in .inp:
       - *EXPANSION, ZERO=0., alpha = -cure_shrink_per_unit
-      - In each slice step, we set:
+      - In each global curing step we set:
           *BOUNDARY, OP=MOD
-            BASE, 1, 6, 0.               (mechanical clamp)
+            BASE, 1, 6, 0.
             SLICE_000_NODES, 11, 11, T0  (current cure_state[0])
             SLICE_001_NODES, 11, 11, T1
             ...
-            SLICE_k_NODES,   11, 11, Tk  (up to current slice)
-
-    No *DFLUX is used here; this is a purely cure-driven eigenstrain model.
     """
 
     n_nodes = len(vertices)
@@ -224,12 +227,16 @@ def write_calculix_job(
     time_per_layer = 1.0
     time_per_layer_step = 1.0
 
+    # Make sure shrinkage_curve is non-empty
+    if not shrinkage_curve:
+        shrinkage_curve = [0.0]
+
     with open(path, "w", encoding="utf-8") as f:
         f.write("**\n** Auto-generated incremental-cure shrink job\n**\n")
         f.write("*HEADING\n")
         f.write(
             "Voxel C3D8R uncoupled temperature-displacement "
-            "(layer-wise MODEL CHANGE + incremental cure-driven shrinkage)\n"
+            "(layer-wise MODEL CHANGE + shrinkage-curve-driven curing)\n"
         )
 
         # -------------------- NODES --------------------
@@ -326,8 +333,10 @@ def write_calculix_job(
             existing_slice_idxs = [int(name.split("_")[1]) for name in slice_names]
             existing_slice_idxs.sort()
 
-            # Track cure_state per slice index
+            # Track cure_state, how many curve entries applied, and which slices exist
             cure_state: Dict[int, float] = {idx: 0.0 for idx in existing_slice_idxs}
+            applied_count: Dict[int, int] = {idx: 0 for idx in existing_slice_idxs}
+            printed: Dict[int, bool] = {idx: False for idx in existing_slice_idxs}
 
             step_counter = 1
 
@@ -347,56 +356,77 @@ def write_calculix_job(
             f.write("*END STEP\n")
             step_counter += 1
 
-            # One incremental-curing step per slice
-            for slice_idx in existing_slice_idxs:
-                name = f"SLICE_{slice_idx:03d}"
-                nset_name = f"{name}_NODES"
-                z_val = z_slices[slice_idx]
+            # Total curing steps after dummy:
+            # - first n_slices steps: add each slice
+            # - then extra steps so top slice sees full curve
+            curve_len = len(shrinkage_curve)
+            total_cure_steps = len(existing_slice_idxs) + curve_len - 1
 
-                # ---- Update cure_state before writing the step ----
-                # Older slices get extra post-cure
+            for global_k in range(total_cure_steps):
+                # Determine if a new slice is added in this step
+                slice_to_add: Optional[int] = None
+                if global_k < len(existing_slice_idxs):
+                    slice_to_add = existing_slice_idxs[global_k]
+
+                # ---- Update cure_state (apply shrinkage_curve) ----
+                # Mark new slice as printed (it appears now)
+                if slice_to_add is not None:
+                    printed[slice_to_add] = True
+
+                # For all printed slices, apply next entry in curve if available
                 for j in existing_slice_idxs:
-                    if j < slice_idx:
+                    if not printed[j]:
+                        continue
+                    k_applied = applied_count[j]
+                    if k_applied >= curve_len:
+                        continue  # this slice already consumed full curve
+                    increment = shrinkage_curve[k_applied]
+                    if increment != 0.0:
                         cure_state[j] = min(
                             max_cure,
-                            cure_state[j] + post_cure_increment,
+                            cure_state[j] + increment,
                         )
+                    applied_count[j] = k_applied + 1
 
-                # New slice gets exposure cure
-                cure_state[slice_idx] = max(
-                    cure_state[slice_idx],
-                    min(exposure_cure, max_cure),
-                )
-
+                # ---- Write step header ----
                 f.write("** --------------------------------------------------------\n")
-                f.write(
-                    f"** Step {step_counter}: incremental cure of slice {name} "
-                    f"at z = {z_val}\n"
-                )
-                f.write("** (MODEL CHANGE + updated cure state for all printed slices)\n")
+                if slice_to_add is not None:
+                    name = f"SLICE_{slice_to_add:03d}"
+                    z_val = z_slices[slice_to_add]
+                    f.write(
+                        f"** Step {step_counter}: add slice {name} at z = {z_val} "
+                        f"and advance shrinkage curve\n"
+                    )
+                else:
+                    f.write(
+                        f"** Step {step_counter}: post-cure step "
+                        f"(no new slices, advance shrinkage curve)\n"
+                    )
                 f.write("** --------------------------------------------------------\n")
                 f.write("*STEP\n")
                 f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT\n")
                 f.write(f"{time_per_layer_step:.6f}, {time_per_layer:.6f}\n")
 
-                # MODEL CHANGE
-                if slice_idx == existing_slice_idxs[0]:
-                    # First slice: keep only this slice active
-                    remove = [
-                        f"SLICE_{other:03d}"
-                        for other in existing_slice_idxs
-                        if other != slice_idx
-                    ]
-                    if remove:
-                        f.write("** Model change: keep only the first slice active\n")
-                        f.write("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n")
-                        for nm in remove:
-                            f.write(f"{nm}\n")
-                else:
-                    # Later slices: add this slice on top of existing ones
-                    f.write("** Model change: add new slice\n")
-                    f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
-                    f.write(f"{name}\n")
+                # MODEL CHANGE logic (same as your previous version)
+                if slice_to_add is not None:
+                    name = f"SLICE_{slice_to_add:03d}"
+                    if slice_to_add == existing_slice_idxs[0]:
+                        # First slice: keep only this slice active
+                        remove = [
+                            f"SLICE_{other:03d}"
+                            for other in existing_slice_idxs
+                            if other != slice_to_add
+                        ]
+                        if remove:
+                            f.write("** Model change: keep only the first slice active\n")
+                            f.write("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n")
+                            for nm in remove:
+                                f.write(f"{nm}\n")
+                    else:
+                        # Later slices: add this slice on top of existing ones
+                        f.write("** Model change: add new slice\n")
+                        f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
+                        f.write(f"{name}\n")
 
                 # Outputs
                 f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
@@ -405,21 +435,19 @@ def write_calculix_job(
                 f.write("*EL FILE\n")
                 f.write("S, E, HFL, NOE\n")
 
-                # ---- Boundary conditions: base + cure for all printed slices ----
-                f.write("** Boundary conditions (base + incremental cure) ++++++++++\n")
+                # ---- Boundary conditions: base + current cure_state ----
+                f.write("** Boundary conditions (base + shrinkage-curve cure) +++++\n")
                 f.write("*BOUNDARY, OP=MOD\n")
-                # Mechanical base clamp
-                if base_nodes:
-                    f.write("BASE, 1, 6, 0.\n")
 
-                # Apply cure_state to all slices that should already be "printed"
+                # Apply cure_state to all printed slices
                 for j in existing_slice_idxs:
-                    if j > slice_idx:
-                        continue  # not printed yet in this simple model
+                    if not printed[j]:
+                        continue
                     cure_val = cure_state[j]
                     if cure_val == 0.0:
                         continue  # uncured, no need to BC it
                     nset_j = f"SLICE_{j:03d}_NODES"
+                    # DOF 11 = temperature (cure variable)
                     f.write(f"{nset_j}, 11, 11, {cure_val:.6f}\n")
 
                 f.write("*END STEP\n")
@@ -428,9 +456,8 @@ def write_calculix_job(
     print(f"[CCX] Wrote incremental-cure UT-D job to: {path}")
     print(
         f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, "
-        f"slices: {n_slices}, exposure_cure={exposure_cure}, "
-        f"post_cure_increment={post_cure_increment}, "
-        f"cure_shrink_per_unit={cure_shrink_per_unit}"
+        f"slices: {n_slices}, shrinkage_curve={shrinkage_curve}, "
+        f"max_cure={max_cure}, cure_shrink_per_unit={cure_shrink_per_unit}"
     )
 
 
