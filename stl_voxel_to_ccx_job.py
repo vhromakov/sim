@@ -173,7 +173,7 @@ def write_calculix_job(
     heat_flux: float = 1.0,          # kept for compatibility, NOT used
     shrinkage_curve: List[float] = [5, 4, 3, 2, 1],
     max_cure: float = 1.0,           # cap for cure (fully cured)
-    cure_shrink_per_unit: float = 0.05,  # ≈5% linear shrink at cure=1.0
+    cure_shrink_per_unit: float = 0.03,  # ≈3% linear shrink at cure=1.0
 ):
     """
     Additive-style uncoupled temperature-displacement job with MODEL CHANGE
@@ -765,6 +765,78 @@ def export_lattice_ply_split(
                 f.write(f"{x} {y} {z}\n")
         print(f"[PLY] Deformed lattice written to: {def_path}")
 
+def export_ffd_control_points(ffd, basepath: str):
+    """
+    Export FFD control points as two PLYs:
+
+        basepath + "_ffd_ctrl_orig.ply" : original control point positions
+        basepath + "_ffd_ctrl_def.ply"  : deformed control point positions
+
+    Works with the 'classic' PyGeM FFD API that uses:
+        - box_origin, box_length
+        - array_mu_x, array_mu_y, array_mu_z
+    """
+    if not hasattr(ffd, "array_mu_x") or not hasattr(ffd, "box_origin") or not hasattr(ffd, "box_length"):
+        print("[PLY] FFD control-point export not supported by this PyGeM FFD object.")
+        return
+
+    mu_x = np.asarray(ffd.array_mu_x, dtype=float)
+    mu_y = np.asarray(ffd.array_mu_y, dtype=float)
+    mu_z = np.asarray(ffd.array_mu_z, dtype=float)
+
+    nx, ny, nz = mu_x.shape
+    origin = np.asarray(ffd.box_origin, dtype=float).reshape(3)
+    length = np.asarray(ffd.box_length, dtype=float).reshape(3)
+    Lx, Ly, Lz = length
+
+    pts_orig = []
+    pts_def = []
+
+    # Control points param coords (s, t, u) on [0,1]^3
+    # x = origin + [s*Lx, t*Ly, u*Lz]
+    for i in range(nx):
+        s = i / (nx - 1) if nx > 1 else 0.0
+        for j in range(ny):
+            t = j / (ny - 1) if ny > 1 else 0.0
+            for k in range(nz):
+                u = k / (nz - 1) if nz > 1 else 0.0
+
+                base = origin + np.array([s * Lx, t * Ly, u * Lz], dtype=float)
+
+                disp = np.array(
+                    [
+                        mu_x[i, j, k] * Lx,
+                        mu_y[i, j, k] * Ly,
+                        mu_z[i, j, k] * Lz,
+                    ],
+                    dtype=float,
+                )
+
+                pts_orig.append(base)
+                pts_def.append(base + disp)
+
+    pts_orig = np.asarray(pts_orig, dtype=float)
+    pts_def = np.asarray(pts_def, dtype=float)
+
+    orig_path = basepath + "_ffd_ctrl_orig.ply"
+    def_path = basepath + "_ffd_ctrl_def.ply"
+
+    def write_ply(points: np.ndarray, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {points.shape[0]}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("end_header\n")
+            for x, y, z in points:
+                f.write(f"{x} {y} {z}\n")
+        print(f"[PLY] FFD control points written to: {path}")
+
+    write_ply(pts_orig, orig_path)
+    write_ply(pts_def, def_path)
+
 
 # ============================================================
 #  STL deformation with PyGeM (forward + pre-deformed)
@@ -808,7 +880,7 @@ def deform_input_stl_with_frd_pygem(
     print(f"[FFD] Displacements available for {len(displacements)} nodes "
           f"out of {len(vertices)} total.")
 
-    # Optional lattice export
+    # Optional lattice export (voxel lattice nodes)
     if lattice_basepath:
         orig_ply = lattice_basepath + "_orig.ply"
         def_ply = lattice_basepath + "_def.ply"
@@ -816,6 +888,10 @@ def deform_input_stl_with_frd_pygem(
 
     # Build FFD from voxel lattice + FE displacements
     ffd = build_ffd_from_lattice(vertices, cube_size, displacements)
+
+    # NEW: export FFD control points as seen by PyGeM
+    if lattice_basepath:
+        export_ffd_control_points(ffd, lattice_basepath)
 
     # Load original STL
     mesh = trimesh.load(input_stl)
