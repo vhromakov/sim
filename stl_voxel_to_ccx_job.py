@@ -10,8 +10,8 @@ Pipeline:
 2. Build global hex mesh (C3D8R elements).
 3. Single CalculiX job:
    - Procedure: *UNCOUPLED TEMPERATURE-DISPLACEMENT
-   - One step per slice ("layer" in Z):
-       * Apply heat flux to that layer's ELSET.
+   - One step per slice:
+       * Apply curing (via TEMP DOF) to that slice's NSET.
        * Base nodes mechanically fixed (UX, UY, UZ = 0).
        * Base nodes thermally fixed at base_temp.
        * Temperatures and displacements carry over between steps.
@@ -24,12 +24,19 @@ Pipeline:
    - if --export-lattice:
         * <job_name>_lattice_orig.ply  (original lattice nodes)
         * <job_name>_lattice_def.ply   (deformed lattice nodes)
+
+New:
+- Optional cylindrical “curved voxel” mode (--curved-voxels) where voxels are
+  axis-aligned in cylindrical param space (u, v, w), then mapped to a cylinder
+  in world space. Each slice becomes a curved layer following the cylindrical
+  surface (radial bands).
 """
 
 import argparse
 import os
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Set, Optional
 
+import math
 import numpy as np
 import trimesh
 import subprocess
@@ -45,21 +52,156 @@ except ImportError:
 
 
 # ============================================================
+#  Cylindrical mapping helpers
+# ============================================================
+
+def world_to_param_cyl(point, cx, cz, R0):
+    """
+    Map world coordinates (x, y, z) to cylindrical param space (u, v, w).
+
+    Cylinder axis is along global Y and centered at (cx, cz) in XZ plane.
+    R0 is the base cylinder radius.
+
+    Returns:
+        (u, v, w)
+        u: coordinate along cylinder axis (Y)
+        v: arc length along circumference (R0 * angle)
+        w: radial offset from base cylinder (r - R0)
+    """
+    x, y, z = point
+    dx = x - cx
+    dz = z - cz
+
+    u = y
+    r = math.sqrt(dx * dx + dz * dz)
+
+    if r < 1e-12:
+        theta = 0.0
+    else:
+        theta = math.atan2(dz, dx)
+
+    v = R0 * theta
+    w = r - R0
+
+    return (u, v, w)
+
+
+def param_to_world_cyl(param_point, cx, cz, R0):
+    """
+    Map param space point (u, v, w) back to world (x, y, z)
+    using the same cylinder definition.
+
+    Args:
+        param_point: (u, v, w)
+        cx, cz: cylinder center in XZ plane
+        R0: base radius
+
+    Returns:
+        (x, y, z)
+    """
+    u, v, w = param_point
+
+    theta = v / R0
+    r = R0 + w
+
+    x = cx + r * math.cos(theta)
+    y = u
+    z = cz + r * math.sin(theta)
+
+    return (x, y, z)
+
+def export_cylinder_debug_stl(
+    cx: float,
+    cz: float,
+    R0: float,
+    y_min: float,
+    y_max: float,
+    path: str,
+    n_theta: int = 64,
+):
+    """
+    Export a simple cylinder surface as STL for debugging.
+
+    - Axis: global +Y
+    - Center in XZ: (cx, cz)
+    - Radius: R0
+    - Extends from y_min to y_max
+
+    This is just a triangulated tube (no caps).
+    """
+    if R0 <= 0.0:
+        print("[CYL] Radius <= 0, skipping cylinder STL export.")
+        return
+
+    thetas = np.linspace(0.0, 2.0 * math.pi, n_theta, endpoint=False)
+
+    # Two rings: bottom at y_min and top at y_max
+    bottom = []
+    top = []
+    for theta in thetas:
+        x = cx + R0 * math.cos(theta)
+        z = cz + R0 * math.sin(theta)
+        bottom.append([x, y_min, z])
+        top.append([x, y_max, z])
+
+    bottom = np.array(bottom, dtype=float)
+    top = np.array(top, dtype=float)
+
+    vertices = np.vstack([bottom, top])
+    faces = []
+
+    # Connect triangles between bottom and top rings
+    for i in range(n_theta):
+        j = (i + 1) % n_theta
+
+        # indices in vertices array
+        b0 = i
+        b1 = j
+        t0 = i + n_theta
+        t1 = j + n_theta
+
+        # quad (b0, b1, t1, t0) -> two triangles
+        faces.append([b0, b1, t1])
+        faces.append([b0, t1, t0])
+
+    faces = np.array(faces, dtype=np.int64)
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    mesh.export(path)
+    print(f"[CYL] Debug cylinder STL written to: {path}")
+
+
+# ============================================================
 #  Voxel mesh -> CalculiX job
 # ============================================================
 
 def generate_global_cubic_hex_mesh(
     input_stl: str,
     cube_size: float,
+    curved_voxels: bool = False,
+    cyl_center_xz: Optional[Tuple[float, float]] = None,
+    cyl_radius: Optional[float] = None,
 ):
     """
     Voxelize input_stl and build a global C3D8R brick mesh.
 
+    If curved_voxels is False (default):
+        - Standard axis-aligned voxels in world (x,y,z).
+        - Slices are horizontal layers in Z.
+
+    If curved_voxels is True:
+        - STL is first mapped to cylindrical param space (u,v,w) using
+          world_to_param_cyl (axis along Y).
+        - Voxelization happens in (u,v,w).
+        - Voxel corners (in param space) are mapped back to world via
+          param_to_world_cyl, giving curved hexahedra that follow a cylinder.
+        - Slices become radial layers (bands in w).
+
     Returns:
-        vertices: List[(x, y, z)]
-        hexes:    List[(v1..v8)]  1-based indices
+        vertices: List[(x, y, z)]          world-coordinates of nodes
+        hexes:    List[(v1..v8)]           1-based node indices
         slice_to_eids: Dict[slice_index -> List[element_id]]
-        z_slices: List[float]  physical z of each slice index (sorted bottom->top)
+        z_slices: List[float]              slice "position" (Z or param w)
     """
     if cube_size <= 0:
         raise ValueError("cube_size must be positive")
@@ -73,6 +215,93 @@ def generate_global_cubic_hex_mesh(
 
     print(f"[VOXEL] Loaded mesh from {input_stl}")
     print(f"[VOXEL] Watertight: {mesh.is_watertight}, bbox extents: {mesh.extents}")
+
+    cyl_params = None
+    if curved_voxels:
+        # Work in world space to determine cylinder first
+        bounds = mesh.bounds  # shape (2,3): [[xmin,ymin,zmin], [xmax,ymax,zmax]]
+        x_min, y_min, z_min = bounds[0]
+        x_max, y_max, z_max = bounds[1]
+
+        verts_world = mesh.vertices.copy()
+
+        # --- Find lowest point (min Z) ---
+        z_coords = verts_world[:, 2]
+        min_z_idx = int(np.argmin(z_coords))
+        x_low, y_low, z_low = verts_world[min_z_idx]
+
+        # We'll start from this X as cylinder center X
+        cx_cyl = float(x_low)
+
+        if cyl_radius is not None and cyl_radius > 0.0:
+            # --- User provided radius: enforce that lowest point lies on cylinder ---
+            R0 = float(cyl_radius)
+
+            z_center_bbox = 0.5 * (z_min + z_max)
+            cz_plus = z_low + R0
+            cz_minus = z_low - R0
+
+            # Choose center Z that keeps axis near bbox center
+            if abs(cz_plus - z_center_bbox) < abs(cz_minus - z_center_bbox):
+                cz_cyl = cz_plus
+            else:
+                cz_cyl = cz_minus
+
+            if cyl_center_xz is not None:
+                print(
+                    "[VOXEL] Note: --cyl-center-xz provided, but CZ is "
+                    "overridden to enforce lowest point on cylinder."
+                )
+
+            print(
+                f"[VOXEL] Using user radius R0={R0:.3f}; lowest point "
+                f"({x_low:.3f}, {y_low:.3f}, {z_low:.3f}) lies on cylinder."
+            )
+
+        else:
+            # --- No radius provided: fall back to old behaviour ---
+            if cyl_center_xz is not None:
+                # Explicit center overrides auto X/Z
+                cx_cli, cz_cli = cyl_center_xz
+                cx_cyl = cx_cli
+                cz_cyl = cz_cli
+                print(
+                    "[VOXEL] No radius given; using explicit cyl-center-xz "
+                    f"({cx_cyl:.3f}, {cz_cyl:.3f})"
+                )
+            else:
+                # X from lowest-Z point, Z from bbox center
+                cz_cyl = 0.5 * (z_min + z_max)
+                print(
+                    "[VOXEL] No radius given; using cx from lowest-Z point "
+                    f"and cz=bbox center: cx={cx_cyl:.3f}, cz={cz_cyl:.3f}"
+                )
+
+            dx = verts_world[:, 0] - cx_cyl
+            dz = verts_world[:, 2] - cz_cyl
+            r = np.sqrt(dx * dx + dz * dz)
+            R0 = float(np.mean(r))
+
+        print(
+            f"[VOXEL] Cyl center from lowest Z vertex: "
+            f"min_z={z_low:.3f}, lowest_pt=({x_low:.3f}, {y_low:.3f}, {z_low:.3f})"
+        )
+        print(
+            f"[VOXEL] Cylindrical voxel mode ON: axis=+Y, "
+            f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), R0={R0:.3f}"
+        )
+
+        # --- Debug cylinder STL (ideal cylinder) ---
+        input_base = os.path.splitext(os.path.basename(input_stl))[0]
+        cyl_debug_stl = input_base + "_cylinder_debug.stl"
+        export_cylinder_debug_stl(cx_cyl, cz_cyl, R0, y_min, y_max, cyl_debug_stl)
+
+        # Map mesh into param space (u,v,w)
+        verts_param = np.zeros_like(verts_world)
+        for i, (x, y, z) in enumerate(verts_world):
+            verts_param[i] = world_to_param_cyl((x, y, z), cx_cyl, cz_cyl, R0)
+        mesh.vertices = verts_param
+        cyl_params = (cx_cyl, cz_cyl, R0)
 
     print(f"[VOXEL] Voxelizing with cube size = {cube_size} ...")
     vox = mesh.voxelized(pitch=cube_size)
@@ -90,20 +319,29 @@ def generate_global_cubic_hex_mesh(
     order = np.lexsort((indices[:, 0], indices[:, 1], indices[:, 2]))
     indices_sorted = indices[order]
 
-    # map iz -> physical z
+    # map iz -> slice "position"
+    # planar: z_center (world Z); curved: w_center (param w)
     unique_iz = np.unique(indices_sorted[:, 2])
     layer_info = []
     for iz in unique_iz:
         idx_arr = np.array([[0, 0, iz]], dtype=float)
-        z_center = float(vox.indices_to_points(idx_arr)[0, 2])
-        layer_info.append((iz, z_center))
-    layer_info.sort(key=lambda x: x[1])
+        pt = vox.indices_to_points(idx_arr)[0]  # in mesh coordinate system
+        slice_coord = float(pt[2])  # Z in planar, w in cylindrical param space
+        layer_info.append((iz, slice_coord))
+    # Sorting slice order: planar = low Z first; cylindrical = high w first
+    if curved_voxels:
+        # w = radial offset; larger w is farther from cylinder center.
+        # For printing/curing order, slice 0 must be at model bottom → largest w.
+        layer_info.sort(key=lambda x: x[1], reverse=True)
+    else:
+        # planar slicing: bottom Z first
+        layer_info.sort(key=lambda x: x[1])
 
     iz_to_slice: Dict[int, int] = {}
     z_slices: List[float] = []
-    for slice_idx, (iz, z_phys) in enumerate(layer_info):
+    for slice_idx, (iz, pos) in enumerate(layer_info):
         iz_to_slice[int(iz)] = slice_idx
-        z_slices.append(z_phys)
+        z_slices.append(pos)
 
     vertex_index_map: Dict[Tuple[int, int, int], int] = {}
     vertices: List[Tuple[float, float, float]] = []
@@ -124,31 +362,85 @@ def generate_global_cubic_hex_mesh(
     half = cube_size / 2.0
     print("[VOXEL] Building global C3D8R mesh ...")
 
-    for (ix, iy, iz) in indices_sorted:
-        center = vox.indices_to_points(
-            np.array([[ix, iy, iz]], dtype=float)
-        )[0]
-        cx, cy, cz = center
-        x0, x1 = cx - half, cx + half
-        y0, y1 = cy - half, cy + half
-        z0, z1 = cz - half, cz + half
+    if not curved_voxels:
+        # ----------- Original axis-aligned cubic voxels -----------
+        for (ix, iy, iz) in indices_sorted:
+            center = vox.indices_to_points(
+                np.array([[ix, iy, iz]], dtype=float)
+            )[0]
+            cx, cy, cz = center
+            x0, x1 = cx - half, cx + half
+            y0, y1 = cy - half, cy + half
+            z0, z1 = cz - half, cz + half
 
-        # bottom face
-        v0 = get_vertex_index((ix,   iy,   iz),   (x0, y0, z0))  # x-,y-,z-
-        v1 = get_vertex_index((ix+1, iy,   iz),   (x1, y0, z0))  # x+,y-,z-
-        v2 = get_vertex_index((ix+1, iy+1, iz),   (x1, y1, z0))  # x+,y+,z-
-        v3 = get_vertex_index((ix,   iy+1, iz),   (x0, y1, z0))  # x-,y+,z-
-        # top face
-        v4 = get_vertex_index((ix,   iy,   iz+1), (x0, y0, z1))  # x-,y-,z+
-        v5 = get_vertex_index((ix+1, iy,   iz+1), (x1, y0, z1))  # x+,y-,z+
-        v6 = get_vertex_index((ix+1, iy+1, iz+1), (x1, y1, z1))  # x+,y+,z+
-        v7 = get_vertex_index((ix,   iy+1, iz+1), (x0, y1, z1))  # x-,y+,z+
+            # bottom face
+            v0 = get_vertex_index((ix,   iy,   iz),   (x0, y0, z0))  # x-,y-,z-
+            v1 = get_vertex_index((ix+1, iy,   iz),   (x1, y0, z0))  # x+,y-,z-
+            v2 = get_vertex_index((ix+1, iy+1, iz),   (x1, y1, z0))  # x+,y+,z-
+            v3 = get_vertex_index((ix,   iy+1, iz),   (x0, y1, z0))  # x-,y+,z-
+            # top face
+            v4 = get_vertex_index((ix,   iy,   iz+1), (x0, y0, z1))  # x-,y-,z+
+            v5 = get_vertex_index((ix+1, iy,   iz+1), (x1, y0, z1))  # x+,y-,z+
+            v6 = get_vertex_index((ix+1, iy+1, iz+1), (x1, y1, z1))  # x+,y+,z+
+            v7 = get_vertex_index((ix,   iy+1, iz+1), (x0, y1, z1))  # x-,y+,z+
 
-        hexes.append((v0, v1, v2, v3, v4, v5, v6, v7))
+            hexes.append((v0, v1, v2, v3, v4, v5, v6, v7))
 
-        eid = len(hexes)
-        slice_idx = iz_to_slice[int(iz)]
-        slice_to_eids[slice_idx].append(eid)
+            eid = len(hexes)
+            slice_idx = iz_to_slice[int(iz)]
+            slice_to_eids[slice_idx].append(eid)
+    else:
+        # ----------- Curved voxels on cylindrical surface -----------
+        if cyl_params is None:
+            raise RuntimeError("cyl_params missing in curved voxel mode")
+        cx_cyl, cz_cyl, R0 = cyl_params
+
+        for (ix, iy, iz) in indices_sorted:
+            center_param = vox.indices_to_points(
+                np.array([[ix, iy, iz]], dtype=float)
+            )[0]
+            u_c, v_c, w_c = center_param
+
+            u0, u1 = u_c - half, u_c + half
+            v0, v1 = v_c - half, v_c + half
+            w0, w1 = w_c - half, w_c + half
+
+            # param-space corners of this voxel
+            p0 = (u0, v0, w0)  # "bottom" in param space
+            p1 = (u1, v0, w0)
+            p2 = (u1, v1, w0)
+            p3 = (u0, v1, w0)
+            p4 = (u0, v0, w1)  # "top" in param space
+            p5 = (u1, v0, w1)
+            p6 = (u1, v1, w1)
+            p7 = (u0, v1, w1)
+
+            # map to world (curved hexa)
+            x0, y0, z0 = param_to_world_cyl(p0, cx_cyl, cz_cyl, R0)
+            x1, y1, z1 = param_to_world_cyl(p1, cx_cyl, cz_cyl, R0)
+            x2, y2, z2 = param_to_world_cyl(p2, cx_cyl, cz_cyl, R0)
+            x3, y3, z3 = param_to_world_cyl(p3, cx_cyl, cz_cyl, R0)
+            x4, y4, z4 = param_to_world_cyl(p4, cx_cyl, cz_cyl, R0)
+            x5, y5, z5 = param_to_world_cyl(p5, cx_cyl, cz_cyl, R0)
+            x6, y6, z6 = param_to_world_cyl(p6, cx_cyl, cz_cyl, R0)
+            x7, y7, z7 = param_to_world_cyl(p7, cx_cyl, cz_cyl, R0)
+
+            # bottom face
+            v0_idx = get_vertex_index((ix,   iy,   iz),   (x0, y0, z0))
+            v1_idx = get_vertex_index((ix+1, iy,   iz),   (x1, y1, z1))
+            v2_idx = get_vertex_index((ix+1, iy+1, iz),   (x2, y2, z2))
+            v3_idx = get_vertex_index((ix,   iy+1, iz),   (x3, y3, z3))
+            # top face
+            v4_idx = get_vertex_index((ix,   iy,   iz+1), (x4, y4, z4))
+            v5_idx = get_vertex_index((ix+1, iy,   iz+1), (x5, y5, z5))
+            v6_idx = get_vertex_index((ix+1, iy+1, iz+1), (x6, y6, z6))
+            v7_idx = get_vertex_index((ix,   iy+1, iz+1), (x7, y7, z7))
+
+            hexes.append((v0_idx, v1_idx, v2_idx, v3_idx, v4_idx, v5_idx, v6_idx, v7_idx))
+
+            eid = len(hexes)
+            slice_idx = iz_to_slice[int(iz)]
+            slice_to_eids[slice_idx].append(eid)
 
     print(
         f"[VOXEL] Built mesh: {len(vertices)} nodes, "
@@ -171,61 +463,27 @@ def write_calculix_job(
     z_slices: List[float],
     base_temp: float = 0.0,
     heat_flux: float = 1.0,          # kept for compatibility, NOT used
-    shrinkage_curve: List[float] = [5, 4, 3, 2, 1],
-    max_cure: float = 1.0,           # cap for cure (fully cured)
-    cure_shrink_per_unit: float = 0.03,  # ≈3% linear shrink at cure=1.0
+    shrinkage_curve: List[float] = [1],
+    max_cure: float = 1.0,
+    cure_shrink_per_unit: float = 0.2,
+    curved_voxels: bool = False,     # <--- NEW
 ):
     """
     Additive-style uncoupled temperature-displacement job with MODEL CHANGE
     and incremental curing driven by a per-layer shrinkage curve.
 
-    Interpretation:
-      - Temperature DOF (T, DOF 11) is a cure variable, not real °C.
-      - T = 0   -> uncured (no shrink)
-      - T in (0, max_cure] -> partially / fully cured (shrink via negative CTE)
-
-    Curing model (shrinkage_curve as weights):
-      - User specifies `shrinkage_curve` as *weights*, e.g.:
-            [1, 1]           -> [0.5, 0.5]
-            [10, 10, 10, 10] -> [0.25, 0.25, 0.25, 0.25]
-            [2, 4, 6, 8]     -> [0.1, 0.2, 0.3, 0.4]
-        We normalize internally so that the resulting values sum to 1.0.
-
-      - After normalization, `shrinkage_curve = [c0, c1, c2, ...]` defines cure
-        *increments* per global curing step since the slice appeared:
-
-          step when slice appears      -> +c0
-          next global curing step      -> +c1
-          next                         -> +c2
-          ...
-
-      - Each slice gets ONE entry from shrinkage_curve per global curing step,
-        starting from c0 at the step it is first added, then c1, c2, etc.
-
-      - We run additional post-cure steps *after* the last slice is added so
-        that even the top layer experiences the *full* normalized curve
-        (sum of all increments = 1.0, then capped by max_cure).
-
-      - Cure is always capped at `max_cure`.
-
-    Implementation in .inp:
-      - *EXPANSION, ZERO=0., alpha = -cure_shrink_per_unit
-      - In each global curing step we set:
-          *BOUNDARY, OP=MOD
-            BASE, 1, 6, 0.
-            SLICE_000_NODES, 11, 11, T0  (current cure_state[0])
-            SLICE_001_NODES, 11, 11, T1
-            ...
+    (Unchanged logic – slices may now be curved radial layers when curved_voxels
+    mode is used.)
     """
 
     n_nodes = len(vertices)
     n_elems = len(hexes)
 
-    # detect bottom nodes as "BASE"
-    z_coords = np.array([v[2] for v in vertices], dtype=float)
-    z_min = float(z_coords.min())
-    tol = (z_coords.max() - z_min + 1e-9) * 1e-3
-    base_nodes = [i + 1 for i, z in enumerate(z_coords) if abs(z - z_min) <= tol]
+    # detect bottom nodes as "BASE" by minimum world Z
+    # z_coords = np.array([v[2] for v in vertices], dtype=float)
+    # z_min = float(z_coords.min())
+    # tol = (z_coords.max() - z_min + 1e-9) * 1e-3
+    # base_nodes = [i + 1 for i, z in enumerate(z_coords) if abs(z - z_min) <= tol]
 
     n_slices = len(z_slices)
 
@@ -234,13 +492,11 @@ def write_calculix_job(
     time_per_layer_step = 1.0
 
     # --- Normalize shrinkage_curve as weights so entries sum to 1.0 ----------
-    # Make sure shrinkage_curve is non-empty
     if not shrinkage_curve:
         shrinkage_curve = [1.0]
 
     total_weight = float(sum(shrinkage_curve))
     if total_weight <= 0.0:
-        # Fallback: single full increment
         shrinkage_curve = [1.0]
         total_weight = 1.0
 
@@ -274,11 +530,8 @@ def write_calculix_job(
         f.write("*NSET, NSET=ALLNODES, GENERATE\n")
         f.write(f"1, {n_nodes}, 1\n")
 
-        if base_nodes:
-            f.write("*NSET, NSET=BASE\n")
-            _write_id_list_lines(f, base_nodes)
-        else:
-            f.write("** Warning: no base nodes detected for BASE set.\n")
+        # We'll define BASE after we build per-slice node sets
+        base_nodes = []
 
         f.write("** Element + node sets (per slice) +++++++++++++++++++++++++\n")
         slice_names: List[str] = []
@@ -315,6 +568,32 @@ def write_calculix_job(
             f.write(f"*NSET, NSET={nset_name}\n")
             _write_id_list_lines(f, node_list)
 
+        # -------------------- BASE from bottom faces of first slice ---------------
+        existing_slice_idxs = sorted(slice_node_ids.keys())
+        if existing_slice_idxs:
+            base_slice = existing_slice_idxs[0]
+            base_eids = slice_to_eids.get(base_slice, [])
+
+            base_node_set: Set[int] = set()
+            for eid in base_eids:
+                n0, n1, n2, n3, n4, n5, n6, n7 = hexes[eid - 1]
+
+                if curved_voxels:
+                    # Cylindrical case: "bottom" = outer radial face (w1) = nodes 4..7
+                    base_node_set.update([n4, n5, n6, n7])
+                else:
+                    # Planar case: bottom = lower Z face = nodes 0..3
+                    base_node_set.update([n0, n1, n2, n3])
+
+            base_nodes = sorted(base_node_set)
+
+            f.write("** Base node set = bottom faces of first slice +++++++++++++++\n")
+            f.write("*NSET, NSET=BASE\n")
+            _write_id_list_lines(f, base_nodes)
+        else:
+            f.write("** Warning: no slices -> no BASE node set.\n")
+            base_nodes = []
+
         # -------------------- MATERIAL (ABS with cure-shrink) ----------------
         f.write("** Materials +++++++++++++++++++++++++++++++++++++++++++++++\n")
         f.write("*MATERIAL, NAME=ABS\n")
@@ -323,12 +602,10 @@ def write_calculix_job(
         f.write("*ELASTIC\n")
         f.write("2000., 0.394\n")
 
-        # Cure-shrink interpreted via negative CTE
         alpha = -float(cure_shrink_per_unit)  # higher T -> shrink
         f.write("*EXPANSION, ZERO=0.\n")
         f.write(f"{alpha:.6E}\n")
 
-        # Thermal props can stay; they’re unused physically here
         f.write("*CONDUCTIVITY\n")
         f.write("0.2256\n")
         f.write("*SPECIFIC HEAT\n")
@@ -348,7 +625,6 @@ def write_calculix_job(
             existing_slice_idxs = [int(name.split("_")[1]) for name in slice_names]
             existing_slice_idxs.sort()
 
-            # Track cure_state, how many curve entries applied, and which slices exist
             cure_state: Dict[int, float] = {idx: 0.0 for idx in existing_slice_idxs}
             applied_count: Dict[int, int] = {idx: 0 for idx in existing_slice_idxs}
             printed: Dict[int, bool] = {idx: False for idx in existing_slice_idxs}
@@ -371,30 +647,23 @@ def write_calculix_job(
             f.write("*END STEP\n")
             step_counter += 1
 
-            # Total curing steps after dummy:
-            # - first n_slices steps: add each slice
-            # - then extra steps so top slice sees full curve
             curve_len = len(shrinkage_curve)
             total_cure_steps = len(existing_slice_idxs) + curve_len - 1
 
             for global_k in range(total_cure_steps):
-                # Determine if a new slice is added in this step
                 slice_to_add: Optional[int] = None
                 if global_k < len(existing_slice_idxs):
                     slice_to_add = existing_slice_idxs[global_k]
 
-                # ---- Update cure_state (apply shrinkage_curve) ----
-                # Mark new slice as printed (it appears now)
                 if slice_to_add is not None:
                     printed[slice_to_add] = True
 
-                # For all printed slices, apply next entry in curve if available
                 for j in existing_slice_idxs:
                     if not printed[j]:
                         continue
                     k_applied = applied_count[j]
                     if k_applied >= curve_len:
-                        continue  # this slice already consumed full curve
+                        continue
                     increment = shrinkage_curve[k_applied]
                     if increment != 0.0:
                         cure_state[j] = min(
@@ -403,7 +672,6 @@ def write_calculix_job(
                         )
                     applied_count[j] = k_applied + 1
 
-                # ---- Write step header ----
                 f.write("** --------------------------------------------------------\n")
                 if slice_to_add is not None:
                     name = f"SLICE_{slice_to_add:03d}"
@@ -422,11 +690,9 @@ def write_calculix_job(
                 f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT\n")
                 f.write(f"{time_per_layer_step:.6f}, {time_per_layer:.6f}\n")
 
-                # MODEL CHANGE logic (same as your previous version)
                 if slice_to_add is not None:
                     name = f"SLICE_{slice_to_add:03d}"
                     if slice_to_add == existing_slice_idxs[0]:
-                        # First slice: keep only this slice active
                         remove = [
                             f"SLICE_{other:03d}"
                             for other in existing_slice_idxs
@@ -438,31 +704,26 @@ def write_calculix_job(
                             for nm in remove:
                                 f.write(f"{nm}\n")
                     else:
-                        # Later slices: add this slice on top of existing ones
                         f.write("** Model change: add new slice\n")
                         f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
                         f.write(f"{name}\n")
 
-                # Outputs
                 f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
                 f.write("*NODE FILE\n")
                 f.write("RF, U, NT, RFL\n")
                 f.write("*EL FILE\n")
                 f.write("S, E, HFL, NOE\n")
 
-                # ---- Boundary conditions: base + current cure_state ----
                 f.write("** Boundary conditions (base + shrinkage-curve cure) +++++\n")
                 f.write("*BOUNDARY, OP=MOD\n")
 
-                # Apply cure_state to all printed slices
                 for j in existing_slice_idxs:
                     if not printed[j]:
                         continue
                     cure_val = cure_state[j]
                     if cure_val == 0.0:
-                        continue  # uncured, no need to BC it
+                        continue
                     nset_j = f"SLICE_{j:03d}_NODES"
-                    # DOF 11 = temperature (cure variable)
                     f.write(f"{nset_j}, 11, 11, {cure_val:.6f}\n")
 
                 f.write("*END STEP\n")
@@ -481,10 +742,6 @@ def write_calculix_job(
 # ============================================================
 
 def write_mechanical_job(*args, **kwargs):
-    """
-    Deprecated: the pipeline now uses a single *UNCOUPLED TEMPERATURE-DISPLACEMENT job.
-    This function is kept only to avoid breaking imports; it is not used in main().
-    """
     print("[WARN] write_mechanical_job() is deprecated and not used in this script.")
 
 
@@ -493,9 +750,6 @@ def write_mechanical_job(*args, **kwargs):
 # ============================================================
 
 def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
-    """
-    Run CalculiX on given job (job_name without .inp).
-    """
     print(f"[RUN] Launching CalculiX: {ccx_cmd} {job_name}")
     try:
         my_env = os.environ.copy()
@@ -527,23 +781,6 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
 # ============================================================
 
 def read_frd_displacements(frd_path: str) -> Dict[int, np.ndarray]:
-    """
-    Parse nodal displacements from a CalculiX .frd file.
-
-    We look for the last DISP dataset:
-
-        -4  DISP ...
-        -5  D1 ...
-        -5  D2 ...
-        -5  D3 ...
-        -5  ALL ...
-        -1  <node> <D1> <D2> <D3>
-        ...
-        -3
-
-    Lines are parsed using fixed-width columns, because the node ID and
-    first value may be glued when the value is negative (so split() is unsafe).
-    """
     if not os.path.isfile(frd_path):
         print(f"[FRD] File not found: {frd_path}")
         return {}
@@ -560,7 +797,6 @@ def read_frd_displacements(frd_path: str) -> Dict[int, np.ndarray]:
             if not s:
                 continue
 
-            # Start of a DISP result block
             if s.startswith("-4") and "DISP" in s:
                 disp = {}
                 in_disp = True
@@ -569,12 +805,10 @@ def read_frd_displacements(frd_path: str) -> Dict[int, np.ndarray]:
             if not in_disp:
                 continue
 
-            # End of this result block
             if s.startswith("-3"):
                 in_disp = False
                 continue
 
-            # Nodal data line
             if s.startswith("-1"):
                 try:
                     nid_str = line[3:13]
@@ -604,20 +838,6 @@ def build_ffd_from_lattice(
     cube_size: float,
     displacements: Dict[int, np.ndarray],
 ):
-    """
-    Build a PyGeM FFD object whose control points coincide (logically)
-    with the voxel lattice nodes, and whose control point displacements
-    come from the FE nodal displacements.
-
-    This implementation is compatible with the *classic* PyGeM API:
-
-        FFD(n_control_points=[nx, ny, nz])
-        ffd.box_origin, ffd.box_length, ffd.rot_angle
-        ffd.array_mu_x / array_mu_y / array_mu_z
-
-    The FE displacements (in physical units) are converted to the
-    normalized weights used by PyGeM: array_mu_* = disp / box_length.
-    """
     if FFD is None:
         raise RuntimeError("PyGeM FFD is not available. Please install 'pygem'.")
 
@@ -631,7 +851,6 @@ def build_ffd_from_lattice(
 
     inv_h = 1.0 / float(cube_size)
 
-    # First pass: find max logical indices (ix, iy, iz), assuming regular grid
     imax = jmax = kmax = 0
     logical_idx: List[Tuple[int, int, int]] = []
 
@@ -647,16 +866,14 @@ def build_ffd_from_lattice(
         if iz > kmax:
             kmax = iz
 
-    nx = imax + 1  # number of control points in X
-    ny = jmax + 1  # in Y
-    nz = kmax + 1  # in Z
+    nx = imax + 1
+    ny = jmax + 1
+    nz = kmax + 1
 
     print(f"[FFD] Building PyGeM FFD: n_control_points = ({nx}, {ny}, {nz})")
 
-    # --- Create FFD (classic PyGeM API) ---
     ffd = FFD(n_control_points=[nx, ny, nz])
 
-    # Align FFD box with voxel lattice bounding box
     Lx = max(x_max - x_min, 1e-12)
     Ly = max(y_max - y_min, 1e-12)
     Lz = max(z_max - z_min, 1e-12)
@@ -665,7 +882,6 @@ def build_ffd_from_lattice(
     ffd.box_length[:] = np.array([Lx, Ly, Lz], dtype=float)
     ffd.rot_angle[:] = np.array([0.0, 0.0, 0.0], dtype=float)
 
-    # Reset weights if available, otherwise zero arrays manually
     if hasattr(ffd, "reset_weights"):
         ffd.reset_weights()
     else:
@@ -673,8 +889,6 @@ def build_ffd_from_lattice(
         ffd.array_mu_y[:] = 0.0
         ffd.array_mu_z[:] = 0.0
 
-    # --- Map FE nodal displacements -> FFD weights ---
-    # displacements[nid] is in physical units
     for nid, (ix, iy, iz) in enumerate(logical_idx, start=1):
         if not (0 <= ix < nx and 0 <= iy < ny and 0 <= iz < nz):
             continue
@@ -683,7 +897,6 @@ def build_ffd_from_lattice(
         if u is None:
             continue
 
-        # Convert physical displacement to normalized mu (per box length)
         ffd.array_mu_x[ix, iy, iz] = u[0] / Lx
         ffd.array_mu_y[ix, iy, iz] = u[1] / Ly
         ffd.array_mu_z[ix, iy, iz] = u[2] / Lz
@@ -702,14 +915,6 @@ def export_lattice_ply_split(
     def_path: str,
     max_points: int = 20000,
 ):
-    """
-    Export lattice as two PLY point clouds:
-
-        - orig_path : original lattice node positions
-        - def_path  : deformed lattice node positions
-
-    Both are ASCII PLY files of points (no colors).
-    """
     if not vertices:
         print("[PLY] No vertices, skipping lattice export.")
         return
@@ -765,17 +970,8 @@ def export_lattice_ply_split(
                 f.write(f"{x} {y} {z}\n")
         print(f"[PLY] Deformed lattice written to: {def_path}")
 
+
 def export_ffd_control_points(ffd, basepath: str):
-    """
-    Export FFD control points as two PLYs:
-
-        basepath + "_ffd_ctrl_orig.ply" : original control point positions
-        basepath + "_ffd_ctrl_def.ply"  : deformed control point positions
-
-    Works with the 'classic' PyGeM FFD API that uses:
-        - box_origin, box_length
-        - array_mu_x, array_mu_y, array_mu_z
-    """
     if not hasattr(ffd, "array_mu_x") or not hasattr(ffd, "box_origin") or not hasattr(ffd, "box_length"):
         print("[PLY] FFD control-point export not supported by this PyGeM FFD object.")
         return
@@ -792,8 +988,6 @@ def export_ffd_control_points(ffd, basepath: str):
     pts_orig = []
     pts_def = []
 
-    # Control points param coords (s, t, u) on [0,1]^3
-    # x = origin + [s*Lx, t*Ly, u*Lz]
     for i in range(nx):
         s = i / (nx - 1) if nx > 1 else 0.0
         for j in range(ny):
@@ -843,7 +1037,6 @@ def export_ffd_control_points(ffd, basepath: str):
 # ============================================================
 
 def ffd_apply_points(ffd, pts: np.ndarray) -> np.ndarray:
-    """Wrapper to handle PyGeM API (__call__ vs deform)."""
     try:
         return ffd(pts)
     except TypeError:
@@ -858,16 +1051,6 @@ def deform_input_stl_with_frd_pygem(
     output_stl: str,
     lattice_basepath: str = None,
 ):
-    """
-    Full pipeline using PyGeM FFD:
-
-      - Read displacements from thermo-mechanical .frd
-      - Optionally export lattice PLYs
-      - Build PyGeM FFD lattice from voxel nodes + displacements
-      - Load original STL
-      - Forward FFD deformation -> deformed STL
-      - Pre-deformed STL -> apply FFD with reversed control displacements
-    """
     if FFD is None:
         print("[FFD] PyGeM FFD not available; skipping STL deformation.")
         return
@@ -880,20 +1063,16 @@ def deform_input_stl_with_frd_pygem(
     print(f"[FFD] Displacements available for {len(displacements)} nodes "
           f"out of {len(vertices)} total.")
 
-    # Optional lattice export (voxel lattice nodes)
     if lattice_basepath:
         orig_ply = lattice_basepath + "_orig.ply"
         def_ply = lattice_basepath + "_def.ply"
         export_lattice_ply_split(vertices, displacements, orig_ply, def_ply)
 
-    # Build FFD from voxel lattice + FE displacements
     ffd = build_ffd_from_lattice(vertices, cube_size, displacements)
 
-    # NEW: export FFD control points as seen by PyGeM
     if lattice_basepath:
         export_ffd_control_points(ffd, lattice_basepath)
 
-    # Load original STL
     mesh = trimesh.load(input_stl)
     if not isinstance(mesh, trimesh.Trimesh):
         if isinstance(mesh, trimesh.Scene):
@@ -906,23 +1085,15 @@ def deform_input_stl_with_frd_pygem(
     n_verts = orig_verts.shape[0]
     print(f"[FFD] Deforming input STL with {n_verts} vertices using PyGeM FFD...")
 
-    # ------------------------------------------------------------------
-    # Forward deformation: FFD with +displacements -> deformed STL
-    # ------------------------------------------------------------------
     deformed_verts = ffd_apply_points(ffd, orig_verts)
     mesh.vertices = deformed_verts
     mesh.export(output_stl)
     print(f"[FFD] Deformed STL (PyGeM) written to: {output_stl}")
 
-    # ------------------------------------------------------------------
-    # Pre-deformation: flip control displacements and apply to original
-    # ------------------------------------------------------------------
     print("[FFD] Computing pre-deformed STL by reversing FFD control displacements...")
 
-    # Restore original geometry
     mesh.vertices = orig_verts
 
-    # Flip the FFD weights (classic PyGeM: array_mu_x/y/z)
     try:
         if hasattr(ffd, "array_mu_x") and hasattr(ffd, "array_mu_y") and hasattr(ffd, "array_mu_z"):
             ffd.array_mu_x *= -1.0
@@ -1001,6 +1172,30 @@ def main():
             "'<job_name>_lattice_def.ply' point clouds."
         ),
     )
+    # --- New cylindrical voxel options ---
+    parser.add_argument(
+        "--curved-voxels",
+        action="store_true",
+        help=(
+            "Use cylindrical curved voxels instead of axis-aligned cubes. "
+            "Cylinder axis is global +Y; slices become radial layers."
+        ),
+    )
+    parser.add_argument(
+        "--cyl-center-xz",
+        type=float,
+        nargs=2,
+        metavar=("CX", "CZ"),
+        help="Cylinder axis center in XZ plane (used with --curved-voxels).",
+    )
+    parser.add_argument(
+        "--cyl-radius",
+        type=float,
+        help=(
+            "Base cylinder radius R0 (used with --curved-voxels). "
+            "If omitted, estimated from STL geometry."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1012,6 +1207,9 @@ def main():
     vertices, hexes, slice_to_eids, z_slices = generate_global_cubic_hex_mesh(
         args.input_stl,
         args.cube_size,
+        curved_voxels=args.curved_voxels,
+        cyl_center_xz=tuple(args.cyl_center_xz) if args.cyl_center_xz else None,
+        cyl_radius=args.cyl_radius,
     )
     if not vertices or not hexes:
         print("No mesh generated, aborting.")
@@ -1034,6 +1232,7 @@ def main():
         z_slices,
         # base_temp=args.base_temp,
         # heat_flux=args.heat_flux,
+        curved_voxels=args.curved_voxels,   # <--- NEW
     )
 
     # 3) Optional run + PyGeM FFD deformation + lattice export

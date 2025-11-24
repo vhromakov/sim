@@ -19,3 +19,8 @@ python stl_voxel_to_ccx_job.py donut_.stl donut_job --cube-size 5 --run-ccx --cc
 ```
 
 python stl_voxel_to_ccx_job.py donut_vert_.stl cube_job --cube-size 0.75 --run-ccx --ccx-cmd "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe"
+
+Cylindrical Slicing 
+```
+python stl_voxel_to_ccx_job.py MODELS/cube.stl cube_job --cube-size 5 --run-ccx --ccx-cmd "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe" --curved-voxels --cyl-center-xz 0 100 --cyl-radius 100 
+```
