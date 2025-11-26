@@ -25,12 +25,17 @@ import trimesh
 #  Cylindrical mapping helpers
 # ============================================================
 
-def world_to_param_cyl(point, cx, cz, R0):
+def world_to_param_cyl(
+    point,
+    cx: float,
+    cz: float,
+    R0: float,
+):
     """
     Map world coordinates (x, y, z) to cylindrical param space (u, v, w).
 
     Cylinder axis is along global Y and centered at (cx, cz) in XZ plane.
-    R0 is the base cylinder radius.
+    R0 is the base cylinder radius used for angular mapping.
 
     Returns:
         (u, v, w)
@@ -56,7 +61,12 @@ def world_to_param_cyl(point, cx, cz, R0):
     return (u, v, w)
 
 
-def param_to_world_cyl(param_point, cx, cz, R0, theta_offset: float = 0.0):
+def param_to_world_cyl(
+    param_point,
+    cx: float,
+    cz: float,
+    R0: float,
+):
     """
     Map param space point (u, v, w) back to world (x, y, z)
     using the same cylinder definition.
@@ -65,15 +75,13 @@ def param_to_world_cyl(param_point, cx, cz, R0, theta_offset: float = 0.0):
         param_point: (u, v, w)
         cx, cz: cylinder center in XZ plane
         R0: base radius used for angular mapping
-        theta_offset: global angular offset applied to all points
-                      (used to align lowest point with voxel center)
 
     Returns:
         (x, y, z)
     """
     u, v, w = param_point
 
-    theta = v / R0 + theta_offset
+    theta = v / R0
     r = R0 + w
 
     x = cx + r * math.cos(theta)
@@ -121,7 +129,7 @@ def generate_cylindrical_voxel_lattice(
         axis_point_world:   point on cylinder axis near lowest point (same Y)
         edge_left_world:    radial edge direction (angular left)
         edge_right_world:   radial edge direction (angular right)
-        cyl_params:         (cx, cz, R0_world, theta_offset)
+        cyl_params:         (cx, cz, R0)
     """
     if cube_size <= 0:
         raise ValueError("cube_size must be positive")
@@ -141,13 +149,13 @@ def generate_cylindrical_voxel_lattice(
     x_min_w, y_min_w, z_min_w = bounds[0]
     x_max_w, y_max_w, z_max_w = bounds[1]
 
-    cyl_params: Optional[Tuple[float, float, float, float]] = None  # (cx, cz, R0_world, theta_offset)
+    cyl_params: Optional[Tuple[float, float, float]] = None  # (cx, cz, R0)
 
     r_lowest: Optional[float] = None
     theta_lowest: Optional[float] = None
     cx_cyl: Optional[float] = None
     cz_cyl: Optional[float] = None
-    R0_param: Optional[float] = None  # radius used for world->param mapping
+    R0_param: Optional[float] = None  # intermediate estimate
     lowest_point_world: Optional[Tuple[float, float, float]] = None
     axis_point_world: Optional[Tuple[float, float, float]] = None
     edge_left_world: Optional[Tuple[float, float, float]] = None
@@ -207,10 +215,16 @@ def generate_cylindrical_voxel_lattice(
                 f"and cz=bbox center: cx={cx_cyl:.3f}, cz={cz_cyl:.3f}"
             )
 
+    # --- compute radii & angles of all vertices wrt chosen axis ---
     dx_all = verts_world[:, 0] - cx_cyl
     dz_all = verts_world[:, 2] - cz_cyl
     r_all = np.sqrt(dx_all * dx_all + dz_all * dz_all)
-    R0_param = float(np.mean(r_all))
+
+    if R0_param is None:
+        R0_param = float(np.mean(r_all))
+    else:
+        # Just for info: R0_param set by user above
+        pass
 
     # Radial/angle of the lowest point (with chosen center)
     dx_low = x_low - cx_cyl
@@ -219,7 +233,6 @@ def generate_cylindrical_voxel_lattice(
     theta_lowest = math.atan2(dz_low, dx_low)  # angle of lowest point
 
     # --- Angular edges of the STL around the lowest direction ---------
-    # Angles of all STL vertices around the cylinder axis
     theta_all = np.arctan2(dz_all, dx_all)
 
     # Differences w.r.t. theta_lowest, wrapped to [-pi, pi]
@@ -260,15 +273,28 @@ def generate_cylindrical_voxel_lattice(
         f"min_z={z_low:.3f}, lowest_pt=({x_low:.3f}, {y_low:.3f}, {z_low:.3f}), "
         f"r_low={r_lowest:.3f}, theta_low={theta_lowest:.3f} rad"
     )
+
+    # --- choose final cylinder mapping (R0) ---
+    #
+    # R0: use R0_param (user radius or geometric mean).
+    #
+    R0 = float(R0_param)
+
     print(
         f"[VOXEL] Cylindrical voxel mode: axis=+Y, "
-        f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), R0_param={R0_param:.3f}"
+        f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), "
+        f"R0={R0:.3f}"
     )
 
-    # Map mesh into param space (u,v,w) using R0_param
+    # Map mesh into param space (u,v,w) using final (R0)
     verts_param = np.zeros_like(verts_world)
     for i, (x, y, z) in enumerate(verts_world):
-        verts_param[i] = world_to_param_cyl((x, y, z), cx_cyl, cz_cyl, R0_param)
+        verts_param[i] = world_to_param_cyl(
+            (x, y, z),
+            cx_cyl,
+            cz_cyl,
+            R0,
+        )
     mesh.vertices = verts_param
 
     # --- Tangential (v) extents of the STL in param space -------------
@@ -327,24 +353,11 @@ def generate_cylindrical_voxel_lattice(
     total_voxels = indices.shape[0]
     print(f"[VOXEL] Total voxels after angular trim (param v): {total_voxels}")
 
-    # sort by iz, iy, ix
+    # sort by iz, iy, ix (radial, tangential, axial indices)
     order = np.lexsort((indices[:, 0], indices[:, 1], indices[:, 2]))
     indices_sorted = indices[order]
 
-    # Map iz -> slice "position" in param space: w_center
-    unique_iz = np.unique(indices_sorted[:, 2])
-    layer_info = []
-    for iz in unique_iz:
-        idx_arr = np.array([[0, 0, iz]], dtype=float)
-        pt = vox.indices_to_points(idx_arr)[0]  # in param coordinates
-        slice_coord = float(pt[2])  # w in cylindrical param space
-        layer_info.append((iz, slice_coord))
-
-    # Sorting slice order: high w first (outer radial band as base slice)
-    layer_info.sort(key=lambda x: x[1], reverse=True)
-
-    z_slices: List[float] = [pos for (iz, pos) in layer_info]
-
+    # --- Prepare lattice building structures -------------------------
     vertex_index_map: Dict[Tuple[int, int, int], int] = {}
     vertices: List[Tuple[float, float, float]] = []
 
@@ -361,85 +374,11 @@ def generate_cylindrical_voxel_lattice(
 
     half = cube_size / 2.0
 
-    # --- For curved voxels: compute R0_world (radial alignment) and theta_offset (tangential alignment)
-    R0_world: Optional[float] = None
-    theta_offset: float = 0.0
-
-    if (
-        r_lowest is None or R0_param is None or
-        cx_cyl is None or cz_cyl is None or theta_lowest is None
-    ):
-        raise RuntimeError("[VOXEL] Internal error: cylindrical parameters not initialized.")
-
-    # --- Radial: force lowest point onto outer face of base slice ---
-    if z_slices:
-        # Base slice is slice_idx 0 (outermost radial band) after sort(reverse=True)
-        w_center_base = z_slices[0]           # param w of slice center
-        w_face_outer = w_center_base + half   # param w of outer face
-
-        # Want: R0_world + w_face_outer = r_lowest  ->  R0_world = r_lowest - w_face_outer
-        R0_world = r_lowest - w_face_outer
-
-        if R0_world <= 0.0:
-            print(
-                f"[VOXEL] WARNING: computed R0_world={R0_world:.6f} <= 0; "
-                f"falling back to R0_param={R0_param:.6f}"
-            )
-            R0_world = max(R0_param, cube_size)
-
-        print(
-            "[VOXEL] Aligning outer face of base radial layer with lowest point:\n"
-            f"        r_low={r_lowest:.6f}, w_center_base={w_center_base:.6f}, "
-            f"w_face_outer={w_face_outer:.6f} -> R0_world={R0_world:.6f}"
-        )
-    else:
-        R0_world = R0_param
-        print(
-            "[VOXEL] No slices? Using R0_param for R0_world "
-            f"(R0_world={R0_world:.6f})."
-        )
-
-    # --- Tangential: find voxel in base slice whose center angle is closest to theta_lowest ---
-    base_slice_iz = layer_info[0][0] if layer_info else None
-    best_dtheta = None
-    best_theta_center = None
-
-    if base_slice_iz is not None:
-        for (ix, iy, iz) in indices_sorted:
-            if iz != base_slice_iz:
-                continue
-
-            center_param = vox.indices_to_points(
-                np.array([[ix, iy, iz]], dtype=float)
-            )[0]
-            u_c, v_c, w_c = center_param
-
-            # Use R0_world with zero offset to get preliminary center
-            x_c, y_c, z_c = param_to_world_cyl((u_c, v_c, w_c), cx_cyl, cz_cyl, R0_world, theta_offset=0.0)
-            theta_center = math.atan2(z_c - cz_cyl, x_c - cx_cyl)
-
-            # Smallest angular difference mod 2π
-            dtheta = abs(((theta_center - theta_lowest + math.pi) % (2.0 * math.pi)) - math.pi)
-
-            if best_dtheta is None or dtheta < best_dtheta:
-                best_dtheta = dtheta
-                best_theta_center = theta_center
-
-    if best_theta_center is not None:
-        theta_offset = theta_lowest - best_theta_center
-        print(
-            "[VOXEL] Tangential alignment: base-slice voxel center angle "
-            f"{best_theta_center:.6f} -> theta_low={theta_lowest:.6f}, "
-            f"theta_offset={theta_offset:.6f}"
-        )
-    else:
-        theta_offset = 0.0
-        print("[VOXEL] WARNING: could not find base slice voxel for tangential alignment.")
-
     # This is the cylinder definition used by the voxel mesh
-    cyl_params = (cx_cyl, cz_cyl, R0_world, theta_offset)
+    R0_world: float = float(R0)
+    cyl_params = (cx_cyl, cz_cyl, R0_world)
 
-    # --- Build voxel-node lattice (curved hex nodes) -------------------------
+    # --- Build voxel-node lattice (curved hexa nodes) -------------------------
     print("[VOXEL] Building voxel-node lattice (curved hexa nodes) ...")
 
     for (ix, iy, iz) in indices_sorted:
@@ -463,14 +402,14 @@ def generate_cylindrical_voxel_lattice(
         p7 = (u0, v1, w1)
 
         # map to world (curved hexa)
-        x0, y0, z0 = param_to_world_cyl(p0, cx_cyl, cz_cyl, R0_world, theta_offset)
-        x1, y1, z1 = param_to_world_cyl(p1, cx_cyl, cz_cyl, R0_world, theta_offset)
-        x2, y2, z2 = param_to_world_cyl(p2, cx_cyl, cz_cyl, R0_world, theta_offset)
-        x3, y3, z3 = param_to_world_cyl(p3, cx_cyl, cz_cyl, R0_world, theta_offset)
-        x4, y4, z4 = param_to_world_cyl(p4, cx_cyl, cz_cyl, R0_world, theta_offset)
-        x5, y5, z5 = param_to_world_cyl(p5, cx_cyl, cz_cyl, R0_world, theta_offset)
-        x6, y6, z6 = param_to_world_cyl(p6, cx_cyl, cz_cyl, R0_world, theta_offset)
-        x7, y7, z7 = param_to_world_cyl(p7, cx_cyl, cz_cyl, R0_world, theta_offset)
+        x0, y0, z0 = param_to_world_cyl(p0, cx_cyl, cz_cyl, R0_world)
+        x1, y1, z1 = param_to_world_cyl(p1, cx_cyl, cz_cyl, R0_world)
+        x2, y2, z2 = param_to_world_cyl(p2, cx_cyl, cz_cyl, R0_world)
+        x3, y3, z3 = param_to_world_cyl(p3, cx_cyl, cz_cyl, R0_world)
+        x4, y4, z4 = param_to_world_cyl(p4, cx_cyl, cz_cyl, R0_world)
+        x5, y5, z5 = param_to_world_cyl(p5, cx_cyl, cz_cyl, R0_world)
+        x6, y6, z6 = param_to_world_cyl(p6, cx_cyl, cz_cyl, R0_world)
+        x7, y7, z7 = param_to_world_cyl(p7, cx_cyl, cz_cyl, R0_world)
 
         # Deduplicate nodes by (ix,iy,iz-based) key
         get_vertex_index((ix,   iy,   iz),   (x0, y0, z0))
@@ -484,6 +423,78 @@ def generate_cylindrical_voxel_lattice(
 
     print(f"[VOXEL] Lattice nodes: {len(vertices)}")
     return vertices, lowest_point_world, axis_point_world, edge_left_world, edge_right_world, cyl_params
+
+
+# ============================================================
+#  FFD lattice generation (bent parallelepiped in cylinder space)
+# ============================================================
+
+def build_ffd_lattice(
+    u_range: Tuple[float,float],
+    v_range: Tuple[float,float],
+    w_range: Tuple[float,float],
+    ffd_res: Tuple[int,int,int],
+    cyl_params: Tuple[float,float,float],
+):
+    """
+    Build an FFD lattice block in param space and map it to world space.
+
+    u_range = (u_min, u_max)
+    v_range = (v_min, v_max)
+    w_range = (w_min, w_max)
+
+    ffd_res = (nu, nv, nw)  number of control points in each direction.
+
+    Returns:
+        List[(x,y,z)] of FFD control points (flattened)
+    """
+    cx, cz, R0 = cyl_params
+    nu, nv, nw = ffd_res
+
+    u_min, u_max = u_range
+    v_min, v_max = v_range
+    w_min, w_max = w_range
+
+    us = np.linspace(u_min, u_max, nu)
+    vs = np.linspace(v_min, v_max, nv)
+    ws = np.linspace(w_min, w_max, nw)
+
+    points_world: List[Tuple[float,float,float]] = []
+
+    for u in us:
+        for v in vs:
+            for w in ws:
+                x, y, z = param_to_world_cyl((u, v, w), cx, cz, R0)
+                points_world.append((x, y, z))
+
+    return points_world
+
+
+# ============================================================
+#  FFD lattice PLY export
+# ============================================================
+
+def export_ffd_lattice_ply(points, out_path: str):
+    if not points:
+        print("[FFD] No FFD points to export.")
+        return
+
+    pts = np.array(points, dtype=float)
+    print(f"[FFD] Exporting {pts.shape[0]} FFD control points to {out_path}")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {pts.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("end_header\n")
+        for x, y, z in pts:
+            f.write(f"{x} {y} {z}\n")
+
+    print(f"[FFD] lattice written to: {out_path}")
+
 
 
 # ============================================================
@@ -699,6 +710,112 @@ def main():
         edge_left_point=edge_left_point,
         edge_right_point=edge_right_point,
     )
+
+    # --------------------------------------------
+    # Build FFD lattice covering voxel param bounds
+    # --------------------------------------------
+
+    # param bounds come from voxel param points
+    cx, cz, R0 = cyl_params
+
+    verts_param = np.array([
+        world_to_param_cyl(v, cx, cz, R0)
+        for v in vertices
+    ])
+
+    u_min, v_min2, w_min = verts_param.min(axis=0)
+    u_max, v_max2, w_max = verts_param.max(axis=0)
+
+    # --------------------------------------------
+    # Build FFD lattice matching voxel grid dims
+    # --------------------------------------------
+    ffd_points = build_ffd_lattice_from_vertices(
+        vertices,
+        cyl_params,
+        args.cube_size,
+    )
+
+    ffd_path = args.job_name + "_ffd_lattice_orig.ply"
+    export_ffd_lattice_ply(ffd_points, ffd_path)
+
+
+# ============================================================
+#  FFD lattice generation (same resolution as voxel grid)
+# ============================================================
+
+def build_ffd_lattice_from_vertices(
+    vertices: List[Tuple[float, float, float]],
+    cyl_params: Tuple[float, float, float],
+    cube_size: float,
+) -> List[Tuple[float, float, float]]:
+    """
+    Build an FFD control lattice whose node counts match the voxel grid:
+
+        nu = (#voxels along u) + 1
+        nv = (#voxels along v) + 1
+        nw = (#voxels along w) + 1
+
+    We infer this from the param-space extents of the voxel *nodes*.
+    """
+    cx, cz, R0 = cyl_params
+
+    # Map voxel nodes back to param space (u, v, w)
+    verts_param = np.array(
+        [world_to_param_cyl(v, cx, cz, R0) for v in vertices],
+        dtype=float,
+    )
+
+    u_vals = verts_param[:, 0]
+    v_vals = verts_param[:, 1]
+    w_vals = verts_param[:, 2]
+
+    u_min = float(u_vals.min())
+    u_max = float(u_vals.max())
+    v_min = float(v_vals.min())
+    v_max = float(v_vals.max())
+    w_min = float(w_vals.min())
+    w_max = float(w_vals.max())
+
+    # Spans should be ~ N_cells * cube_size in each direction
+    u_span = u_max - u_min
+    v_span = v_max - v_min
+    w_span = w_max - w_min
+
+    def compute_nodes(span: float) -> int:
+        # N_cells ≈ span / cube_size  → nodes = N_cells + 1
+        if span <= 0.0:
+            return 2
+        return max(2, int(round(span / cube_size)) + 1)
+
+    nu = compute_nodes(u_span)
+    nv = compute_nodes(v_span)
+    nw = compute_nodes(w_span)
+
+    print(
+        "[FFD] param extents:\n"
+        f"      u=[{u_min:.6f}, {u_max:.6f}] (span={u_span:.6f})\n"
+        f"      v=[{v_min:.6f}, {v_max:.6f}] (span={v_span:.6f})\n"
+        f"      w=[{w_min:.6f}, {w_max:.6f}] (span={w_span:.6f})"
+    )
+    print(
+        f"[FFD] inferred voxel cells: "
+        f"nu-1={nu-1}, nv-1={nv-1}, nw-1={nw-1}"
+    )
+    print(f"[FFD] FFD resolution (nodes): ({nu}, {nv}, {nw})")
+
+    # Node coordinates span exactly the same param box as the voxel nodes
+    us = np.linspace(u_min, u_max, nu)
+    vs = np.linspace(v_min, v_max, nv)
+    ws = np.linspace(w_min, w_max, nw)
+
+    points_world: List[Tuple[float, float, float]] = []
+    for u in us:
+        for v in vs:
+            for w in ws:
+                x, y, z = param_to_world_cyl((u, v, w), cx, cz, R0)
+                points_world.append((x, y, z))
+
+    return points_world
 
 
 if __name__ == "__main__":
