@@ -857,23 +857,26 @@ def build_ffd_from_lattice(
     cyl_params: Optional[Tuple[float, float, float]] = None,
 ):
     """
-    Build a PyGeM FFD lattice from voxel nodes.
+    Build a PyGeM FFD lattice from voxel nodes, entirely in *input model
+    coordinates* (world space).
 
-    FFD resolution and cylindrical param extents follow the same logic as
-    build_ffd_lattice_from_vertices() in gen_grid.py:
+    - FFD box_origin / box_length are the axis-aligned bbox of voxel nodes.
+    - Logical indices (ix,iy,iz) come from world coordinates with spacing cube_size.
+    - Displacements from FRD are in world coords and stored directly as mu_x/y/z.
 
-        nu = (#voxels along u) + 1  ~= span_u / cube_size + 1
-        nv = (#voxels along v) + 1  ~= span_v / cube_size + 1
-        nw = (#voxels along w) + 1  ~= span_w / cube_size + 1
-
-    We infer this from the cylindrical param-space extents of the voxel nodes.
+    Cylindrical mapping is ONLY used earlier to create the curved voxel mesh;
+    it is NOT used for FFD itself. This keeps STL, voxels and FFD all in the
+    same coordinate system.
     """
     if FFD is None:
         raise RuntimeError("PyGeM FFD is not available. Please install 'pygem'.")
 
+    if not vertices:
+        raise ValueError("build_ffd_from_lattice: no vertices provided")
+
     coords = np.array(vertices, dtype=float)
 
-    # World-space bounds (for classic rectangular FFD box)
+    # World-space bounds of voxel nodes (input-model coordinates)
     x_min = float(coords[:, 0].min())
     x_max = float(coords[:, 0].max())
     y_min = float(coords[:, 1].min())
@@ -881,84 +884,32 @@ def build_ffd_from_lattice(
     z_min = float(coords[:, 2].min())
     z_max = float(coords[:, 2].max())
 
-    # ------------------------------------------------------------
-    # Determine FFD resolution from cylindrical param extents
-    # ------------------------------------------------------------
-    if cyl_params is None:
-        # Fallback: rectangular param box based on world coords
-        # (not expected in cylindrical workflow, but kept for robustness)
-        print("[FFD] WARNING: cyl_params is None, falling back to world-based FFD grid.")
-        Lx = max(x_max - x_min, 1e-12)
-        Ly = max(y_max - y_min, 1e-12)
-        Lz = max(z_max - z_min, 1e-12)
-
-        def compute_nodes(span: float) -> int:
-            if span <= 0.0:
-                return 2
-            return max(2, int(round(span / cube_size)) + 1)
-
-        nx = compute_nodes(Lx)
-        ny = compute_nodes(Ly)
-        nz = compute_nodes(Lz)
-
-        # Dummy logical indices based on world coords
-        uvw = None
-    else:
-        cx_cyl, cz_cyl, R0 = cyl_params
-
-        # Map voxel nodes back to param space (u, v, w)
-        uvw = np.array(
-            [world_to_param_cyl(v, cx_cyl, cz_cyl, R0) for v in coords],
-            dtype=float,
-        )
-
-        u_vals = uvw[:, 0]
-        v_vals = uvw[:, 1]
-        w_vals = uvw[:, 2]
-
-        u_min = float(u_vals.min())
-        u_max = float(u_vals.max())
-        v_min = float(v_vals.min())
-        v_max = float(v_vals.max())
-        w_min = float(w_vals.min())
-        w_max = float(w_vals.max())
-
-        u_span = u_max - u_min
-        v_span = v_max - v_min
-        w_span = w_max - w_min
-
-        def compute_nodes(span: float) -> int:
-            # N_cells ≈ span / cube_size  → nodes = N_cells + 1
-            if span <= 0.0:
-                return 2
-            return max(2, int(round(span / cube_size)) + 1)
-
-        nx = compute_nodes(u_span)
-        ny = compute_nodes(v_span)
-        nz = compute_nodes(w_span)
-
-        print(
-            "[FFD] param extents:\n"
-            f"      u=[{u_min:.6f}, {u_max:.6f}] (span={u_span:.6f})\n"
-            f"      v=[{v_min:.6f}, {v_max:.6f}] (span={v_span:.6f})\n"
-            f"      w=[{w_min:.6f}, {w_max:.6f}] (span={w_span:.6f})"
-        )
-        print(
-            f"[FFD] inferred voxel cells: "
-            f"nu-1={nx-1}, nv-1={ny-1}, nw-1={nz-1}"
-        )
-        print(f"[FFD] FFD resolution (nodes): ({nx}, {ny}, {nz})")
-
-    # ------------------------------------------------------------
-    # Construct FFD object
-    # ------------------------------------------------------------
-    print(f"[FFD] Building PyGeM FFD: n_control_points = ({nx}, {ny}, {nz})")
-
-    ffd = FFD(n_control_points=[nx, ny, nz])
-
     Lx = max(x_max - x_min, 1e-12)
     Ly = max(y_max - y_min, 1e-12)
     Lz = max(z_max - z_min, 1e-12)
+
+    def compute_nodes(span: float) -> int:
+        # N_cells ≈ span / cube_size → nodes = N_cells + 1
+        if span <= 0.0:
+            return 2
+        return max(2, int(round(span / cube_size)) + 1)
+
+    nx = compute_nodes(Lx)
+    ny = compute_nodes(Ly)
+    nz = compute_nodes(Lz)
+
+    print(
+        "[FFD] World-space extents (voxel nodes):\n"
+        f"      x=[{x_min:.6f}, {x_max:.6f}] (Lx={Lx:.6f})\n"
+        f"      y=[{y_min:.6f}, {y_max:.6f}] (Ly={Ly:.6f})\n"
+        f"      z=[{z_min:.6f}, {z_max:.6f}] (Lz={Lz:.6f})"
+    )
+    print(f"[FFD] FFD resolution (nodes): ({nx}, {ny}, {nz})")
+
+    # ------------------------------------------------------------
+    # Construct FFD object in world coordinates
+    # ------------------------------------------------------------
+    ffd = FFD(n_control_points=[nx, ny, nz])
 
     ffd.box_origin[:] = np.array([x_min, y_min, z_min], dtype=float)
     ffd.box_length[:] = np.array([Lx, Ly, Lz], dtype=float)
@@ -973,34 +924,16 @@ def build_ffd_from_lattice(
 
     # ------------------------------------------------------------
     # Fill control weights from nodal displacements
-    # (logical indices derived from cylindrical param grid)
+    # using world-coordinate logical indices
     # ------------------------------------------------------------
     logical_idx: List[Tuple[int, int, int]] = []
+    inv_h = 1.0 / float(cube_size)
 
-    if cyl_params is not None and uvw is not None:
-        # Use param-space to define logical indices
-        u_vals = uvw[:, 0]
-        v_vals = uvw[:, 1]
-        w_vals = uvw[:, 2]
-
-        u_min = float(u_vals.min())
-        v_min = float(v_vals.min())
-        w_min = float(w_vals.min())
-
-        for nid in range(1, len(vertices) + 1):
-            u, v, w = uvw[nid - 1]
-            ix = int(round((u - u_min) / cube_size))
-            iy = int(round((v - v_min) / cube_size))
-            iz = int(round((w - w_min) / cube_size))
-            logical_idx.append((ix, iy, iz))
-    else:
-        # Fallback: world-based logical indices
-        inv_h = 1.0 / float(cube_size)
-        for nid, (x, y, z) in enumerate(vertices, start=1):
-            ix = int(round((x - x_min) * inv_h))
-            iy = int(round((y - y_min) * inv_h))
-            iz = int(round((z - z_min) * inv_h))
-            logical_idx.append((ix, iy, iz))
+    for nid, (x, y, z) in enumerate(vertices, start=1):
+        ix = int(round((x - x_min) * inv_h))
+        iy = int(round((y - y_min) * inv_h))
+        iz = int(round((z - z_min) * inv_h))
+        logical_idx.append((ix, iy, iz))
 
     for nid, (ix, iy, iz) in enumerate(logical_idx, start=1):
         if not (0 <= ix < nx and 0 <= iy < ny and 0 <= iz < nz):
@@ -1010,46 +943,16 @@ def build_ffd_from_lattice(
         if u is None:
             continue
 
+        # u is a world displacement (ux,uy,uz)
         ffd.array_mu_x[ix, iy, iz] = u[0] / Lx
         ffd.array_mu_y[ix, iy, iz] = u[1] / Ly
         ffd.array_mu_z[ix, iy, iz] = u[2] / Lz
 
-    # --- Cylindrical meta-data for exporting curved FFD lattice -------------
-    if cyl_params is not None:
-        cx_cyl, cz_cyl, R0 = cyl_params
-
-        # If we haven't already computed uvw, do so now
-        if uvw is None:
-            uvw = np.array(
-                [world_to_param_cyl(v, cx_cyl, cz_cyl, R0) for v in coords],
-                dtype=float,
-            )
-
-        u_vals = uvw[:, 0]
-        v_vals = uvw[:, 1]
-        w_vals = uvw[:, 2]
-
-        u_min = float(u_vals.min())
-        u_max = float(u_vals.max())
-        v_min = float(v_vals.min())
-        v_max = float(v_vals.max())
-        w_min = float(w_vals.min())
-        w_max = float(w_vals.max())
-
-        setattr(ffd, "_curved_voxels", True)
-        setattr(ffd, "_cyl_params", cyl_params)
-        setattr(ffd, "_param_bounds", (u_min, u_max, v_min, v_max, w_min, w_max))
-
-        print(
-            "[FFD] Curved-voxel FFD: cylindrical param bounds "
-            f"u=[{u_min:.3f},{u_max:.3f}], "
-            f"v=[{v_min:.3f},{v_max:.3f}], "
-            f"w=[{w_min:.3f},{w_max:.3f}]"
-        )
-    else:
-        setattr(ffd, "_curved_voxels", False)
-        setattr(ffd, "_cyl_params", None)
-        setattr(ffd, "_param_bounds", None)
+    # Mark that this FFD is world-based; cylindrical info is only
+    # kept for visualization helpers if you want it.
+    setattr(ffd, "_curved_voxels", False)
+    setattr(ffd, "_cyl_params", cyl_params)
+    setattr(ffd, "_param_bounds", None)
 
     return ffd
 
@@ -1223,6 +1126,17 @@ def export_lattice_ply_split(
 
 
 def export_ffd_control_points(ffd, basepath: str):
+    """
+    Export FFD control points as a single PLY with edges (arrows)
+    from original positions to deformed positions, in *FFD box
+    coordinates* (no cylindrical transforms).
+
+    Layout:
+      - First N vertices  : original control points
+      - Next  N vertices  : deformed control points
+      - N edges           : each edge connects (i -> i+N)
+    """
+    # Need these attributes from PyGeM's FFD
     if not hasattr(ffd, "array_mu_x") or not hasattr(ffd, "box_origin") or not hasattr(ffd, "box_length"):
         print("[PLY] FFD control-point export not supported by this PyGeM FFD object.")
         return
@@ -1232,30 +1146,21 @@ def export_ffd_control_points(ffd, basepath: str):
     mu_z = np.asarray(ffd.array_mu_z, dtype=float)
 
     nx, ny, nz = mu_x.shape
+
     origin = np.asarray(ffd.box_origin, dtype=float).reshape(3)
     length = np.asarray(ffd.box_length, dtype=float).reshape(3)
     Lx, Ly, Lz = length
 
-    # Curved-voxel meta-data (if available)
-    curved = bool(getattr(ffd, "_curved_voxels", False))
-    cyl_params = getattr(ffd, "_cyl_params", None)
-    param_bounds = getattr(ffd, "_param_bounds", None)
-
-    use_cyl = curved and cyl_params is not None and param_bounds is not None
-
-    if use_cyl:
-        cx_cyl, cz_cyl, R0 = cyl_params
-        u_min, u_max, v_min, v_max, w_min, w_max = param_bounds
-        print(
-            "[PLY] Exporting FFD control points in cylindrical form "
-            f"(center=({cx_cyl:.3f},{cz_cyl:.3f}), R0={R0:.3f})"
-        )
-    else:
-        print("[PLY] Exporting FFD control points in rectangular form.")
+    print(
+        "[PLY] Exporting FFD control arrows in FFD box coords "
+        f"(origin={origin}, length={length}, "
+        f"shape=({nx},{ny},{nz}))"
+    )
 
     pts_orig = []
     pts_def = []
 
+    # Build original + deformed control points (rectangular box only)
     for i in range(nx):
         s = i / (nx - 1) if nx > 1 else 0.0
         for j in range(ny):
@@ -1263,23 +1168,10 @@ def export_ffd_control_points(ffd, basepath: str):
             for k in range(nz):
                 u = k / (nz - 1) if nz > 1 else 0.0
 
-                # Base position in rectangular box
-                base_rect = origin + np.array([s * Lx, t * Ly, u * Lz], dtype=float)
+                # Base position in FFD box coordinates
+                base = origin + np.array([s * Lx, t * Ly, u * Lz], dtype=float)
 
-                if use_cyl:
-                    # Map uniform grid in [0,1]^3 -> cylindrical param bounds
-                    u_cyl = u_min + s * (u_max - u_min)   # along axis (Y)
-                    v_cyl = v_min + t * (v_max - v_min)   # arc-length
-                    w_cyl = w_min + u * (w_max - w_min)   # radial offset
-
-                    base_world = np.array(
-                        param_to_world_cyl((u_cyl, v_cyl, w_cyl), cx_cyl, cz_cyl, R0),
-                        dtype=float,
-                    )
-                else:
-                    base_world = base_rect
-
-                # Displacement of control point in world units (still based on rectangular box lengths)
+                # Displacement of control point in world units mapped to box
                 disp = np.array(
                     [
                         mu_x[i, j, k] * Lx,
@@ -1289,31 +1181,117 @@ def export_ffd_control_points(ffd, basepath: str):
                     dtype=float,
                 )
 
-                pts_orig.append(base_world)
-                pts_def.append(base_world + disp)
+                pts_orig.append(base)
+                pts_def.append(base + disp)
 
     pts_orig = np.asarray(pts_orig, dtype=float)
     pts_def = np.asarray(pts_def, dtype=float)
 
-    orig_path = basepath + "_ffd_ctrl_orig.ply"
-    def_path = basepath + "_ffd_ctrl_def.ply"
+    n = pts_orig.shape[0]
+    if n != pts_def.shape[0]:
+        print("[PLY] ERROR: mismatch between original and deformed control point counts.")
+        return
 
-    def write_ply(points: np.ndarray, path: str):
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("ply\n")
-            f.write("format ascii 1.0\n")
-            f.write(f"element vertex {points.shape[0]}\n")
-            f.write("property float x\n")
-            f.write("property float y\n")
-            f.write("property float z\n")
-            f.write("end_header\n")
-            for x, y, z in points:
-                f.write(f"{x} {y} {z}\n")
-        print(f"[PLY] FFD control points written to: {path}")
+    # Combine vertices: first all originals, then all deformed
+    all_verts = np.vstack([pts_orig, pts_def])
 
-    write_ply(pts_orig, orig_path)
-    write_ply(pts_def, def_path)
+    # Edges: from i -> i+n
+    edges = np.array([[i, i + n] for i in range(n)], dtype=int)
 
+    out_path = basepath + "_ffd_ctrl_arrows.ply"
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {all_verts.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write(f"element edge {edges.shape[0]}\n")
+        f.write("property int vertex1\n")
+        f.write("property int vertex2\n")
+        f.write("end_header\n")
+
+        # vertices
+        for x, y, z in all_verts:
+            f.write(f"{x} {y} {z}\n")
+
+        # edges
+        for v1, v2 in edges:
+            f.write(f"{v1} {v2}\n")
+
+    print(f"[PLY] FFD control arrows written to: {out_path}")
+
+
+def export_deformed_voxels_stl(
+    vertices: List[Tuple[float, float, float]],
+    displacements: Dict[int, np.ndarray],
+    hexes: List[Tuple[int, int, int, int, int, int, int, int]],
+    out_path: str,
+):
+    """
+    Export a deformed voxel mesh as STL by:
+      - taking the original hex connectivity,
+      - moving each node by its FRD displacement,
+      - tesselating each hex into 12 triangles.
+
+    This does NOT use cylindrical mapping, it just deforms the already-curved
+    hex nodes by their nodal displacements.
+    """
+    if not vertices or not hexes:
+        print("[VOXDBG] No vertices/hexes, skipping deformed voxel export.")
+        return
+
+    verts_orig = np.array(vertices, dtype=float)
+    n_nodes = verts_orig.shape[0]
+
+    # Build deformed nodal coords
+    disp_arr = np.zeros_like(verts_orig)
+    for nid, u in displacements.items():
+        if 1 <= nid <= n_nodes:
+            disp_arr[nid - 1] = u
+
+    verts_def = verts_orig + disp_arr
+
+    all_tri_vertices = []
+    all_tri_faces = []
+
+    cube_faces = [
+        (0, 1, 2), (0, 2, 3),  # bottom
+        (4, 5, 6), (4, 6, 7),  # top
+        (0, 1, 5), (0, 5, 4),  # front
+        (1, 2, 6), (1, 6, 5),  # right
+        (2, 3, 7), (2, 7, 6),  # back
+        (3, 0, 4), (3, 4, 7),  # left
+    ]
+
+    for (n0, n1, n2, n3, n4, n5, n6, n7) in hexes:
+        # node IDs are 1-based
+        p0 = verts_def[n0 - 1]
+        p1 = verts_def[n1 - 1]
+        p2 = verts_def[n2 - 1]
+        p3 = verts_def[n3 - 1]
+        p4 = verts_def[n4 - 1]
+        p5 = verts_def[n5 - 1]
+        p6 = verts_def[n6 - 1]
+        p7 = verts_def[n7 - 1]
+
+        base_idx = len(all_tri_vertices)
+        all_tri_vertices.extend([p0, p1, p2, p3, p4, p5, p6, p7])
+
+        for (a, b, c) in cube_faces:
+            all_tri_faces.append((base_idx + a, base_idx + b, base_idx + c))
+
+    if not all_tri_vertices:
+        print("[VOXDBG] No triangles produced for deformed voxels.")
+        return
+
+    vertices_np = np.array(all_tri_vertices, dtype=float)
+    faces_np = np.array(all_tri_faces, dtype=np.int32)
+
+    mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces_np, process=False)
+    mesh.export(out_path)
+    print(f"[VOXDBG] Deformed voxel STL written: {out_path}")
 
 # ============================================================
 #  STL deformation with PyGeM (forward + pre-deformed)
@@ -1333,11 +1311,13 @@ def deform_input_stl_with_frd_pygem(
     cube_size: float,
     output_stl: str,
     lattice_basepath: str = None,
-    cyl_params: Optional[Tuple[float, ...]] = None,
+    cyl_params: Optional[Tuple[float, float, float]] = None,
     lowest_point: Optional[Tuple[float, float, float]] = None,
     axis_point: Optional[Tuple[float, float, float]] = None,
     edge_left_point: Optional[Tuple[float, float, float]] = None,
     edge_right_point: Optional[Tuple[float, float, float]] = None,
+    hexes: Optional[List[Tuple[int, int, int, int, int, int, int, int]]] = None,
+    deformed_voxels_path: Optional[str] = None,
 ):
 
     if FFD is None:
@@ -1351,6 +1331,15 @@ def deform_input_stl_with_frd_pygem(
 
     print(f"[FFD] Displacements available for {len(displacements)} nodes "
           f"out of {len(vertices)} total.")
+    
+    # Deformed voxel STL export (if requested)
+    if hexes is not None and deformed_voxels_path:
+        export_deformed_voxels_stl(
+            vertices,
+            displacements,
+            hexes,
+            deformed_voxels_path,
+        )
 
     # Lattice of voxel nodes (orig+def)
     if lattice_basepath:
@@ -1622,6 +1611,8 @@ def main():
         if os.path.isfile(utd_frd):
             deformed_stl = args.job_name + "_deformed.stl"
             lattice_basepath = args.job_name + "_lattice" if args.export_lattice else None
+            deformed_voxels_stl = args.job_name + "_voxels_def.stl"
+
             deform_input_stl_with_frd_pygem(
                 args.input_stl,
                 utd_frd,
@@ -1634,7 +1625,10 @@ def main():
                 axis_point=axis_point,
                 edge_left_point=edge_left_point,
                 edge_right_point=edge_right_point,
+                hexes=hexes,
+                deformed_voxels_path=deformed_voxels_stl,
             )
+
 
         else:
             print(f"[FFD] Thermo-mechanical FRD '{utd_frd}' not found, skipping STL deformation.")
