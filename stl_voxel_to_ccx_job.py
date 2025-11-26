@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-STL -> voxel C3D8R hex mesh -> uncoupled thermo-mechanical CalculiX job
+STL -> cylindrical voxel C3D8R hex mesh -> uncoupled thermo-mechanical CalculiX job
 + FFD deformation of the original STL using PyGeM (forward + pre-deformed)
 + optional lattice visualization as separate PLY point clouds.
 
-Pipeline:
+Pipeline (cylindrical workflow only):
 
-1. Voxelize input STL into cubes of size cube_size.
-2. Build global hex mesh (C3D8R elements).
+1. Voxelize input STL into cubes of size cube_size in cylindrical param space.
+2. Map cubes to curved C3D8R hexes on a cylinder (axis = global +Y).
 3. Single CalculiX job:
    - Procedure: *UNCOUPLED TEMPERATURE-DISPLACEMENT
-   - One step per slice:
+   - One step per radial slice:
        * Apply curing (via TEMP DOF) to that slice's NSET.
-       * Base nodes mechanically fixed (UX, UY, UZ = 0).
-       * Base nodes thermally fixed at base_temp.
+       * Base nodes (outer radial face of first radial slice) mechanically fixed.
        * Temperatures and displacements carry over between steps.
 4. If --run-ccx:
    - Run the thermo-mechanical job -> <job_name>_utd.frd
@@ -24,12 +23,6 @@ Pipeline:
    - if --export-lattice:
         * <job_name>_lattice_orig.ply  (original lattice nodes)
         * <job_name>_lattice_def.ply   (deformed lattice nodes)
-
-New:
-- Optional cylindrical “curved voxel” mode (--curved-voxels) where voxels are
-  axis-aligned in cylindrical param space (u, v, w), then mapped to a cylinder
-  in world space. Each slice becomes a curved layer following the cylindrical
-  surface (radial bands).
 """
 
 import argparse
@@ -173,6 +166,7 @@ def export_cylinder_debug_stl(
     mesh.export(path)
     print(f"[CYL] Debug cylinder STL written to: {path}")
 
+
 def _unwrap_angle_array(thetas: np.ndarray) -> np.ndarray:
     """
     Unwrap a sequence of angles so that they form a continuous curve
@@ -190,35 +184,36 @@ def _unwrap_angle_array(thetas: np.ndarray) -> np.ndarray:
         out[i] = out[i - 1] + diff_wrapped
     return out
 
+
 # ============================================================
-#  Voxel mesh -> CalculiX job
+#  Voxel mesh -> CalculiX job (cylindrical only)
 # ============================================================
 
 def generate_global_cubic_hex_mesh(
     input_stl: str,
     cube_size: float,
-    curved_voxels: bool = False,
     cyl_center_xz: Optional[Tuple[float, float]] = None,
     cyl_radius: Optional[float] = None,
 ):
     """
-    Voxelize input_stl and build a global C3D8R brick mesh.
+    Voxelize input_stl in cylindrical param space and build a global C3D8R brick mesh
+    mapped onto a cylinder (curved voxels).
 
-    If curved_voxels is False (default):
-        - Standard axis-aligned voxels in world (x,y,z).
-        - Slices are horizontal layers in Z.
+    Workflow (always cylindrical):
 
-    If curved_voxels is True:
-        - STL is first mapped to cylindrical param space (u,v,w) using
-          world_to_param_cyl (axis along Y).
-        - Voxelization happens in (u,v,w).
-        - Voxel corners (in param space) are mapped back to world via
-          param_to_world_cyl, giving curved hexahedra that follow a cylinder.
-        - Slices become radial layers (bands in w).
-        - The lowest STL point (by Z) is:
-            * On the outer radial face of the base slice (previous step),
-            * Tangentially aligned so that it lies on the center line
-              (angle) of its voxel in X/Z plane.
+      - STL vertices are analyzed in world space (x,y,z).
+      - Cylinder axis is global +Y.
+      - We choose cylinder center (cx, cz) and a mapping radius R0_param.
+      - STL is mapped to cylindrical param space (u, v, w) via world_to_param_cyl.
+      - Voxelization happens in (u, v, w) using trimesh.voxelized().
+      - Angular trimming in param v and world-angle keeps only bands intersecting STL.
+      - Voxel corners in param space are mapped back to world via param_to_world_cyl,
+        giving curved hexahedra that follow the cylinder.
+      - Slices become radial layers (bands in w).
+      - The lowest STL point (by Z) is:
+          * On the outer radial face of the base slice,
+          * Tangentially aligned so that it lies on the center line
+            (angle) of its voxel in XZ plane.
     """
     if cube_size <= 0:
         raise ValueError("cube_size must be positive")
@@ -250,221 +245,195 @@ def generate_global_cubic_hex_mesh(
     edge_left_world: Optional[Tuple[float, float, float]] = None
     edge_right_world: Optional[Tuple[float, float, float]] = None
 
+    # --- cylindrical preprocessing (always) ---
+    verts_world = mesh.vertices.copy()
 
-    if curved_voxels:
-        verts_world = mesh.vertices.copy()
+    # --- Find lowest point (min Z) in world space ---
+    z_coords = verts_world[:, 2]
+    min_z_idx = int(np.argmin(z_coords))
+    x_low, y_low, z_low = verts_world[min_z_idx]
+    lowest_point_world = (float(x_low), float(y_low), float(z_low))
 
-        # --- Find lowest point (min Z) in world space ---
-        z_coords = verts_world[:, 2]
-        min_z_idx = int(np.argmin(z_coords))
-        x_low, y_low, z_low = verts_world[min_z_idx]
-        lowest_point_world = (float(x_low), float(y_low), float(z_low))
+    # Start from this X as cylinder center X
+    cx_cyl = float(x_low)
 
-        # Start from this X as cylinder center X
-        cx_cyl = float(x_low)
+    # Decide CZ and initial radius R0_param for world->param mapping
+    if cyl_radius is not None and cyl_radius > 0.0:
+        # User-provided radius (for mapping)
+        R0_param = float(cyl_radius)
 
-        # Decide CZ and initial radius R0_param for world->param mapping
-        if cyl_radius is not None and cyl_radius > 0.0:
-            # User-provided radius (for mapping)
-            R0_param = float(cyl_radius)
+        z_center_bbox = 0.5 * (z_min_w + z_max_w)
+        cz_plus = z_low + R0_param
+        cz_minus = z_low - R0_param
 
-            z_center_bbox = 0.5 * (z_min_w + z_max_w)
-            cz_plus = z_low + R0_param
-            cz_minus = z_low - R0_param
-
-            if abs(cz_plus - z_center_bbox) < abs(cz_minus - z_center_bbox):
-                cz_cyl = cz_plus
-            else:
-                cz_cyl = cz_minus
-
-            if cyl_center_xz is not None:
-                print(
-                    "[VOXEL] Note: --cyl-center-xz provided, but CZ is "
-                    "overridden to enforce lowest point on cylinder."
-                )
-
-            print(
-                f"[VOXEL] Using user radius R0_param={R0_param:.3f}; "
-                f"lowest point ({x_low:.3f}, {y_low:.3f}, {z_low:.3f}) "
-                f"lies on cylinder (by CZ selection)."
-            )
+        if abs(cz_plus - z_center_bbox) < abs(cz_minus - z_center_bbox):
+            cz_cyl = cz_plus
         else:
-            # Estimate center/radius from geometry
-            if cyl_center_xz is not None:
-                cx_cli, cz_cli = cyl_center_xz
-                cx_cyl = cx_cli
-                cz_cyl = cz_cli
-                print(
-                    "[VOXEL] No radius given; using explicit cyl-center-xz "
-                    f"({cx_cyl:.3f}, {cz_cyl:.3f})"
-                )
-            else:
-                cz_cyl = 0.5 * (z_min_w + z_max_w)
-                print(
-                    "[VOXEL] No radius given; using cx from lowest-Z point "
-                    f"and cz=bbox center: cx={cx_cyl:.3f}, cz={cz_cyl:.3f}"
-                )
+            cz_cyl = cz_minus
 
-        dx_all = verts_world[:, 0] - cx_cyl
-        dz_all = verts_world[:, 2] - cz_cyl
-        r_all = np.sqrt(dx_all * dx_all + dz_all * dz_all)
-        R0_param = float(np.mean(r_all))
-
-        # Radial/angle of the lowest point (with chosen center)
-        dx_low = x_low - cx_cyl
-        dz_low = z_low - cz_cyl
-        r_lowest = math.sqrt(dx_low * dx_low + dz_low * dz_low)
-        theta_lowest = math.atan2(dz_low, dx_low)  # angle of lowest point
-
-        # --- Angular edges of the STL around the lowest direction ---------
-        # Angles of all STL vertices around the cylinder axis
-        theta_all = np.arctan2(dz_all, dx_all)
-
-        # Differences w.r.t. theta_lowest, wrapped to [-pi, pi]
-        dtheta_all = theta_all - theta_lowest
-        dtheta_all = (dtheta_all + math.pi) % (2.0 * math.pi) - math.pi
-
-        # Left edge = most negative delta, right edge = most positive delta
-        idx_left = int(np.argmin(dtheta_all))
-        idx_right = int(np.argmax(dtheta_all))
-
-        theta_left = theta_lowest + float(dtheta_all[idx_left])
-        theta_right = theta_lowest + float(dtheta_all[idx_right])
-
-        # Use max radial extent for nice long edge rays
-        r_edge = float(r_all.max())
-        y_ref = float(y_low)  # keep all rays in the same horizontal plane
-
-        axis_point_world = (float(cx_cyl), y_ref, float(cz_cyl))
-        edge_left_world = (
-            float(cx_cyl + r_edge * math.cos(theta_left)),
-            y_ref,
-            float(cz_cyl + r_edge * math.sin(theta_left)),
-        )
-        edge_right_world = (
-            float(cx_cyl + r_edge * math.cos(theta_right)),
-            y_ref,
-            float(cz_cyl + r_edge * math.sin(theta_right)),
-        )
+        if cyl_center_xz is not None:
+            print(
+                "[VOXEL] Note: --cyl-center-xz provided, but CZ is "
+                "overridden to enforce lowest point on cylinder."
+            )
 
         print(
-            "[VOXEL] Angular edges: dtheta_left="
-            f"{float(dtheta_all[idx_left]):.6f}, "
-            f"dtheta_right={float(dtheta_all[idx_right]):.6f}"
-        )
-
-        print(
-            f"[VOXEL] Cyl center from lowest Z vertex: "
-            f"min_z={z_low:.3f}, lowest_pt=({x_low:.3f}, {y_low:.3f}, {z_low:.3f}), "
-            f"r_low={r_lowest:.3f}, theta_low={theta_lowest:.3f} rad"
-        )
-        print(
-            f"[VOXEL] Cylindrical voxel mode ON (world->param): axis=+Y, "
-            f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), R0_param={R0_param:.3f}"
-        )
-
-        # Map mesh into param space (u,v,w) using R0_param
-        verts_param = np.zeros_like(verts_world)
-        for i, (x, y, z) in enumerate(verts_world):
-            verts_param[i] = world_to_param_cyl((x, y, z), cx_cyl, cz_cyl, R0_param)
-        mesh.vertices = verts_param
-
-        # --- Tangential (v) extents of the STL in param space -------------
-        v_min_mesh = float(verts_param[:, 1].min())
-        v_max_mesh = float(verts_param[:, 1].max())
-        print(
-            f"[VOXEL] Param v extents of STL: v_min={v_min_mesh:.6f}, "
-            f"v_max={v_max_mesh:.6f}"
+            f"[VOXEL] Using user radius R0_param={R0_param:.3f}; "
+            f"lowest point ({x_low:.3f}, {y_low:.3f}, {z_low:.3f}) "
+            f"lies on cylinder (by CZ selection)."
         )
     else:
-        verts_world = mesh.vertices.copy()
-        z_coords = verts_world[:, 2]
-        min_z_idx = int(np.argmin(z_coords))
-        x_low, y_low, z_low = verts_world[min_z_idx]
-        lowest_point_world = (float(x_low), float(y_low), float(z_low))
+        # Estimate center/radius from geometry
+        if cyl_center_xz is not None:
+            cx_cli, cz_cli = cyl_center_xz
+            cx_cyl = cx_cli
+            cz_cyl = cz_cli
+            print(
+                "[VOXEL] No radius given; using explicit cyl-center-xz "
+                f"({cx_cyl:.3f}, {cz_cyl:.3f})"
+            )
+        else:
+            cz_cyl = 0.5 * (z_min_w + z_max_w)
+            print(
+                "[VOXEL] No radius given; using cx from lowest-Z point "
+                f"and cz=bbox center: cx={cx_cyl:.3f}, cz={cz_cyl:.3f}"
+            )
 
-    # --- Voxelization in current mesh coordinates (world or param) ---
+    dx_all = verts_world[:, 0] - cx_cyl
+    dz_all = verts_world[:, 2] - cz_cyl
+    r_all = np.sqrt(dx_all * dx_all + dz_all * dz_all)
+    R0_param = float(np.mean(r_all))
+
+    # Radial/angle of the lowest point (with chosen center)
+    dx_low = x_low - cx_cyl
+    dz_low = z_low - cz_cyl
+    r_lowest = math.sqrt(dx_low * dx_low + dz_low * dz_low)
+    theta_lowest = math.atan2(dz_low, dx_low)  # angle of lowest point
+
+    # --- Angular edges of the STL around the lowest direction ---------
+    # Angles of all STL vertices around the cylinder axis
+    theta_all = np.arctan2(dz_all, dx_all)
+
+    # Differences w.r.t. theta_lowest, wrapped to [-pi, pi]
+    dtheta_all = theta_all - theta_lowest
+    dtheta_all = (dtheta_all + math.pi) % (2.0 * math.pi) - math.pi
+
+    # Left edge = most negative delta, right edge = most positive delta
+    idx_left = int(np.argmin(dtheta_all))
+    idx_right = int(np.argmax(dtheta_all))
+
+    theta_left = theta_lowest + float(dtheta_all[idx_left])
+    theta_right = theta_lowest + float(dtheta_all[idx_right])
+
+    # Use max radial extent for nice long edge rays
+    r_edge = float(r_all.max())
+    y_ref = float(y_low)  # keep all rays in the same horizontal plane
+
+    axis_point_world = (float(cx_cyl), y_ref, float(cz_cyl))
+    edge_left_world = (
+        float(cx_cyl + r_edge * math.cos(theta_left)),
+        y_ref,
+        float(cz_cyl + r_edge * math.sin(theta_left)),
+    )
+    edge_right_world = (
+        float(cx_cyl + r_edge * math.cos(theta_right)),
+        y_ref,
+        float(cz_cyl + r_edge * math.sin(theta_right)),
+    )
+
+    print(
+        "[VOXEL] Angular edges: dtheta_left="
+        f"{float(dtheta_all[idx_left]):.6f}, "
+        f"dtheta_right={float(dtheta_all[idx_right]):.6f}"
+    )
+
+    print(
+        f"[VOXEL] Cyl center from lowest Z vertex: "
+        f"min_z={z_low:.3f}, lowest_pt=({x_low:.3f}, {y_low:.3f}, {z_low:.3f}), "
+        f"r_low={r_lowest:.3f}, theta_low={theta_lowest:.3f} rad"
+    )
+    print(
+        f"[VOXEL] Cylindrical voxel mode: axis=+Y, "
+        f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), R0_param={R0_param:.3f}"
+    )
+
+    # Map mesh into param space (u,v,w) using R0_param
+    verts_param = np.zeros_like(verts_world)
+    for i, (x, y, z) in enumerate(verts_world):
+        verts_param[i] = world_to_param_cyl((x, y, z), cx_cyl, cz_cyl, R0_param)
+    mesh.vertices = verts_param
+
+    # --- Tangential (v) extents of the STL in param space -------------
+    v_min_mesh = float(verts_param[:, 1].min())
+    v_max_mesh = float(verts_param[:, 1].max())
+    print(
+        f"[VOXEL] Param v extents of STL: v_min={v_min_mesh:.6f}, "
+        f"v_max={v_max_mesh:.6f}"
+    )
+
+    # --- Voxelization in param coordinates ---
     print(f"[VOXEL] Voxelizing with cube size = {cube_size} ...")
     vox = mesh.voxelized(pitch=cube_size)
     vox.fill()
 
-    indices = vox.sparse_indices  # (N,3) with (ix,iy,iz)
+    indices = vox.sparse_indices  # (N,3) with (ix,iy,iz) in param grid
     if indices.size == 0:
         print("[VOXEL] No voxels found – check cube size or input mesh.")
-        return [], [], {}, [], None
+        return [], [], {}, [], None, None, None, None, None, None, None
 
     total_voxels = indices.shape[0]
     print(f"[VOXEL] Total filled voxels (cubes): {total_voxels}")
 
-    # # --- Optional angular trimming in curved-voxel mode -------------------
-    # # --- Angular trimming in curved-voxel mode: keep only bands that intersect STL in v ---
-    # # --- Angular trimming in curved-voxel mode: keep only bands that intersect STL in v ---
-    # if curved_voxels:
-    #     # We rely on v_min_mesh / v_max_mesh computed earlier when we mapped STL to param.
-    #     # (If somehow they don't exist, that's a bug.)
-    #     try:
-    #         v_min_mesh  # type: ignore[name-defined]
-    #     except NameError:
-    #         print("[VOXEL] ERROR: v_min_mesh/v_max_mesh not defined in curved voxel mode.")
-    #         return [], [], {}, [], None
+    # --- Angular trimming in param v: keep only bands that intersect STL in v ---
+    half = cube_size / 2.0
+    eps = 1e-9
 
-    #     half = cube_size / 2.0
-    #     eps = 1e-9
+    unique_iy = np.unique(indices[:, 1])
 
-    #     # Unique angular indices
-    #     unique_iy = np.unique(indices[:, 1])
+    # Compute v_center for each angular band using voxel centers
+    centers_param = vox.indices_to_points(
+        np.array([[0, int(iy), 0] for iy in unique_iy], dtype=float)
+    )
+    v_centers = centers_param[:, 1]
 
-    #     # Compute v_center for each angular band using voxel centers
-    #     centers_param = vox.indices_to_points(
-    #         np.array([[0, int(iy), 0] for iy in unique_iy], dtype=float)
-    #     )
-    #     v_centers = centers_param[:, 1]
+    # Map iy -> (v_lo, v_hi)
+    v_interval_by_iy: Dict[int, Tuple[float, float]] = {}
+    for iy_val, v_c in zip(unique_iy, v_centers):
+        v_lo = float(v_c - half)
+        v_hi = float(v_c + half)
+        v_interval_by_iy[int(iy_val)] = (v_lo, v_hi)
 
-    #     # Map iy -> (v_lo, v_hi)
-    #     v_interval_by_iy: Dict[int, Tuple[float, float]] = {}
-    #     for iy_val, v_c in zip(unique_iy, v_centers):
-    #         v_lo = float(v_c - half)
-    #         v_hi = float(v_c + half)
-    #         v_interval_by_iy[int(iy_val)] = (v_lo, v_hi)
+    # Build mask: keep cells whose v-interval intersects [v_min_mesh, v_max_mesh]
+    mask = np.zeros(indices.shape[0], dtype=bool)
+    for row_idx, (ix, iy, iz) in enumerate(indices):
+        v_lo, v_hi = v_interval_by_iy[int(iy)]
+        if (v_hi >= v_min_mesh - eps) and (v_lo <= v_max_mesh + eps):
+            mask[row_idx] = True
 
-    #     # Build mask: keep cells whose v-interval intersects [v_min_mesh, v_max_mesh]
-    #     mask = np.zeros(indices.shape[0], dtype=bool)
-    #     for row_idx, (ix, iy, iz) in enumerate(indices):
-    #         v_lo, v_hi = v_interval_by_iy[int(iy)]
-    #         if (v_hi >= v_min_mesh - eps) and (v_lo <= v_max_mesh + eps):
-    #             mask[row_idx] = True
+    indices = indices[mask]
 
-    #     indices = indices[mask]
+    if indices.size == 0:
+        print("[VOXEL] After angular trimming (param v), no voxels left – aborting.")
+        return [], [], {}, [], None, None, None, None, None, None, None
 
-    #     if indices.size == 0:
-    #         print("[VOXEL] After angular trimming, no voxels left – aborting.")
-    #         return [], [], {}, [], None
-
-    #     total_voxels = indices.shape[0]
-    #     print(f"[VOXEL] Total voxels after angular trim: {total_voxels}")
-
+    total_voxels = indices.shape[0]
+    print(f"[VOXEL] Total voxels after angular trim (param v): {total_voxels}")
 
     # sort by iz, iy, ix
     order = np.lexsort((indices[:, 0], indices[:, 1], indices[:, 2]))
     indices_sorted = indices[order]
 
-    # Map iz -> slice "position"
-    # planar: z_center (world Z); cylindrical: w_center (param w)
+    # Map iz -> slice "position" in param space: w_center
     unique_iz = np.unique(indices_sorted[:, 2])
     layer_info = []
     for iz in unique_iz:
         idx_arr = np.array([[0, 0, iz]], dtype=float)
-        pt = vox.indices_to_points(idx_arr)[0]  # in current mesh coordinate system
-        slice_coord = float(pt[2])  # Z in planar, w in cylindrical param space
+        pt = vox.indices_to_points(idx_arr)[0]  # in param coordinates
+        slice_coord = float(pt[2])  # w in cylindrical param space
         layer_info.append((iz, slice_coord))
 
-    # Sorting slice order:
-    # - planar: low Z first
-    # - curved: high w first (outer radial band as base slice)
-    if curved_voxels:
-        layer_info.sort(key=lambda x: x[1], reverse=True)
-    else:
-        layer_info.sort(key=lambda x: x[1])
+    # Sorting slice order: high w first (outer radial band as base slice)
+    layer_info.sort(key=lambda x: x[1], reverse=True)
 
     iz_to_slice: Dict[int, int] = {}
     z_slices: List[float] = []
@@ -494,270 +463,240 @@ def generate_global_cubic_hex_mesh(
     R0_world: Optional[float] = None
     theta_offset: float = 0.0
 
-    if curved_voxels:
-        if r_lowest is None or R0_param is None or cx_cyl is None or cz_cyl is None or theta_lowest is None:
-            raise RuntimeError("[VOXEL] Internal error: cylindrical parameters not initialized.")
+    if (
+        r_lowest is None or R0_param is None or
+        cx_cyl is None or cz_cyl is None or theta_lowest is None
+    ):
+        raise RuntimeError("[VOXEL] Internal error: cylindrical parameters not initialized.")
 
-        # --- Radial: force lowest point onto outer face of base slice ---
-        if z_slices:
-            # Base slice is slice_idx 0 (outermost radial band) after sort(reverse=True)
-            w_center_base = z_slices[0]           # param w of slice center
-            w_face_outer = w_center_base + half   # param w of outer face
+    # --- Radial: force lowest point onto outer face of base slice ---
+    if z_slices:
+        # Base slice is slice_idx 0 (outermost radial band) after sort(reverse=True)
+        w_center_base = z_slices[0]           # param w of slice center
+        w_face_outer = w_center_base + half   # param w of outer face
 
-            # Want: R0_world + w_face_outer = r_lowest  ->  R0_world = r_lowest - w_face_outer
-            R0_world = r_lowest - w_face_outer
+        # Want: R0_world + w_face_outer = r_lowest  ->  R0_world = r_lowest - w_face_outer
+        R0_world = r_lowest - w_face_outer
 
-            if R0_world <= 0.0:
-                print(
-                    f"[VOXEL] WARNING: computed R0_world={R0_world:.6f} <= 0; "
-                    f"falling back to R0_param={R0_param:.6f}"
-                )
-                R0_world = max(R0_param, cube_size)
-
+        if R0_world <= 0.0:
             print(
-                "[VOXEL] Aligning outer face of base radial layer with lowest point:\n"
-                f"        r_low={r_lowest:.6f}, w_center_base={w_center_base:.6f}, "
-                f"w_face_outer={w_face_outer:.6f} -> R0_world={R0_world:.6f}"
+                f"[VOXEL] WARNING: computed R0_world={R0_world:.6f} <= 0; "
+                f"falling back to R0_param={R0_param:.6f}"
             )
-        else:
-            R0_world = R0_param
-            print(
-                "[VOXEL] No slices? Using R0_param for R0_world "
-                f"(R0_world={R0_world:.6f})."
-            )
-
-        # --- Tangential: find voxel in base slice whose center angle is closest to theta_lowest ---
-        base_slice_iz = layer_info[0][0] if layer_info else None
-        best_dtheta = None
-        best_theta_center = None
-
-        if base_slice_iz is not None:
-            for (ix, iy, iz) in indices_sorted:
-                if iz != base_slice_iz:
-                    continue
-
-                center_param = vox.indices_to_points(
-                    np.array([[ix, iy, iz]], dtype=float)
-                )[0]
-                u_c, v_c, w_c = center_param
-
-                # Use R0_world with zero offset to get preliminary center
-                x_c, y_c, z_c = param_to_world_cyl((u_c, v_c, w_c), cx_cyl, cz_cyl, R0_world, theta_offset=0.0)
-                theta_center = math.atan2(z_c - cz_cyl, x_c - cx_cyl)
-
-                # Smallest angular difference mod 2π
-                dtheta = abs(((theta_center - theta_lowest + math.pi) % (2.0 * math.pi)) - math.pi)
-
-                if best_dtheta is None or dtheta < best_dtheta:
-                    best_dtheta = dtheta
-                    best_theta_center = theta_center
-
-        if best_theta_center is not None:
-            theta_offset = theta_lowest - best_theta_center
-            print(
-                "[VOXEL] Tangential alignment: base-slice voxel center angle "
-                f"{best_theta_center:.6f} -> theta_low={theta_lowest:.6f}, "
-                f"theta_offset={theta_offset:.6f}"
-            )
-        else:
-            theta_offset = 0.0
-            print("[VOXEL] WARNING: could not find base slice voxel for tangential alignment.")
-
-        # This is the cylinder definition used by the *voxel mesh* and FFD
-        cyl_params = (cx_cyl, cz_cyl, R0_world, theta_offset)
-
-        # Optional: debug cylinder with the aligned R0_world and theta_offset
-        input_base = os.path.splitext(os.path.basename(input_stl))[0]
-        cyl_debug_stl = input_base + "_cylinder_debug.stl"
-
-        # Build cylinder with the same offset
-        n_theta = 64
-        thetas = np.linspace(0.0, 2.0 * math.pi, n_theta, endpoint=False)
-        bottom = []
-        top = []
-        for th in thetas:
-            th_off = th + theta_offset
-            x = cx_cyl + R0_world * math.cos(th_off)
-            z = cz_cyl + R0_world * math.sin(th_off)
-            bottom.append([x, y_min_w, z])
-            top.append([x, y_max_w, z])
-        bottom = np.array(bottom, dtype=float)
-        top = np.array(top, dtype=float)
-        vertices_cyl = np.vstack([bottom, top])
-        faces_cyl = []
-        for i in range(n_theta):
-            j = (i + 1) % n_theta
-            b0 = i
-            b1 = j
-            t0 = i + n_theta
-            t1 = j + n_theta
-            faces_cyl.append([b0, b1, t1])
-            faces_cyl.append([b0, t1, t0])
-        faces_cyl = np.array(faces_cyl, dtype=np.int64)
-        mesh_cyl = trimesh.Trimesh(vertices=vertices_cyl, faces=faces_cyl, process=False)
-        mesh_cyl.export(cyl_debug_stl)
-        print(f"[CYL] Debug cylinder STL written to: {cyl_debug_stl}")
-
-        # --- Angular trimming in WORLD ANGLE space ------------------------
-        # 1) Compute model angular range around cylinder (unwrapped)
-        dx_m = verts_world[:, 0] - cx_cyl
-        dz_m = verts_world[:, 2] - cz_cyl
-        theta_model_raw = np.arctan2(dz_m, dx_m)
-        theta_model_unwrapped = _unwrap_angle_array(theta_model_raw)
-        theta_min_model = float(theta_model_unwrapped.min())
-        theta_max_model = float(theta_model_unwrapped.max())
-        theta_mid_model = 0.5 * (theta_min_model + theta_max_model)
+            R0_world = max(R0_param, cube_size)
 
         print(
-            "[VOXEL] Model angular range (unwrapped): "
-            f"[{theta_min_model:.6f}, {theta_max_model:.6f}] rad "
-            f"(span={theta_max_model - theta_min_model:.6f})"
+            "[VOXEL] Aligning outer face of base radial layer with lowest point:\n"
+            f"        r_low={r_lowest:.6f}, w_center_base={w_center_base:.6f}, "
+            f"w_face_outer={w_face_outer:.6f} -> R0_world={R0_world:.6f}"
+        )
+    else:
+        R0_world = R0_param
+        print(
+            "[VOXEL] No slices? Using R0_param for R0_world "
+            f"(R0_world={R0_world:.6f})."
         )
 
-        # Angular half-width of a voxel band in v-direction
-        dtheta_half = (cube_size * 0.5) / R0_world
+    # --- Tangential: find voxel in base slice whose center angle is closest to theta_lowest ---
+    base_slice_iz = layer_info[0][0] if layer_info else None
+    best_dtheta = None
+    best_theta_center = None
 
-        # 2) For each angular index iy, compute its band center angle in world,
-        #    then keep it iff its angular interval intersects the model's range.
-        unique_iy = np.unique(indices[:, 1])
-        if unique_iy.size == 0:
-            print("[VOXEL] No angular bands to trim, aborting.")
-            return [], [], {}, [], None
-
-        # We'll sample at base slice iz (outer radial band, slice 0)
-        if len(z_slices) == 0:
-            print("[VOXEL] No slices for angular trimming, aborting.")
-            return [], [], {}, [], None
-
-        base_slice_iz = int(layer_info[0][0])
-
-        iy_keep: Set[int] = set()
-        for iy_val in unique_iy:
-            # Use geometric center of cell (ix=0, this iy, base_slice_iz) in param
-            pt_param = vox.indices_to_points(
-                np.array([[0, int(iy_val), base_slice_iz]], dtype=float)
-            )[0]
-            u_c, v_c, w_c = pt_param
-
-            # Map param center to world using final R0_world and theta_offset
-            x_c, y_c, z_c = param_to_world_cyl(
-                (u_c, v_c, w_c),
-                cx_cyl,
-                cz_cyl,
-                R0_world,
-                theta_offset,
-            )
-
-            theta_c_raw = math.atan2(z_c - cz_cyl, x_c - cx_cyl)
-
-            # Bring this band angle near the model's range (same branch)
-            # by adding k*2π to minimize distance to theta_mid_model.
-            # (This avoids wrap issues around -pi/pi.)
-            k = round((theta_mid_model - theta_c_raw) / (2.0 * math.pi))
-            theta_c = theta_c_raw + k * 2.0 * math.pi
-
-            band_min = theta_c - dtheta_half
-            band_max = theta_c + dtheta_half
-
-            # Interval intersection test with model [theta_min_model, theta_max_model]
-            if (band_max >= theta_min_model) and (band_min <= theta_max_model):
-                iy_keep.add(int(iy_val))
-
-        if not iy_keep:
-            print("[VOXEL] Angular trimming would remove all bands, aborting.")
-            return [], [], {}, [], None
-
-        mask_ang = np.array([int(iy) in iy_keep for ix, iy, iz in indices], dtype=bool)
-        indices = indices[mask_ang]
-
-        if indices.size == 0:
-            print("[VOXEL] After angular trimming, no voxels left – aborting.")
-            return [], [], {}, [], None
-
-        total_voxels = indices.shape[0]
-        print(f"[VOXEL] Total voxels after angular trim (world angle): {total_voxels}")
-
-    print("[VOXEL] Building global C3D8R mesh ...")
-
-    if not curved_voxels:
-        # ----------- Original axis-aligned cubic voxels (planar) -----------
+    if base_slice_iz is not None:
         for (ix, iy, iz) in indices_sorted:
-            center = vox.indices_to_points(
-                np.array([[ix, iy, iz]], dtype=float)
-            )[0]
-            cx, cy, cz = center
-            x0, x1 = cx - half, cx + half
-            y0, y1 = cy - half, cy + half
-            z0, z1 = cz - half, cz + half
+            if iz != base_slice_iz:
+                continue
 
-            # bottom face
-            v0 = get_vertex_index((ix,   iy,   iz),   (x0, y0, z0))  # x-,y-,z-
-            v1 = get_vertex_index((ix+1, iy,   iz),   (x1, y0, z0))  # x+,y-,z-
-            v2 = get_vertex_index((ix+1, iy+1, iz),   (x1, y1, z0))  # x+,y+,z-
-            v3 = get_vertex_index((ix,   iy+1, iz),   (x0, y1, z0))  # x-,y+,z-
-            # top face
-            v4 = get_vertex_index((ix,   iy,   iz+1), (x0, y0, z1))  # x-,y-,z+
-            v5 = get_vertex_index((ix+1, iy,   iz+1), (x1, y0, z1))  # x+,y-,z+
-            v6 = get_vertex_index((ix+1, iy+1, iz+1), (x1, y1, z1))  # x+,y+,z+
-            v7 = get_vertex_index((ix,   iy+1, iz+1), (x0, y1, z1))  # x-,y+,z+
-
-            hexes.append((v0, v1, v2, v3, v4, v5, v6, v7))
-
-            eid = len(hexes)
-            slice_idx = iz_to_slice[int(iz)]
-            slice_to_eids[slice_idx].append(eid)
-    else:
-        # ----------- Curved voxels on cylindrical surface -----------
-        if cyl_params is None or R0_world is None:
-            raise RuntimeError("[VOXEL] cyl_params missing in curved voxel mode.")
-        cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use = cyl_params
-
-        for (ix, iy, iz) in indices_sorted:
             center_param = vox.indices_to_points(
                 np.array([[ix, iy, iz]], dtype=float)
             )[0]
             u_c, v_c, w_c = center_param
 
-            u0, u1 = u_c - half, u_c + half
-            v0, v1 = v_c - half, v_c + half
-            w0, w1 = w_c - half, w_c + half
+            # Use R0_world with zero offset to get preliminary center
+            x_c, y_c, z_c = param_to_world_cyl((u_c, v_c, w_c), cx_cyl, cz_cyl, R0_world, theta_offset=0.0)
+            theta_center = math.atan2(z_c - cz_cyl, x_c - cx_cyl)
 
-            # param-space corners of this voxel
-            p0 = (u0, v0, w0)  # "bottom" in param space
-            p1 = (u1, v0, w0)
-            p2 = (u1, v1, w0)
-            p3 = (u0, v1, w0)
-            p4 = (u0, v0, w1)  # "top" in param space
-            p5 = (u1, v0, w1)
-            p6 = (u1, v1, w1)
-            p7 = (u0, v1, w1)
+            # Smallest angular difference mod 2π
+            dtheta = abs(((theta_center - theta_lowest + math.pi) % (2.0 * math.pi)) - math.pi)
 
-            # map to world (curved hexa), using aligned R0_world + theta_offset
-            x0, y0, z0 = param_to_world_cyl(p0, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
-            x1, y1, z1 = param_to_world_cyl(p1, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
-            x2, y2, z2 = param_to_world_cyl(p2, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
-            x3, y3, z3 = param_to_world_cyl(p3, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
-            x4, y4, z4 = param_to_world_cyl(p4, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
-            x5, y5, z5 = param_to_world_cyl(p5, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
-            x6, y6, z6 = param_to_world_cyl(p6, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
-            x7, y7, z7 = param_to_world_cyl(p7, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
+            if best_dtheta is None or dtheta < best_dtheta:
+                best_dtheta = dtheta
+                best_theta_center = theta_center
 
-            # bottom face (outer side still corresponds to w1)
-            v0_idx = get_vertex_index((ix,   iy,   iz),   (x0, y0, z0))
-            v1_idx = get_vertex_index((ix+1, iy,   iz),   (x1, y1, z1))
-            v2_idx = get_vertex_index((ix+1, iy+1, iz),   (x2, y2, z2))
-            v3_idx = get_vertex_index((ix,   iy+1, iz),   (x3, y3, z3))
-            # top face
-            v4_idx = get_vertex_index((ix,   iy,   iz+1), (x4, y4, z4))
-            v5_idx = get_vertex_index((ix+1, iy,   iz+1), (x5, y5, z5))
-            v6_idx = get_vertex_index((ix+1, iy+1, iz+1), (x6, y6, z6))
-            v7_idx = get_vertex_index((ix,   iy+1, iz+1), (x7, y7, z7))
+    if best_theta_center is not None:
+        theta_offset = theta_lowest - best_theta_center
+        print(
+            "[VOXEL] Tangential alignment: base-slice voxel center angle "
+            f"{best_theta_center:.6f} -> theta_low={theta_lowest:.6f}, "
+            f"theta_offset={theta_offset:.6f}"
+        )
+    else:
+        theta_offset = 0.0
+        print("[VOXEL] WARNING: could not find base slice voxel for tangential alignment.")
 
-            hexes.append((v0_idx, v1_idx, v2_idx, v3_idx, v4_idx, v5_idx, v6_idx, v7_idx))
+    # This is the cylinder definition used by the *voxel mesh* and FFD
+    cyl_params = (cx_cyl, cz_cyl, R0_world, theta_offset)
 
-            eid = len(hexes)
-            slice_idx = iz_to_slice[int(iz)]
-            slice_to_eids[slice_idx].append(eid)
+    # Optional: debug cylinder with the aligned R0_world and theta_offset
+    input_base = os.path.splitext(os.path.basename(input_stl))[0]
+    cyl_debug_stl = input_base + "_cylinder_debug.stl"
+
+    n_theta = 64
+    thetas = np.linspace(0.0, 2.0 * math.pi, n_theta, endpoint=False)
+    bottom = []
+    top = []
+    for th in thetas:
+        th_off = th + theta_offset
+        x = cx_cyl + R0_world * math.cos(th_off)
+        z = cz_cyl + R0_world * math.sin(th_off)
+        bottom.append([x, y_min_w, z])
+        top.append([x, y_max_w, z])
+    bottom = np.array(bottom, dtype=float)
+    top = np.array(top, dtype=float)
+    vertices_cyl = np.vstack([bottom, top])
+    faces_cyl = []
+    for i in range(n_theta):
+        j = (i + 1) % n_theta
+        b0 = i
+        b1 = j
+        t0 = i + n_theta
+        t1 = j + n_theta
+        faces_cyl.append([b0, b1, t1])
+        faces_cyl.append([b0, t1, t0])
+    faces_cyl = np.array(faces_cyl, dtype=np.int64)
+    mesh_cyl = trimesh.Trimesh(vertices=vertices_cyl, faces=faces_cyl, process=False)
+    mesh_cyl.export(cyl_debug_stl)
+    print(f"[CYL] Debug cylinder STL written to: {cyl_debug_stl}")
+
+    # --- Angular trimming in WORLD ANGLE space ------------------------
+    # 1) Compute model angular range around cylinder (unwrapped)
+    dx_m = verts_world[:, 0] - cx_cyl
+    dz_m = verts_world[:, 2] - cz_cyl
+    theta_model_raw = np.arctan2(dz_m, dx_m)
+    theta_model_unwrapped = _unwrap_angle_array(theta_model_raw)
+    theta_min_model = float(theta_model_unwrapped.min())
+    theta_max_model = float(theta_model_unwrapped.max())
+    theta_mid_model = 0.5 * (theta_min_model + theta_max_model)
+
+    print(
+        "[VOXEL] Model angular range (unwrapped): "
+        f"[{theta_min_model:.6f}, {theta_max_model:.6f}] rad "
+        f"(span={theta_max_model - theta_min_model:.6f})"
+    )
+
+    # Angular half-width of a voxel band in v-direction
+    dtheta_half = (cube_size * 0.5) / R0_world
+
+    # 2) For each angular index iy, compute its band center angle in world,
+    #    then keep it iff its angular interval intersects the model's range.
+    unique_iy = np.unique(indices[:, 1])
+    if unique_iy.size == 0:
+        print("[VOXEL] No angular bands to trim (world angle), aborting.")
+        return [], [], {}, [], None, None, None, None, None, None, None
+
+    if len(z_slices) == 0:
+        print("[VOXEL] No slices for angular trimming (world angle), aborting.")
+        return [], [], {}, [], None, None, None, None, None, None, None
+
+    base_slice_iz = int(layer_info[0][0])
+
+    iy_keep: Set[int] = set()
+    for iy_val in unique_iy:
+        # Use geometric center of cell (ix=0, this iy, base_slice_iz) in param
+        pt_param = vox.indices_to_points(
+            np.array([[0, int(iy_val), base_slice_iz]], dtype=float)
+        )[0]
+        u_c, v_c, w_c = pt_param
+
+        # Map param center to world using final R0_world and theta_offset
+        x_c, y_c, z_c = param_to_world_cyl(
+            (u_c, v_c, w_c),
+            cx_cyl,
+            cz_cyl,
+            R0_world,
+            theta_offset,
+        )
+
+        theta_c_raw = math.atan2(z_c - cz_cyl, x_c - cx_cyl)
+
+        # Bring this band angle near the model's range (same branch)
+        k = round((theta_mid_model - theta_c_raw) / (2.0 * math.pi))
+        theta_c = theta_c_raw + k * 2.0 * math.pi
+
+        band_min = theta_c - dtheta_half
+        band_max = theta_c + dtheta_half
+
+        # Interval intersection test with model [theta_min_model, theta_max_model]
+        if (band_max >= theta_min_model) and (band_min <= theta_max_model):
+            iy_keep.add(int(iy_val))
+
+    if not iy_keep:
+        print("[VOXEL] Angular trimming (world angle) would remove all bands, aborting.")
+        return [], [], {}, [], None, None, None, None, None, None, None
+
+    mask_ang = np.array([int(iy) in iy_keep for ix, iy, iz in indices], dtype=bool)
+    indices = indices[mask_ang]
+
+    if indices.size == 0:
+        print("[VOXEL] After angular trimming (world angle), no voxels left – aborting.")
+        return [], [], {}, [], None, None, None, None, None, None, None
+
+    total_voxels = indices.shape[0]
+    print(f"[VOXEL] Total voxels after angular trim (world angle): {total_voxels}")
+
+    print("[VOXEL] Building global C3D8R mesh (cylindrical) ...")
+
+    # ----------- Curved voxels on cylindrical surface -----------
+    if cyl_params is None or R0_world is None:
+        raise RuntimeError("[VOXEL] cyl_params missing in cylindrical voxel mode.")
+    cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use = cyl_params
+
+    for (ix, iy, iz) in indices_sorted:
+        center_param = vox.indices_to_points(
+            np.array([[ix, iy, iz]], dtype=float)
+        )[0]
+        u_c, v_c, w_c = center_param
+
+        u0, u1 = u_c - half, u_c + half
+        v0, v1 = v_c - half, v_c + half
+        w0, w1 = w_c - half, w_c + half
+
+        # param-space corners of this voxel
+        p0 = (u0, v0, w0)  # "bottom" in param space
+        p1 = (u1, v0, w0)
+        p2 = (u1, v1, w0)
+        p3 = (u0, v1, w0)
+        p4 = (u0, v0, w1)  # "top" in param space
+        p5 = (u1, v0, w1)
+        p6 = (u1, v1, w1)
+        p7 = (u0, v1, w1)
+
+        # map to world (curved hexa), using aligned R0_world + theta_offset
+        x0, y0, z0 = param_to_world_cyl(p0, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
+        x1, y1, z1 = param_to_world_cyl(p1, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
+        x2, y2, z2 = param_to_world_cyl(p2, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
+        x3, y3, z3 = param_to_world_cyl(p3, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
+        x4, y4, z4 = param_to_world_cyl(p4, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
+        x5, y5, z5 = param_to_world_cyl(p5, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
+        x6, y6, z6 = param_to_world_cyl(p6, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
+        x7, y7, z7 = param_to_world_cyl(p7, cx_cyl_use, cz_cyl_use, R0_use, theta_offset_use)
+
+        # bottom face (outer side still corresponds to w1)
+        v0_idx = get_vertex_index((ix,   iy,   iz),   (x0, y0, z0))
+        v1_idx = get_vertex_index((ix+1, iy,   iz),   (x1, y1, z1))
+        v2_idx = get_vertex_index((ix+1, iy+1, iz),   (x2, y2, z2))
+        v3_idx = get_vertex_index((ix,   iy+1, iz),   (x3, y3, z3))
+        # top face
+        v4_idx = get_vertex_index((ix,   iy,   iz+1), (x4, y4, z4))
+        v5_idx = get_vertex_index((ix+1, iy,   iz+1), (x5, y5, z5))
+        v6_idx = get_vertex_index((ix+1, iy+1, iz+1), (x6, y6, z6))
+        v7_idx = get_vertex_index((ix,   iy+1, iz+1), (x7, y7, z7))
+
+        hexes.append((v0_idx, v1_idx, v2_idx, v3_idx, v4_idx, v5_idx, v6_idx, v7_idx))
+
+        eid = len(hexes)
+        slice_idx = iz_to_slice[int(iz)]
+        slice_to_eids[slice_idx].append(eid)
 
     print(
         f"[VOXEL] Built mesh: {len(vertices)} nodes, "
@@ -773,8 +712,9 @@ def generate_global_cubic_hex_mesh(
         axis_point_world,
         edge_left_world,
         edge_right_world,
+        indices_sorted,   # for debug export
+        vox               # for debug export
     )
-
 
 
 def _write_id_list_lines(f, ids: List[int], per_line: int = 16):
@@ -790,28 +730,20 @@ def write_calculix_job(
     slice_to_eids: Dict[int, List[int]],
     z_slices: List[float],
     base_temp: float = 0.0,
-    heat_flux: float = 1.0,          # kept for compatibility, NOT used
     shrinkage_curve: List[float] = [5, 4, 3, 2, 1],
     max_cure: float = 1.0,
-    cure_shrink_per_unit: float = 0.3, # 3%
-    curved_voxels: bool = False,     # <--- NEW
+    cure_shrink_per_unit: float = 0.3,  # 3%
 ):
     """
     Additive-style uncoupled temperature-displacement job with MODEL CHANGE
     and incremental curing driven by a per-layer shrinkage curve.
 
-    (Unchanged logic – slices may now be curved radial layers when curved_voxels
-    mode is used.)
+    This version assumes cylindrical voxels: the BASE node set is taken from
+    the outer radial faces (nodes 4..7) of the first radial slice.
     """
 
     n_nodes = len(vertices)
     n_elems = len(hexes)
-
-    # detect bottom nodes as "BASE" by minimum world Z
-    # z_coords = np.array([v[2] for v in vertices], dtype=float)
-    # z_min = float(z_coords.min())
-    # tol = (z_coords.max() - z_min + 1e-9) * 1e-3
-    # base_nodes = [i + 1 for i, z in enumerate(z_coords) if abs(z - z_min) <= tol]
 
     n_slices = len(z_slices)
 
@@ -835,7 +767,7 @@ def write_calculix_job(
         f.write("*HEADING\n")
         f.write(
             "Voxel C3D8R uncoupled temperature-displacement "
-            "(layer-wise MODEL CHANGE + shrinkage-curve-driven curing)\n"
+            "(layer-wise MODEL CHANGE + shrinkage-curve-driven curing, cylindrical)\n"
         )
 
         # -------------------- NODES --------------------
@@ -859,7 +791,7 @@ def write_calculix_job(
         f.write(f"1, {n_nodes}, 1\n")
 
         # We'll define BASE after we build per-slice node sets
-        base_nodes = []
+        base_nodes: List[int] = []
 
         f.write("** Element + node sets (per slice) +++++++++++++++++++++++++\n")
         slice_names: List[str] = []
@@ -896,7 +828,7 @@ def write_calculix_job(
             f.write(f"*NSET, NSET={nset_name}\n")
             _write_id_list_lines(f, node_list)
 
-        # -------------------- BASE from bottom faces of first slice ---------------
+        # -------------------- BASE from outer radial faces of first slice ---------------
         existing_slice_idxs = sorted(slice_node_ids.keys())
         if existing_slice_idxs:
             base_slice = existing_slice_idxs[0]
@@ -906,16 +838,12 @@ def write_calculix_job(
             for eid in base_eids:
                 n0, n1, n2, n3, n4, n5, n6, n7 = hexes[eid - 1]
 
-                if curved_voxels:
-                    # Cylindrical case: "bottom" = outer radial face (w1) = nodes 4..7
-                    base_node_set.update([n4, n5, n6, n7])
-                else:
-                    # Planar case: bottom = lower Z face = nodes 0..3
-                    base_node_set.update([n0, n1, n2, n3])
+                # Cylindrical case: "bottom" = outer radial face (w1) = nodes 4..7
+                base_node_set.update([n4, n5, n6, n7])
 
             base_nodes = sorted(base_node_set)
 
-            f.write("** Base node set = bottom faces of first slice +++++++++++++++\n")
+            f.write("** Base node set = outer radial faces of first slice +++++++++++++++\n")
             f.write("*NSET, NSET=BASE\n")
             _write_id_list_lines(f, base_nodes)
         else:
@@ -943,7 +871,7 @@ def write_calculix_job(
         # -------------------- INITIAL "TEMPERATURE" (CURE) -------------------
         f.write("** Initial conditions (cure variable) ++++++++++++++++++++++\n")
         f.write("*INITIAL CONDITIONS, TYPE=TEMPERATURE\n")
-        f.write(f"ALLNODES, {base_temp}\n")  # typically 0.0
+        f.write(f"ALLNODES, {base_temp}\n")  # typically 0.0 or 293
 
         # -------------------- STEPS --------------------
         f.write("** Steps +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
@@ -1005,7 +933,7 @@ def write_calculix_job(
                     name = f"SLICE_{slice_to_add:03d}"
                     z_val = z_slices[slice_to_add]
                     f.write(
-                        f"** Step {step_counter}: add slice {name} at z = {z_val} "
+                        f"** Step {step_counter}: add slice {name} at param w = {z_val} "
                         f"and advance shrinkage curve\n"
                     )
                 else:
@@ -1063,14 +991,6 @@ def write_calculix_job(
         f"slices: {n_slices}, shrinkage_curve={shrinkage_curve}, "
         f"max_cure={max_cure}, cure_shrink_per_unit={cure_shrink_per_unit}"
     )
-
-
-# ============================================================
-#  (Old mechanical job writer – now unused, kept only for reference)
-# ============================================================
-
-def write_mechanical_job(*args, **kwargs):
-    print("[WARN] write_mechanical_job() is deprecated and not used in this script.")
 
 
 # ============================================================
@@ -1165,9 +1085,15 @@ def build_ffd_from_lattice(
     vertices: List[Tuple[float, float, float]],
     cube_size: float,
     displacements: Dict[int, np.ndarray],
-    curved_voxels: bool = False,
-    cyl_params: Optional[Tuple[float, float, float]] = None,
+    cyl_params: Optional[Tuple[float, float, float, float]] = None,
 ):
+    """
+    Build a PyGeM FFD lattice from voxel nodes.
+
+    If cyl_params is provided, cylindrical meta-data is attached for
+    cylindrical visualization of control points; FFD deformation itself
+    is standard rectangular in world (x, y, z).
+    """
     if FFD is None:
         raise RuntimeError("PyGeM FFD is not available. Please install 'pygem'.")
 
@@ -1235,7 +1161,7 @@ def build_ffd_from_lattice(
         ffd.array_mu_z[ix, iy, iz] = u[2] / Lz
 
     # --- Cylindrical meta-data for exporting curved FFD lattice -------------
-    if curved_voxels and cyl_params is not None:
+    if cyl_params is not None:
         # Support both (cx, cz, R0) and (cx, cz, R0, theta_offset)
         if len(cyl_params) == 4:
             cx_cyl, cz_cyl, R0, theta_offset = cyl_params
@@ -1561,7 +1487,6 @@ def deform_input_stl_with_frd_pygem(
     cube_size: float,
     output_stl: str,
     lattice_basepath: str = None,
-    curved_voxels: bool = False,
     cyl_params: Optional[Tuple[float, ...]] = None,
     lowest_point: Optional[Tuple[float, float, float]] = None,
     axis_point: Optional[Tuple[float, float, float]] = None,
@@ -1602,11 +1527,10 @@ def deform_input_stl_with_frd_pygem(
         vertices,
         cube_size,
         displacements,
-        curved_voxels=curved_voxels,
         cyl_params=cyl_params,
     )
 
-    # Export FFD control points (now cylindrical-shaped when curved_voxels=True)
+    # Export FFD control points (now cylindrical-shaped when cyl_params != None)
     if lattice_basepath:
         export_ffd_control_points(ffd, lattice_basepath)
 
@@ -1650,6 +1574,86 @@ def deform_input_stl_with_frd_pygem(
     print(f"[FFD] Pre-deformed STL written to: {predeformed_path}")
 
 
+def export_voxel_debug_stl(
+    indices_sorted,
+    vox,
+    cube_size,
+    cyl_params,
+    out_path
+):
+    """
+    Export all voxels as an STL mesh for visualization.
+    Each voxel is drawn as 12 triangles (6 faces).
+
+    Always uses cylindrical mapping:
+      - voxel centers/corners are in param (u,v,w)
+      - corners are mapped through param_to_world_cyl().
+    """
+    if cyl_params is None:
+        print("[VOXDBG] cyl_params missing, cannot export curved voxels.")
+        return
+
+    if len(cyl_params) == 4:
+        cx, cz, R0, theta_offset = cyl_params
+    else:
+        cx, cz, R0 = cyl_params
+        theta_offset = 0.0
+
+    half = cube_size / 2.0
+    vertices = []
+    faces = []
+
+    for (ix, iy, iz) in indices_sorted:
+        # center in param coords
+        center = vox.indices_to_points(
+            np.array([[ix, iy, iz]], dtype=float)
+        )[0]
+        cx0, cy0, cz0 = center
+
+        # axis-aligned corners in param coords
+        u0, u1 = cx0 - half, cx0 + half
+        v0, v1 = cy0 - half, cy0 + half
+        w0, w1 = cz0 - half, cz0 + half
+
+        corners = [
+            (u0, v0, w0),
+            (u1, v0, w0),
+            (u1, v1, w0),
+            (u0, v1, w0),
+            (u0, v0, w1),
+            (u1, v0, w1),
+            (u1, v1, w1),
+            (u0, v1, w1),
+        ]
+
+        world = [
+            param_to_world_cyl(p, cx, cz, R0, theta_offset)
+            for p in corners
+        ]
+
+        base = len(vertices)
+        vertices.extend(world)
+
+        # add 12 triangles of the cube
+        cube_faces = [
+            (0, 1, 2), (0, 2, 3),  # bottom
+            (4, 5, 6), (4, 6, 7),  # top
+            (0, 1, 5), (0, 5, 4),  # front
+            (1, 2, 6), (1, 6, 5),  # right
+            (2, 3, 7), (2, 7, 6),  # back
+            (3, 0, 4), (3, 4, 7),  # left
+        ]
+        for (a, b, c) in cube_faces:
+            faces.append((base + a, base + b, base + c))
+
+    # Export STL
+    vertices_np = np.array(vertices, dtype=float)
+    faces_np = np.array(faces, dtype=np.int32)
+    mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces_np, process=False)
+    mesh.export(out_path)
+    print(f"[VOXDBG] Voxel debug STL written: {out_path}")
+
+
 # ============================================================
 #  CLI
 # ============================================================
@@ -1657,9 +1661,10 @@ def deform_input_stl_with_frd_pygem(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Voxelize an STL and generate an uncoupled thermo-mechanical CalculiX job "
-            "with C3D8R hexahedra and layer-by-layer *UNCOUPLED TEMPERATURE-DISPLACEMENT "
-            "steps, then deform the input STL using PyGeM FFD (forward + pre-deformed) "
+            "Voxelize an STL in cylindrical coordinates and generate an "
+            "uncoupled thermo-mechanical CalculiX job with C3D8R hexahedra "
+            "and layer-by-layer *UNCOUPLED TEMPERATURE-DISPLACEMENT steps, "
+            "then deform the input STL using PyGeM FFD (forward + pre-deformed) "
             "and optionally export the lattice as separate PLY point clouds."
         )
     )
@@ -1682,13 +1687,7 @@ def main():
         "--base-temp",
         type=float,
         default=293.0,
-        help="Base/support temperature (K) for boundary condition (default 293)",
-    )
-    parser.add_argument(
-        "--heat-flux",
-        type=float,
-        default=1.0e3,
-        help="Heat flux value used in *DFLUX (default 1.0e3)",
+        help="Base/support temperature (K) for initial cure value (default 293)",
     )
     parser.add_argument(
         "--run-ccx",
@@ -1709,27 +1708,19 @@ def main():
             "'<job_name>_lattice_def.ply' point clouds."
         ),
     )
-    # --- New cylindrical voxel options ---
-    parser.add_argument(
-        "--curved-voxels",
-        action="store_true",
-        help=(
-            "Use cylindrical curved voxels instead of axis-aligned cubes. "
-            "Cylinder axis is global +Y; slices become radial layers."
-        ),
-    )
+    # Cylindrical options
     parser.add_argument(
         "--cyl-center-xz",
         type=float,
         nargs=2,
         metavar=("CX", "CZ"),
-        help="Cylinder axis center in XZ plane (used with --curved-voxels).",
+        help="Cylinder axis center in XZ plane.",
     )
     parser.add_argument(
         "--cyl-radius",
         type=float,
         help=(
-            "Base cylinder radius R0 (used with --curved-voxels). "
+            "Base cylinder radius R0 for param mapping. "
             "If omitted, estimated from STL geometry."
         ),
     )
@@ -1740,7 +1731,7 @@ def main():
         print(f"Input STL not found: {args.input_stl}")
         raise SystemExit(1)
 
-    # 1) Mesh
+    # 1) Mesh (cylindrical curved voxels only)
     (
         vertices,
         hexes,
@@ -1751,12 +1742,23 @@ def main():
         axis_point,
         edge_left_point,
         edge_right_point,
+        indices_sorted,
+        vox,
     ) = generate_global_cubic_hex_mesh(
         args.input_stl,
         args.cube_size,
-        curved_voxels=args.curved_voxels,
         cyl_center_xz=tuple(args.cyl_center_xz) if args.cyl_center_xz else None,
         cyl_radius=args.cyl_radius,
+    )
+
+    # --- Export voxel debug STL ---
+    voxel_debug_stl = args.job_name + "_voxels.stl"
+    export_voxel_debug_stl(
+        indices_sorted,
+        vox,
+        args.cube_size,
+        cyl_params,
+        voxel_debug_stl
     )
 
     if not vertices or not hexes:
@@ -1778,9 +1780,7 @@ def main():
         hexes,
         slice_to_eids,
         z_slices,
-        # base_temp=args.base_temp,
-        # heat_flux=args.heat_flux,
-        curved_voxels=args.curved_voxels,   # <--- NEW
+        base_temp=args.base_temp,
     )
 
     # 3) Optional run + PyGeM FFD deformation + lattice export
@@ -1801,7 +1801,6 @@ def main():
                 args.cube_size,
                 deformed_stl,
                 lattice_basepath=lattice_basepath,
-                curved_voxels=args.curved_voxels,
                 cyl_params=cyl_params,
                 lowest_point=lowest_point,
                 axis_point=axis_point,
