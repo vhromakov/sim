@@ -27,6 +27,7 @@ Pipeline (cylindrical workflow only):
 
 import argparse
 import os
+import sys
 from typing import List, Tuple, Dict, Set, Optional
 
 import math
@@ -142,26 +143,26 @@ def generate_global_cubic_hex_mesh(
     cube_size: float,
     cyl_center_xz: Optional[Tuple[float, float]] = None,
     cyl_radius: Optional[float] = None,
-    cyl_radius_offset: float = 0.0,  # NEW: extra radius added to cylinder
+    cyl_radius_offset: float = 0.0,  # interpreted as your old "half voxel" extra
 ):
     """
     Voxelize input_stl in cylindrical param space and build a global C3D8R brick mesh
     mapped onto a cylinder (curved voxels).
 
-    This implementation mirrors the cylindrical voxelization pipeline from gen_grid.py:
-
-      - STL vertices are analyzed in world space (x,y,z).
-      - Cylinder axis is global +Y.
-      - Cylinder center (cx, cz) and mapping radius R0 are chosen so that
-        the lowest-Z STL vertex lies on the cylinder surface (if cyl_radius is given),
-        with cx taken from that vertex.
-      - STL is mapped to cylindrical param space (u, v, w) via world_to_param_cyl.
-      - Voxelization happens in (u, v, w) using trimesh.voxelized().
-      - Angular trimming is performed in param v (only) to keep bands intersecting STL.
-      - Voxel corners in param space are mapped back to world via param_to_world_cyl,
-        giving curved hexahedra that follow the cylinder.
-      - Slices become radial layers (bands in w), sorted by param w (outermost first).
+    - Cylinder axis is global +Y.
+    - Cylinder center (cx, cz) chosen so that the lowest-Z vertex defines cx,
+      and cz is either derived from cyl_radius (lowest point lies on that circle)
+      or from bbox center if radius is not given.
+    - The effective mapping radius R0 is:
+          R0 = R_true + cyl_radius_offset + inward_offset
+      where:
+          R_true = distance from cylinder center to lowest point
+          cyl_radius_offset ≈ 0.5*cube_size (your previous offset)
+          inward_offset = sagitta so that midpoint of a 1-voxel chord lies on R0.
+    - We rotate the mesh in param space so that the lowest point ends up at angle 0
+      (v=0), then undo this rotation when mapping voxels back to world.
     """
+
     if cube_size <= 0:
         raise ValueError("cube_size must be positive")
 
@@ -192,7 +193,6 @@ def generate_global_cubic_hex_mesh(
     edge_left_world: Optional[Tuple[float, float, float]] = None
     edge_right_world: Optional[Tuple[float, float, float]] = None
 
-    # --- cylindrical preprocessing (mirrors gen_grid.py) ---
     verts_world = mesh.vertices.copy()
 
     # --- Find lowest point (min Z) in world space ---
@@ -201,17 +201,18 @@ def generate_global_cubic_hex_mesh(
     x_low, y_low, z_low = verts_world[min_z_idx]
     lowest_point_world = (float(x_low), float(y_low), float(z_low))
 
-    # Start from this X as cylinder center X
+    # Use lowest point X as cylinder center X
     cx_cyl = float(x_low)
 
-    # Decide CZ and initial radius R0_param for world->param mapping
-    if cyl_radius is not None and cyl_radius > 0.0:
-        # User-provided *base* radius used to place the axis
-        base_radius = float(cyl_radius)
+    # Decide CZ (and possibly initial "design" radius) to place the axis
+    base_radius: Optional[float] = None  # design radius tied to lowest point
 
+    if cyl_radius is not None and cyl_radius > 0.0:
+        # User-provided radius: we'll place the axis so that the lowest point
+        # lies exactly on this circle.
+        base_radius = float(cyl_radius)
         z_center_bbox = 0.5 * (z_min_w + z_max_w)
 
-        # Place center so that lowest point lies exactly on the base cylinder
         cz_plus = z_low + base_radius
         cz_minus = z_low - base_radius
 
@@ -220,35 +221,17 @@ def generate_global_cubic_hex_mesh(
         else:
             cz_cyl = cz_minus
 
-        # Now keep this axis fixed, but optionally push the cylinder surface outward
-        R0_param = base_radius
-        if cyl_radius_offset != 0.0:
-            R0_param = base_radius + float(cyl_radius_offset)
-            print(
-                f"[VOXEL] Base radius={base_radius:.3f}, "
-                f"applying offset {cyl_radius_offset:.3f} → "
-                f"effective mapping radius R0_param={R0_param:.3f}. "
-                "Axis center is unchanged, so the model moves inside "
-                "the cylinder by that offset."
-            )
-        else:
-            print(
-                f"[VOXEL] Using user radius R0_param={R0_param:.3f}; "
-                f"lowest point lies on the base cylinder."
-            )
-
-        if cyl_center_xz is not None:
-            print(
-                "[VOXEL] Note: --cyl-center-xz provided, but CZ is "
-                "overridden to enforce lowest point on base cylinder."
-            )
-
+        print(
+            "[VOXEL] Using user cylinder radius to place axis so lowest point "
+            f"lies on the circle: base_radius={base_radius:.6f}, "
+            f"center=({cx_cyl:.6f}, {cz_cyl:.6f})"
+        )
     else:
-        # Estimate center/radius from geometry
+        # No explicit radius: use center from CLI or bbox
         if cyl_center_xz is not None:
             cx_cli, cz_cli = cyl_center_xz
-            cx_cyl = cx_cli
-            cz_cyl = cz_cli
+            cx_cyl = float(cx_cli)
+            cz_cyl = float(cz_cli)
             print(
                 "[VOXEL] No radius given; using explicit cyl-center-xz "
                 f"({cx_cyl:.3f}, {cz_cyl:.3f})"
@@ -265,8 +248,12 @@ def generate_global_cubic_hex_mesh(
     dz_all = verts_world[:, 2] - cz_cyl
     r_all = np.sqrt(dx_all * dx_all + dz_all * dz_all)
 
-    if R0_param is None:
+    # If no explicit radius, we can still pick an average radius as baseline
+    if base_radius is None:
         R0_param = float(np.mean(r_all))
+        print(
+            f"[VOXEL] Estimated mapping radius from geometry: R0_param={R0_param:.6f}"
+        )
 
     # Radial/angle of the lowest point (with chosen center)
     dx_low = x_low - cx_cyl
@@ -313,14 +300,73 @@ def generate_global_cubic_hex_mesh(
     print(
         f"[VOXEL] Cyl center from lowest Z vertex: "
         f"min_z={z_low:.3f}, lowest_pt=({x_low:.3f}, {y_low:.3f}, {z_low:.3f}), "
-        f"r_low={r_lowest:.3f}, theta_low={theta_lowest:.3f} rad"
+        f"r_low={r_lowest:.6f}, theta_low={theta_lowest:.6f} rad"
     )
+
+    # ------------------------------------------------------------
+    # Compute effective mapping radius R0:
+    #   R_true = r_lowest (distance center -> lowest point)
+    #   R0 = R_true + cyl_radius_offset + inward_offset
+    # where inward_offset is sagitta so that the midpoint of a 1-voxel chord
+    # lies on the circle of radius R0.
+    # ------------------------------------------------------------
+
+    if base_radius is None:
+        # No explicit radius case: fall back to R0_param we already estimated
+        R_true = r_lowest
+        if R0_param is None:
+            R0_param = float(np.mean(r_all))
+        print(
+            f"[VOXEL] No explicit cylinder radius; using R0_param={R0_param:.6f}, "
+            f"R_true (r_lowest)={R_true:.6f}"
+        )
+    else:
+        # Explicit radius case: treat "radius" as distance center->lowest point
+        R_true = r_lowest  # should equal base_radius numerically
+
+        s = cube_size
+        half = s * 0.5
+
+        if R_true <= half:
+            inward_offset = 0.0
+            print(
+                "[VOXEL] WARNING: R_true <= cube_size/2, "
+                "sagitta-based inward offset set to 0."
+            )
+        else:
+            inward_offset = R_true - math.sqrt(R_true * R_true - half * half)
+
+        total_offset = cyl_radius_offset + inward_offset + sys.float_info.epsilon
+        R0_param = R_true + total_offset
+
+        print(
+            f"[VOXEL] Chord midpoint inward offset={inward_offset:.6f} "
+            f"(R_true={R_true:.6f}, cube_size={s:.6f});\n"
+            f"        using cyl_radius_offset={cyl_radius_offset:.6f} "
+            f"→ total radial extension={total_offset:.6f}, "
+            f"effective mapping radius R0_param={R0_param:.6f}"
+        )
 
     # Final cylinder mapping radius
     R0 = float(R0_param)
     print(
         f"[VOXEL] Cylindrical voxel mode: axis=+Y, "
-        f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), R0={R0:.3f}"
+        f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), R0={R0:.6f}"
+    )
+
+    # --- Rotation so that lowest point is at angle 0 ------------------
+    # world_to_param_cyl gives v = R0 * theta, so:
+    # v_lowest = R0 * theta_lowest  → we want v_lowest' = 0
+    v_lowest = R0 * theta_lowest
+    v_offset = -v_lowest
+    angle_offset = -theta_lowest
+
+    print(
+        f"[VOXEL] Rotating so lowest point is at angle 0: "
+        f"theta_lowest={theta_lowest:.6f} rad, "
+        f"v_lowest={v_lowest:.6f}, "
+        f"v_offset={v_offset:.6f}, "
+        f"angle_offset={angle_offset:.6f} rad"
     )
 
     # Map mesh into param space (u,v,w) using final (R0)
@@ -332,6 +378,10 @@ def generate_global_cubic_hex_mesh(
             cz_cyl,
             R0,
         )
+
+    # Apply tangential rotation so the lowest point gets v=0 in param space
+    verts_param[:, 1] += v_offset
+
     mesh.vertices = verts_param
 
     # --- Tangential (v) extents of the STL in param space -------------
@@ -438,11 +488,14 @@ def generate_global_cubic_hex_mesh(
         )[0]
         u_c, v_c, w_c = center_param
 
+        # Undo the tangential rotation before mapping back to world
+        v_c -= v_offset
+
         u0, u1 = u_c - half, u_c + half
         v0, v1 = v_c - half, v_c + half
         w0, w1 = w_c - half, w_c + half
 
-        # param-space corners of this voxel (following gen_grid.py convention)
+        # param-space corners of this voxel
         p0 = (u0, v0, w0)
         p1 = (u1, v0, w0)
         p2 = (u1, v1, w0)
@@ -479,7 +532,7 @@ def generate_global_cubic_hex_mesh(
         slice_idx = iz_to_slice[int(iz)]
         slice_to_eids[slice_idx].append(eid)
 
-    cyl_params = (cx_cyl, cz_cyl, R0)
+    cyl_params = (cx_cyl, cz_cyl, R0, v_offset)
 
     print(
         f"[VOXEL] Built mesh: {len(vertices)} nodes, "
@@ -799,10 +852,10 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
     print(f"[RUN] CalculiX return code: {result.returncode}")
     if result.stdout:
         print("----- CalculiX STDOUT -----")
-        print(result.stdout)
+        # print(result.stdout)
     if result.stderr:
         print("----- CalculiX STDERR -----")
-        print(result.stderr)
+        # print(result.stderr)
     print("[RUN] Done.")
     return result.returncode == 0
 
@@ -1438,12 +1491,21 @@ def export_voxel_debug_stl(
     Uses cylindrical mapping:
       - voxel centers/corners are in param (u,v,w)
       - corners are mapped through param_to_world_cyl().
+
+    If cyl_params has 4 entries, the 4th is assumed to be the
+    tangential v_offset used to rotate the STL before voxelization,
+    and we undo it here.
     """
     if cyl_params is None:
         print("[VOXDBG] cyl_params missing, cannot export curved voxels.")
         return
 
-    cx, cz, R0 = cyl_params
+    # Support both (cx, cz, R0) and (cx, cz, R0, v_offset)
+    if len(cyl_params) >= 4:
+        cx, cz, R0, v_offset = cyl_params
+    else:
+        cx, cz, R0 = cyl_params
+        v_offset = 0.0
 
     half = cube_size / 2.0
     vertices = []
@@ -1455,6 +1517,9 @@ def export_voxel_debug_stl(
             np.array([[ix, iy, iz]], dtype=float)
         )[0]
         u_c, v_c, w_c = center_param
+
+        # --- NEW: undo the half-voxel rotation for debug mesh ---------
+        v_c -= v_offset
 
         # axis-aligned corners in param coords
         u0, u1 = u_c - half, u_c + half
