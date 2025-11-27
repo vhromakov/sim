@@ -142,6 +142,7 @@ def generate_global_cubic_hex_mesh(
     cube_size: float,
     cyl_center_xz: Optional[Tuple[float, float]] = None,
     cyl_radius: Optional[float] = None,
+    cyl_radius_offset: float = 0.0,  # NEW: extra radius added to cylinder
 ):
     """
     Voxelize input_stl in cylindrical param space and build a global C3D8R brick mesh
@@ -205,29 +206,43 @@ def generate_global_cubic_hex_mesh(
 
     # Decide CZ and initial radius R0_param for world->param mapping
     if cyl_radius is not None and cyl_radius > 0.0:
-        # User-provided radius (for mapping)
-        R0_param = float(cyl_radius)
+        # User-provided *base* radius used to place the axis
+        base_radius = float(cyl_radius)
 
         z_center_bbox = 0.5 * (z_min_w + z_max_w)
-        cz_plus = z_low + R0_param
-        cz_minus = z_low - R0_param
+
+        # Place center so that lowest point lies exactly on the base cylinder
+        cz_plus = z_low + base_radius
+        cz_minus = z_low - base_radius
 
         if abs(cz_plus - z_center_bbox) < abs(cz_minus - z_center_bbox):
             cz_cyl = cz_plus
         else:
             cz_cyl = cz_minus
 
+        # Now keep this axis fixed, but optionally push the cylinder surface outward
+        R0_param = base_radius
+        if cyl_radius_offset != 0.0:
+            R0_param = base_radius + float(cyl_radius_offset)
+            print(
+                f"[VOXEL] Base radius={base_radius:.3f}, "
+                f"applying offset {cyl_radius_offset:.3f} → "
+                f"effective mapping radius R0_param={R0_param:.3f}. "
+                "Axis center is unchanged, so the model moves inside "
+                "the cylinder by that offset."
+            )
+        else:
+            print(
+                f"[VOXEL] Using user radius R0_param={R0_param:.3f}; "
+                f"lowest point lies on the base cylinder."
+            )
+
         if cyl_center_xz is not None:
             print(
                 "[VOXEL] Note: --cyl-center-xz provided, but CZ is "
-                "overridden to enforce lowest point on cylinder."
+                "overridden to enforce lowest point on base cylinder."
             )
 
-        print(
-            f"[VOXEL] Using user radius R0_param={R0_param:.3f}; "
-            f"lowest point ({x_low:.3f}, {y_low:.3f}, {z_low:.3f}) "
-            f"lies on cylinder (by CZ selection)."
-        )
     else:
         # Estimate center/radius from geometry
         if cyl_center_xz is not None:
@@ -1567,6 +1582,7 @@ def main():
         args.cube_size,
         cyl_center_xz=None,
         cyl_radius=args.cyl_radius,
+        cyl_radius_offset=args.cube_size / 2,  # NEW
     )
 
     # --- Export voxel debug STL ---
