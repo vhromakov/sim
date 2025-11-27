@@ -176,12 +176,33 @@ def generate_global_cubic_hex_mesh(
     print(f"[VOXEL] Loaded mesh from {input_stl}")
     print(f"[VOXEL] Watertight: {mesh.is_watertight}, bbox extents: {mesh.extents}")
 
-    # Bounds in world space (original STL)
+    # --- NEW: shift model in Y so that min Y = 0 for voxelization ---
+    bounds_orig = mesh.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]  # <<< NEW
+    x_min_o, y_min_o, z_min_o = bounds_orig[0]                          # <<< NEW
+    x_max_o, y_max_o, z_max_o = bounds_orig[1]                          # <<< NEW
+
+    y_length = y_max_o - y_min_o
+    float_cubes = y_length / cube_size
+    ceil_cubes = math.ceil(float_cubes)
+    reminder = (ceil_cubes - float_cubes) / 2
+    print(f"vh {cube_size} {y_length} {float_cubes} {ceil_cubes} {reminder}")
+
+    y_offset = -float(y_min_o) - cube_size / 2 + (reminder * cube_size)                                          # <<< NEW vh -3 moves up
+
+
+    if abs(y_offset) > 1e-9:                                            # <<< NEW
+        mesh.apply_translation([0.0, y_offset, 0.0])                    # <<< NEW
+        print(                                                         # <<< NEW
+            f"[VOXEL] Shifted mesh along +Y by {y_offset:.6f} so min Y = 0 "  # <<< NEW
+            "(voxelization frame)"                                     # <<< NEW
+        )                                                               # <<< NEW
+
+    # Bounds in voxelization world space (shifted STL)
     bounds = mesh.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]
     x_min_w, y_min_w, z_min_w = bounds[0]
     x_max_w, y_max_w, z_max_w = bounds[1]
 
-    cyl_params: Optional[Tuple[float, float, float]] = None  # (cx, cz, R0)
+    cyl_params: Optional[Tuple[float, ...]] = None  # (cx, cz, R0, v_offset, y_offset)  # <<< CHANGED
 
     r_lowest: Optional[float] = None
     theta_lowest: Optional[float] = None
@@ -195,7 +216,7 @@ def generate_global_cubic_hex_mesh(
 
     verts_world = mesh.vertices.copy()
 
-    # --- Find lowest point (min Z) in world space ---
+    # --- Find lowest point (min Z) in voxelization world space ---
     z_coords = verts_world[:, 2]
     min_z_idx = int(np.argmin(z_coords))
     x_low, y_low, z_low = verts_world[min_z_idx]
@@ -505,7 +526,7 @@ def generate_global_cubic_hex_mesh(
         p6 = (u1, v1, w1)
         p7 = (u0, v1, w1)
 
-        # map to world (curved hexa)
+        # map to world (curved hexa) in voxelization frame (Y >= 0)
         x0, y0, z0 = param_to_world_cyl(p0, cx_cyl, cz_cyl, R0)
         x1, y1, z1 = param_to_world_cyl(p1, cx_cyl, cz_cyl, R0)
         x2, y2, z2 = param_to_world_cyl(p2, cx_cyl, cz_cyl, R0)
@@ -532,12 +553,40 @@ def generate_global_cubic_hex_mesh(
         slice_idx = iz_to_slice[int(iz)]
         slice_to_eids[slice_idx].append(eid)
 
-    cyl_params = (cx_cyl, cz_cyl, R0, v_offset)
+    # Store cylindrical parameters + v_offset + y_offset
+    cyl_params = (cx_cyl, cz_cyl, R0, v_offset, y_offset)  # <<< CHANGED
 
     print(
-        f"[VOXEL] Built mesh: {len(vertices)} nodes, "
+        f"[VOXEL] Built mesh (voxelization frame): {len(vertices)} nodes, "
         f"{len(hexes)} hex elements, {len(z_slices)} radial slices."
     )
+
+    # --- Undo Y-shift for returned data so voxels sit back where STL was ---
+    if abs(y_offset) > 1e-9:                                           # <<< NEW
+        vertices = [                                                   # <<< NEW
+            (x, y - y_offset, z) for (x, y, z) in vertices             # <<< NEW
+        ]                                                              # <<< NEW
+
+        if lowest_point_world is not None:                             # <<< NEW
+            lx, ly, lz = lowest_point_world                            # <<< NEW
+            lowest_point_world = (lx, ly - y_offset, lz)               # <<< NEW
+
+        if axis_point_world is not None:                               # <<< NEW
+            ax, ay, az = axis_point_world                              # <<< NEW
+            axis_point_world = (ax, ay - y_offset, az)                 # <<< NEW
+
+        if edge_left_world is not None:                                # <<< NEW
+            ex, ey, ez = edge_left_world                               # <<< NEW
+            edge_left_world = (ex, ey - y_offset, ez)                  # <<< NEW
+
+        if edge_right_world is not None:                               # <<< NEW
+            rx, ry, rz = edge_right_world                              # <<< NEW
+            edge_right_world = (rx, ry - y_offset, rz)                 # <<< NEW
+
+        print(                                                         # <<< NEW
+            f"[VOXEL] Shifted voxel nodes and marker points back by {-y_offset:.6f} in Y "  # <<< NEW
+            "(original STL frame)"                                     # <<< NEW
+        )                                                              # <<< NEW
 
     return (
         vertices,
@@ -922,7 +971,7 @@ def build_ffd_from_lattice(
     vertices: List[Tuple[float, float, float]],
     cube_size: float,
     displacements: Dict[int, np.ndarray],
-    cyl_params: Optional[Tuple[float, float, float]] = None,
+    cyl_params: Optional[Tuple[float, ...]] = None,   # <<< CHANGED (variadic)
 ):
     """
     Build a PyGeM FFD lattice from voxel nodes, entirely in *input model
@@ -1036,7 +1085,7 @@ def export_lattice_ply_split(
     def_path: str,
     max_points: int = 20000,
     lowest_point: Optional[Tuple[float, float, float]] = None,
-    cyl_params: Optional[Tuple[float, ...]] = None,
+    cyl_params: Optional[Tuple[float, ...]] = None,   # already variadic
     axis_point: Optional[Tuple[float, float, float]] = None,
     edge_left_point: Optional[Tuple[float, float, float]] = None,
     edge_right_point: Optional[Tuple[float, float, float]] = None,
@@ -1379,7 +1428,7 @@ def deform_input_stl_with_frd_pygem(
     cube_size: float,
     output_stl: str,
     lattice_basepath: str = None,
-    cyl_params: Optional[Tuple[float, float, float]] = None,
+    cyl_params: Optional[Tuple[float, ...]] = None,  # <<< CHANGED (variadic)
     lowest_point: Optional[Tuple[float, float, float]] = None,
     axis_point: Optional[Tuple[float, float, float]] = None,
     edge_left_point: Optional[Tuple[float, float, float]] = None,
@@ -1491,21 +1540,21 @@ def export_voxel_debug_stl(
     Uses cylindrical mapping:
       - voxel centers/corners are in param (u,v,w)
       - corners are mapped through param_to_world_cyl().
-
-    If cyl_params has 4 entries, the 4th is assumed to be the
-    tangential v_offset used to rotate the STL before voxelization,
-    and we undo it here.
     """
     if cyl_params is None:
         print("[VOXDBG] cyl_params missing, cannot export curved voxels.")
         return
 
-    # Support both (cx, cz, R0) and (cx, cz, R0, v_offset)
-    if len(cyl_params) >= 4:
-        cx, cz, R0, v_offset = cyl_params
-    else:
-        cx, cz, R0 = cyl_params
-        v_offset = 0.0
+    # Support (cx, cz, R0), (cx, cz, R0, v_offset), or (cx, cz, R0, v_offset, y_offset)
+    if len(cyl_params) >= 5:                                           # <<< NEW
+        cx, cz, R0, v_offset, y_offset = cyl_params                    # <<< NEW
+    elif len(cyl_params) >= 4:                                         # <<< NEW
+        cx, cz, R0, v_offset = cyl_params                              # <<< NEW
+        y_offset = 0.0                                                 # <<< NEW
+    else:                                                              # <<< NEW
+        cx, cz, R0 = cyl_params                                        # <<< NEW
+        v_offset = 0.0                                                 # <<< NEW
+        y_offset = 0.0                                                 # <<< NEW
 
     half = cube_size / 2.0
     vertices = []
@@ -1518,7 +1567,7 @@ def export_voxel_debug_stl(
         )[0]
         u_c, v_c, w_c = center_param
 
-        # --- NEW: undo the half-voxel rotation for debug mesh ---------
+        # Undo the tangential rotation for debug mesh
         v_c -= v_offset
 
         # axis-aligned corners in param coords
@@ -1537,10 +1586,11 @@ def export_voxel_debug_stl(
             (u0, v1, w1),
         ]
 
-        world = [
-            param_to_world_cyl(p, cx, cz, R0)
-            for p in corners
-        ]
+        world = []
+        for p in corners:
+            x, y, z = param_to_world_cyl(p, cx, cz, R0)
+            y = y - y_offset     # <<< NEW: move voxels back to original Y frame
+            world.append((x, y, z))
 
         base = len(vertices)
         vertices.extend(world)
