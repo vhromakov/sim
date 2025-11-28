@@ -213,6 +213,8 @@ def generate_global_cubic_hex_mesh(
     axis_point_world: Optional[Tuple[float, float, float]] = None
     edge_left_world: Optional[Tuple[float, float, float]] = None
     edge_right_world: Optional[Tuple[float, float, float]] = None
+    leftmost_point_world: Optional[Tuple[float, float, float]] = None
+    theta_leftmost: Optional[float] = None
 
     verts_world = mesh.vertices.copy()
 
@@ -221,6 +223,12 @@ def generate_global_cubic_hex_mesh(
     min_z_idx = int(np.argmin(z_coords))
     x_low, y_low, z_low = verts_world[min_z_idx]
     lowest_point_world = (float(x_low), float(y_low), float(z_low))
+
+    # --- Find left-most point (min X) in voxelization world space ---
+    x_coords = verts_world[:, 0]
+    min_x_idx = int(np.argmin(x_coords))
+    x_left, y_left, z_left = verts_world[min_x_idx]
+    leftmost_point_world = (float(x_left), float(y_left), float(z_left))
 
     # Use lowest point X as cylinder center X
     cx_cyl = float(x_low)
@@ -268,6 +276,17 @@ def generate_global_cubic_hex_mesh(
     dx_all = verts_world[:, 0] - cx_cyl
     dz_all = verts_world[:, 2] - cz_cyl
     r_all = np.sqrt(dx_all * dx_all + dz_all * dz_all)
+
+    # Angle of the left-most bbox vertex relative to cylinder axis
+    dx_left = x_left - cx_cyl
+    dz_left = z_left - cz_cyl
+    theta_leftmost = math.atan2(dz_left, dx_left)
+
+    print(
+        f"[VOXEL] Left-most bbox vertex: "
+        f"({x_left:.3f}, {y_left:.3f}, {z_left:.3f}), "
+        f"theta_left={theta_leftmost:.6f} rad"
+    )
 
     # If no explicit radius, we can still pick an average radius as baseline
     if base_radius is None:
@@ -357,7 +376,7 @@ def generate_global_cubic_hex_mesh(
         else:
             inward_offset = R_true - math.sqrt(R_true * R_true - half * half)
 
-        total_offset = cyl_radius_offset + inward_offset + sys.float_info.epsilon
+        total_offset = cyl_radius_offset + inward_offset + 0.1 # vh
         R0_param = R_true + total_offset
 
         print(
@@ -375,17 +394,27 @@ def generate_global_cubic_hex_mesh(
         f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), R0={R0:.6f}"
     )
 
-    # --- Rotation so that lowest point is at angle 0 ------------------
-    # world_to_param_cyl gives v = R0 * theta, so:
-    # v_lowest = R0 * theta_lowest  → we want v_lowest' = 0
-    v_lowest = R0 * theta_lowest
-    v_offset = -v_lowest
-    angle_offset = -theta_lowest
+    theta_cube_size = cube_size / R0
+    theta_length = float(dtheta_all[idx_right] - dtheta_all[idx_left])
+    float_cubes = theta_length / theta_cube_size
+    ceil_cubes = math.ceil(float_cubes)
+    reminder = (ceil_cubes - float_cubes) / 2
+    print(f"vh2 {theta_cube_size} {theta_length} {float_cubes} {ceil_cubes} {reminder} {theta_leftmost}")
+    theta_leftmost = theta_leftmost + theta_cube_size / 2 - (reminder * theta_cube_size)
+
+    # --- Rotation so that left-most bbox point is at angle 0 ----------
+    # world_to_param_cyl gives v = R0 * theta
+    # We want the left-most point (min X of bbox) to have v' = 0.
+    theta_ref = theta_leftmost if theta_leftmost is not None else theta_lowest
+
+    v_ref = R0 * theta_ref
+    v_offset = -v_ref
+    angle_offset = -theta_ref
 
     print(
-        f"[VOXEL] Rotating so lowest point is at angle 0: "
-        f"theta_lowest={theta_lowest:.6f} rad, "
-        f"v_lowest={v_lowest:.6f}, "
+        f"[VOXEL] Rotating so left-most bbox point is at angle 0: "
+        f"theta_ref={theta_ref:.6f} rad, "
+        f"v_ref={v_ref:.6f}, "
         f"v_offset={v_offset:.6f}, "
         f"angle_offset={angle_offset:.6f} rad"
     )
@@ -617,7 +646,7 @@ def write_calculix_job(
     z_slices: List[float],
     shrinkage_curve: List[float] = [5, 4, 3, 2, 1],
     max_cure: float = 1.0,
-    cure_shrink_per_unit: float = 0.3,  # 3%
+    cure_shrink_per_unit: float = 0.03,  # 3%
 ):
     """
     Additive-style uncoupled temperature-displacement job with MODEL CHANGE
@@ -851,9 +880,9 @@ def write_calculix_job(
 
                 f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
                 f.write("*NODE FILE\n")
-                f.write("RF, U, NT, RFL\n")
-                f.write("*EL FILE\n")
-                f.write("S, E, HFL, NOE\n")
+                f.write("U\n")
+                # f.write("*EL FILE\n")
+                # f.write("S, E, HFL, NOE\n")
 
                 f.write("** Boundary conditions (base + shrinkage-curve cure) +++++\n")
                 f.write("*BOUNDARY, OP=MOD\n")
