@@ -27,22 +27,13 @@ Pipeline (cylindrical workflow only):
 
 import argparse
 import os
-import sys
 from typing import List, Tuple, Dict, Set, Optional
 
 import math
 import numpy as np
 import trimesh
 import subprocess
-
-# --- PyGeM import (supports old/new layouts) ---
-try:
-    from pygem.ffd import FFD
-except ImportError:
-    try:
-        from pygem import FFD
-    except ImportError:
-        FFD = None
+from pygem import FFD
 
 
 # ============================================================
@@ -74,10 +65,7 @@ def world_to_param_cyl(
     u = y
     r = math.sqrt(dx * dx + dz * dz)
 
-    if r < 1e-12:
-        theta = 0.0
-    else:
-        theta = math.atan2(dz, dx)
+    theta = math.atan2(dz, dx)
 
     v = R0 * theta
     w = r - R0
@@ -115,24 +103,6 @@ def param_to_world_cyl(
     return (x, y, z)
 
 
-def _unwrap_angle_array(thetas: np.ndarray) -> np.ndarray:
-    """
-    Unwrap a sequence of angles so that they form a continuous curve
-    (no jumps > pi). Used so we can get a clean [theta_min, theta_max]
-    interval for the STL.
-    """
-    if thetas.size == 0:
-        return thetas
-    out = np.zeros_like(thetas)
-    out[0] = thetas[0]
-    for i in range(1, len(thetas)):
-        diff = thetas[i] - thetas[i - 1]
-        # wrap diff into [-pi, pi]
-        diff_wrapped = (diff + math.pi) % (2.0 * math.pi) - math.pi
-        out[i] = out[i - 1] + diff_wrapped
-    return out
-
-
 # ============================================================
 #  Voxel mesh -> CalculiX job (cylindrical only, rewritten
 #  around gen_grid.py voxelization pipeline)
@@ -141,9 +111,7 @@ def _unwrap_angle_array(thetas: np.ndarray) -> np.ndarray:
 def generate_global_cubic_hex_mesh(
     input_stl: str,
     cube_size: float,
-    cyl_center_xz: Optional[Tuple[float, float]] = None,
     cyl_radius: Optional[float] = None,
-    cyl_radius_offset: float = 0.0,  # interpreted as your old "half voxel" extra
 ):
     """
     Voxelize input_stl in cylindrical param space and build a global C3D8R brick mesh
@@ -154,48 +122,30 @@ def generate_global_cubic_hex_mesh(
       and cz is either derived from cyl_radius (lowest point lies on that circle)
       or from bbox center if radius is not given.
     - The effective mapping radius R0 is:
-          R0 = R_true + cyl_radius_offset + inward_offset
+          R0 = R_true + cube_size / 2 + inward_offset
       where:
           R_true = distance from cylinder center to lowest point
-          cyl_radius_offset ≈ 0.5*cube_size (your previous offset)
           inward_offset = sagitta so that midpoint of a 1-voxel chord lies on R0.
     - We rotate the mesh in param space so that the lowest point ends up at angle 0
       (v=0), then undo this rotation when mapping voxels back to world.
     """
 
-    if cube_size <= 0:
-        raise ValueError("cube_size must be positive")
-
     mesh = trimesh.load(input_stl)
-    if not isinstance(mesh, trimesh.Trimesh):
-        if isinstance(mesh, trimesh.Scene):
-            mesh = trimesh.util.concatenate(mesh.dump())
-        else:
-            raise ValueError("Failed to load STL as a valid 3D mesh")
 
     print(f"[VOXEL] Loaded mesh from {input_stl}")
     print(f"[VOXEL] Watertight: {mesh.is_watertight}, bbox extents: {mesh.extents}")
 
-    # --- NEW: shift model in Y so that min Y = 0 for voxelization ---
-    bounds_orig = mesh.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]  # <<< NEW
-    x_min_o, y_min_o, z_min_o = bounds_orig[0]                          # <<< NEW
-    x_max_o, y_max_o, z_max_o = bounds_orig[1]                          # <<< NEW
-
+    # vh: Move mesh on Y axis (goes from us to depth of cylinder) so its in the middle of Y voxels
+    bounds_orig = mesh.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]
+    x_min_o, y_min_o, z_min_o = bounds_orig[0]
+    x_max_o, y_max_o, z_max_o = bounds_orig[1]
     y_length = y_max_o - y_min_o
     float_cubes = y_length / cube_size
     ceil_cubes = math.ceil(float_cubes)
     reminder = (ceil_cubes - float_cubes) / 2
-    print(f"vh {cube_size} {y_length} {float_cubes} {ceil_cubes} {reminder}")
-
-    y_offset = -float(y_min_o) - cube_size / 2 + (reminder * cube_size)                                          # <<< NEW vh -3 moves up
-
-
-    if abs(y_offset) > 1e-9:                                            # <<< NEW
-        mesh.apply_translation([0.0, y_offset, 0.0])                    # <<< NEW
-        print(                                                         # <<< NEW
-            f"[VOXEL] Shifted mesh along +Y by {y_offset:.6f} so min Y = 0 "  # <<< NEW
-            "(voxelization frame)"                                     # <<< NEW
-        )                                                               # <<< NEW
+    y_offset = -float(y_min_o) - cube_size / 2 + (reminder * cube_size)
+    mesh.apply_translation([0.0, y_offset, 0.0])
+    # vh: ---
 
     # Bounds in voxelization world space (shifted STL)
     bounds = mesh.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]
@@ -203,7 +153,6 @@ def generate_global_cubic_hex_mesh(
     x_max_w, y_max_w, z_max_w = bounds[1]
 
     cyl_params: Optional[Tuple[float, ...]] = None  # (cx, cz, R0, v_offset, y_offset)  # <<< CHANGED
-
     r_lowest: Optional[float] = None
     theta_lowest: Optional[float] = None
     cx_cyl: Optional[float] = None
@@ -213,7 +162,6 @@ def generate_global_cubic_hex_mesh(
     axis_point_world: Optional[Tuple[float, float, float]] = None
     edge_left_world: Optional[Tuple[float, float, float]] = None
     edge_right_world: Optional[Tuple[float, float, float]] = None
-    leftmost_point_world: Optional[Tuple[float, float, float]] = None
     theta_leftmost: Optional[float] = None
 
     verts_world = mesh.vertices.copy()
@@ -228,7 +176,6 @@ def generate_global_cubic_hex_mesh(
     x_coords = verts_world[:, 0]
     min_x_idx = int(np.argmin(x_coords))
     x_left, y_left, z_left = verts_world[min_x_idx]
-    leftmost_point_world = (float(x_left), float(y_left), float(z_left))
 
     # Use lowest point X as cylinder center X
     cx_cyl = float(x_low)
@@ -236,41 +183,17 @@ def generate_global_cubic_hex_mesh(
     # Decide CZ (and possibly initial "design" radius) to place the axis
     base_radius: Optional[float] = None  # design radius tied to lowest point
 
-    if cyl_radius is not None and cyl_radius > 0.0:
-        # User-provided radius: we'll place the axis so that the lowest point
-        # lies exactly on this circle.
-        base_radius = float(cyl_radius)
-        z_center_bbox = 0.5 * (z_min_w + z_max_w)
+    # User-provided radius: we'll place the axis so that the lowest point
+    # lies exactly on this circle.
+    base_radius = float(cyl_radius)
+    z_center_bbox = 0.5 * (z_min_w + z_max_w)
+    cz_plus = z_low + base_radius
+    cz_minus = z_low - base_radius
 
-        cz_plus = z_low + base_radius
-        cz_minus = z_low - base_radius
-
-        if abs(cz_plus - z_center_bbox) < abs(cz_minus - z_center_bbox):
-            cz_cyl = cz_plus
-        else:
-            cz_cyl = cz_minus
-
-        print(
-            "[VOXEL] Using user cylinder radius to place axis so lowest point "
-            f"lies on the circle: base_radius={base_radius:.6f}, "
-            f"center=({cx_cyl:.6f}, {cz_cyl:.6f})"
-        )
+    if abs(cz_plus - z_center_bbox) < abs(cz_minus - z_center_bbox):
+        cz_cyl = cz_plus
     else:
-        # No explicit radius: use center from CLI or bbox
-        if cyl_center_xz is not None:
-            cx_cli, cz_cli = cyl_center_xz
-            cx_cyl = float(cx_cli)
-            cz_cyl = float(cz_cli)
-            print(
-                "[VOXEL] No radius given; using explicit cyl-center-xz "
-                f"({cx_cyl:.3f}, {cz_cyl:.3f})"
-            )
-        else:
-            cz_cyl = 0.5 * (z_min_w + z_max_w)
-            print(
-                "[VOXEL] No radius given; using cx from lowest-Z point "
-                f"and cz=bbox center: cx={cx_cyl:.3f}, cz={cz_cyl:.3f}"
-            )
+        cz_cyl = cz_minus
 
     # --- compute radii & angles of all vertices wrt chosen axis ---
     dx_all = verts_world[:, 0] - cx_cyl
@@ -287,13 +210,6 @@ def generate_global_cubic_hex_mesh(
         f"({x_left:.3f}, {y_left:.3f}, {z_left:.3f}), "
         f"theta_left={theta_leftmost:.6f} rad"
     )
-
-    # If no explicit radius, we can still pick an average radius as baseline
-    if base_radius is None:
-        R0_param = float(np.mean(r_all))
-        print(
-            f"[VOXEL] Estimated mapping radius from geometry: R0_param={R0_param:.6f}"
-        )
 
     # Radial/angle of the lowest point (with chosen center)
     dx_low = x_low - cx_cyl
@@ -351,41 +267,16 @@ def generate_global_cubic_hex_mesh(
     # lies on the circle of radius R0.
     # ------------------------------------------------------------
 
-    if base_radius is None:
-        # No explicit radius case: fall back to R0_param we already estimated
-        R_true = r_lowest
-        if R0_param is None:
-            R0_param = float(np.mean(r_all))
-        print(
-            f"[VOXEL] No explicit cylinder radius; using R0_param={R0_param:.6f}, "
-            f"R_true (r_lowest)={R_true:.6f}"
-        )
-    else:
-        # Explicit radius case: treat "radius" as distance center->lowest point
-        R_true = r_lowest  # should equal base_radius numerically
+    # Explicit radius case: treat "radius" as distance center->lowest point
+    R_true = r_lowest  # should equal base_radius numerically
 
-        s = cube_size
-        half = s * 0.5
+    half = cube_size * 0.5
 
-        if R_true <= half:
-            inward_offset = 0.0
-            print(
-                "[VOXEL] WARNING: R_true <= cube_size/2, "
-                "sagitta-based inward offset set to 0."
-            )
-        else:
-            inward_offset = R_true - math.sqrt(R_true * R_true - half * half)
-
-        total_offset = cyl_radius_offset + inward_offset + 0.1 # vh
-        R0_param = R_true + total_offset
-
-        print(
-            f"[VOXEL] Chord midpoint inward offset={inward_offset:.6f} "
-            f"(R_true={R_true:.6f}, cube_size={s:.6f});\n"
-            f"        using cyl_radius_offset={cyl_radius_offset:.6f} "
-            f"→ total radial extension={total_offset:.6f}, "
-            f"effective mapping radius R0_param={R0_param:.6f}"
-        )
+    # vh: Rize model up, because having it on radius will make bottom layer voxels be on the middle of bottom plane
+    inward_offset = R_true - math.sqrt(R_true * R_true - half * half)
+    total_offset = cube_size / 2 + cube_size / 5 # vh: or inward_offset
+    R0_param = R_true + total_offset
+    # vh: ---
 
     # Final cylinder mapping radius
     R0 = float(R0_param)
@@ -394,19 +285,17 @@ def generate_global_cubic_hex_mesh(
         f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), R0={R0:.6f}"
     )
 
+    # vh: Here we rotate the model on X axis to make it be in the middle of voxels on X
     theta_cube_size = cube_size / R0
     theta_length = float(dtheta_all[idx_right] - dtheta_all[idx_left])
     float_cubes = theta_length / theta_cube_size
     ceil_cubes = math.ceil(float_cubes)
     reminder = (ceil_cubes - float_cubes) / 2
     print(f"vh2 {theta_cube_size} {theta_length} {float_cubes} {ceil_cubes} {reminder} {theta_leftmost}")
-    theta_leftmost = theta_leftmost + theta_cube_size / 2 - (reminder * theta_cube_size)
+    theta_leftmost = theta_leftmost #??? + theta_cube_size / 2 - (reminder * theta_cube_size)
+    # vh: ---
 
-    # --- Rotation so that left-most bbox point is at angle 0 ----------
-    # world_to_param_cyl gives v = R0 * theta
-    # We want the left-most point (min X of bbox) to have v' = 0.
-    theta_ref = theta_leftmost if theta_leftmost is not None else theta_lowest
-
+    theta_ref = theta_leftmost
     v_ref = R0 * theta_ref
     v_offset = -v_ref
     angle_offset = -theta_ref
@@ -448,47 +337,8 @@ def generate_global_cubic_hex_mesh(
     vox.fill()
 
     indices = vox.sparse_indices  # (N,3) with (ix,iy,iz) in param grid
-    if indices.size == 0:
-        print("[VOXEL] No voxels found – check cube size or input mesh.")
-        return [], [], {}, [], None, None, None, None, None, None, None
-
     total_voxels = indices.shape[0]
     print(f"[VOXEL] Total filled voxels (cubes): {total_voxels}")
-
-    # --- Angular trimming in param v: keep only bands that intersect STL in v ---
-    half = cube_size / 2.0
-    eps = 1e-9
-
-    unique_iy = np.unique(indices[:, 1])
-
-    # Compute v_center for each angular band using voxel centers
-    centers_param = vox.indices_to_points(
-        np.array([[0, int(iy), 0] for iy in unique_iy], dtype=float)
-    )
-    v_centers = centers_param[:, 1]
-
-    # Map iy -> (v_lo, v_hi)
-    v_interval_by_iy: Dict[int, Tuple[float, float]] = {}
-    for iy_val, v_c in zip(unique_iy, v_centers):
-        v_lo = float(v_c - half)
-        v_hi = float(v_c + half)
-        v_interval_by_iy[int(iy_val)] = (v_lo, v_hi)
-
-    # Build mask: keep cells whose v-interval intersects [v_min_mesh, v_max_mesh]
-    mask = np.zeros(indices.shape[0], dtype=bool)
-    for row_idx, (ix, iy, iz) in enumerate(indices):
-        v_lo, v_hi = v_interval_by_iy[int(iy)]
-        if (v_hi >= v_min_mesh - eps) and (v_lo <= v_max_mesh + eps):
-            mask[row_idx] = True
-
-    indices = indices[mask]
-
-    if indices.size == 0:
-        print("[VOXEL] After angular trimming (param v), no voxels left – aborting.")
-        return [], [], {}, [], None, None, None, None, None, None, None
-
-    total_voxels = indices.shape[0]
-    print(f"[VOXEL] Total voxels after angular trim (param v): {total_voxels}")
 
     # sort by iz, iy, ix (radial, tangential, axial indices)
     order = np.lexsort((indices[:, 0], indices[:, 1], indices[:, 2]))
@@ -591,31 +441,30 @@ def generate_global_cubic_hex_mesh(
     )
 
     # --- Undo Y-shift for returned data so voxels sit back where STL was ---
-    if abs(y_offset) > 1e-9:                                           # <<< NEW
-        vertices = [                                                   # <<< NEW
-            (x, y - y_offset, z) for (x, y, z) in vertices             # <<< NEW
-        ]                                                              # <<< NEW
+    vertices = [
+        (x, y - y_offset, z) for (x, y, z) in vertices
+    ]
 
-        if lowest_point_world is not None:                             # <<< NEW
-            lx, ly, lz = lowest_point_world                            # <<< NEW
-            lowest_point_world = (lx, ly - y_offset, lz)               # <<< NEW
+    if lowest_point_world is not None:
+        lx, ly, lz = lowest_point_world
+        lowest_point_world = (lx, ly - y_offset, lz)
 
-        if axis_point_world is not None:                               # <<< NEW
-            ax, ay, az = axis_point_world                              # <<< NEW
-            axis_point_world = (ax, ay - y_offset, az)                 # <<< NEW
+    if axis_point_world is not None:
+        ax, ay, az = axis_point_world
+        axis_point_world = (ax, ay - y_offset, az)
 
-        if edge_left_world is not None:                                # <<< NEW
-            ex, ey, ez = edge_left_world                               # <<< NEW
-            edge_left_world = (ex, ey - y_offset, ez)                  # <<< NEW
+    if edge_left_world is not None:
+        ex, ey, ez = edge_left_world
+        edge_left_world = (ex, ey - y_offset, ez)
 
-        if edge_right_world is not None:                               # <<< NEW
-            rx, ry, rz = edge_right_world                              # <<< NEW
-            edge_right_world = (rx, ry - y_offset, rz)                 # <<< NEW
+    if edge_right_world is not None:
+        rx, ry, rz = edge_right_world
+        edge_right_world = (rx, ry - y_offset, rz)
 
-        print(                                                         # <<< NEW
-            f"[VOXEL] Shifted voxel nodes and marker points back by {-y_offset:.6f} in Y "  # <<< NEW
-            "(original STL frame)"                                     # <<< NEW
-        )                                                              # <<< NEW
+    print(
+        f"[VOXEL] Shifted voxel nodes and marker points back by {-y_offset:.6f} in Y "
+        "(original STL frame)"
+    )
 
     return (
         vertices,
@@ -632,21 +481,14 @@ def generate_global_cubic_hex_mesh(
     )
 
 
-def _write_id_list_lines(f, ids: List[int], per_line: int = 16):
-    for i in range(0, len(ids), per_line):
-        chunk = ids[i:i + per_line]
-        f.write(", ".join(str(x) for x in chunk) + "\n")
-
-
 def write_calculix_job(
     path: str,
     vertices: List[Tuple[float, float, float]],
     hexes: List[Tuple[int, int, int, int, int, int, int, int]],
     slice_to_eids: Dict[int, List[int]],
     z_slices: List[float],
-    shrinkage_curve: List[float] = [5, 4, 3, 2, 1],
-    max_cure: float = 1.0,
-    cure_shrink_per_unit: float = 0.03,  # 3%
+    shrinkage_curve: List[float],
+    cure_shrink_per_unit: float,
 ):
     """
     Additive-style uncoupled temperature-displacement job with MODEL CHANGE
@@ -658,22 +500,12 @@ def write_calculix_job(
 
     n_nodes = len(vertices)
     n_elems = len(hexes)
-
     n_slices = len(z_slices)
 
     # simple time scheme: 1.0 per step
     time_per_layer = 1.0
     time_per_layer_step = 1.0
-
-    # --- Normalize shrinkage_curve as weights so entries sum to 1.0 ----------
-    if not shrinkage_curve:
-        shrinkage_curve = [1.0]
-
     total_weight = float(sum(shrinkage_curve))
-    if total_weight <= 0.0:
-        shrinkage_curve = [1.0]
-        total_weight = 1.0
-
     shrinkage_curve = [float(w) / total_weight for w in shrinkage_curve]
 
     with open(path, "w", encoding="utf-8") as f:
@@ -710,6 +542,11 @@ def write_calculix_job(
         f.write("** Element + node sets (per slice) +++++++++++++++++++++++++\n")
         slice_names: List[str] = []
         slice_node_ids: Dict[int, List[int]] = {}
+
+        def _write_id_list_lines(f, ids: List[int], per_line: int = 16):
+            for i in range(0, len(ids), per_line):
+                chunk = ids[i:i + per_line]
+                f.write(", ".join(str(x) for x in chunk) + "\n")
 
         for slice_idx in range(n_slices):
             eids = slice_to_eids.get(slice_idx, [])
@@ -837,7 +674,7 @@ def write_calculix_job(
                     increment = shrinkage_curve[k_applied]
                     if increment != 0.0:
                         cure_state[j] = min(
-                            max_cure,
+                            1.0,
                             cure_state[j] + increment,
                         )
                     applied_count[j] = k_applied + 1
@@ -903,7 +740,7 @@ def write_calculix_job(
     print(
         f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, "
         f"slices: {n_slices}, shrinkage_curve={shrinkage_curve}, "
-        f"max_cure={max_cure}, cure_shrink_per_unit={cure_shrink_per_unit}"
+        f"cure_shrink_per_unit={cure_shrink_per_unit}"
     )
 
 
@@ -930,10 +767,10 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
     print(f"[RUN] CalculiX return code: {result.returncode}")
     if result.stdout:
         print("----- CalculiX STDOUT -----")
-        # print(result.stdout)
+        print(result.stdout)
     if result.stderr:
         print("----- CalculiX STDERR -----")
-        # print(result.stderr)
+        print(result.stderr)
     print("[RUN] Done.")
     return result.returncode == 0
 
@@ -1107,7 +944,7 @@ def build_ffd_from_lattice(
 #  Lattice visualization (PLYs)
 # ============================================================
 
-def export_lattice_ply_split(
+def export_lattice_ply_split( 
     vertices: List[Tuple[float, float, float]],
     displacements: Dict[int, np.ndarray],
     orig_path: str,
@@ -1147,18 +984,6 @@ def export_lattice_ply_split(
 
     original_points = verts
     deformed_points = verts + disp_arr
-
-    def maybe_subsample(points: np.ndarray) -> np.ndarray:
-        total = points.shape[0]
-        if total > max_points:
-            step = int(np.ceil(total / max_points))
-            idx = np.arange(0, total, step, dtype=int)
-            return points[idx]
-        return points
-
-    # Subsample lattice itself (if needed)
-    original_points = maybe_subsample(original_points)
-    deformed_points = maybe_subsample(deformed_points)
 
     # ------------------ Vertical marker line through lowest point ------------------
     if lowest_point is not None:
@@ -1570,20 +1395,8 @@ def export_voxel_debug_stl(
       - voxel centers/corners are in param (u,v,w)
       - corners are mapped through param_to_world_cyl().
     """
-    if cyl_params is None:
-        print("[VOXDBG] cyl_params missing, cannot export curved voxels.")
-        return
 
-    # Support (cx, cz, R0), (cx, cz, R0, v_offset), or (cx, cz, R0, v_offset, y_offset)
-    if len(cyl_params) >= 5:                                           # <<< NEW
-        cx, cz, R0, v_offset, y_offset = cyl_params                    # <<< NEW
-    elif len(cyl_params) >= 4:                                         # <<< NEW
-        cx, cz, R0, v_offset = cyl_params                              # <<< NEW
-        y_offset = 0.0                                                 # <<< NEW
-    else:                                                              # <<< NEW
-        cx, cz, R0 = cyl_params                                        # <<< NEW
-        v_offset = 0.0                                                 # <<< NEW
-        y_offset = 0.0                                                 # <<< NEW
+    cx, cz, R0, v_offset, y_offset = cyl_params
 
     half = cube_size / 2.0
     vertices = []
@@ -1618,7 +1431,7 @@ def export_voxel_debug_stl(
         world = []
         for p in corners:
             x, y, z = param_to_world_cyl(p, cx, cz, R0)
-            y = y - y_offset     # <<< NEW: move voxels back to original Y frame
+            y = y - y_offset # move voxels back to original Y frame
             world.append((x, y, z))
 
         base = len(vertices)
@@ -1724,29 +1537,17 @@ def main():
     ) = generate_global_cubic_hex_mesh(
         args.input_stl,
         args.cube_size,
-        cyl_center_xz=None,
         cyl_radius=args.cyl_radius,
-        cyl_radius_offset=args.cube_size / 2,  # NEW
     )
 
     # --- Export voxel debug STL ---
-    voxel_debug_stl = args.job_name + "_voxels.stl"
     export_voxel_debug_stl(
         indices_sorted,
         vox,
         args.cube_size,
         cyl_params,
-        voxel_debug_stl
+        args.job_name + "_voxels.stl"
     )
-
-    if not vertices or not hexes:
-        print("No mesh generated, aborting.")
-        raise SystemExit(1)
-
-    n_slices = len(z_slices)
-    if n_slices == 0:
-        print("No slices generated, aborting.")
-        raise SystemExit(1)
 
     # 2) Single uncoupled thermo-mechanical job
     utd_job = args.job_name + "_utd"
@@ -1758,6 +1559,8 @@ def main():
         hexes,
         slice_to_eids,
         z_slices,
+        shrinkage_curve=[5, 4, 3, 2, 1],
+        cure_shrink_per_unit=0.03,  # 3%
     )
 
     # 3) Optional run + PyGeM FFD deformation + lattice export
