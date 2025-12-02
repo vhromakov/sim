@@ -34,6 +34,12 @@ import numpy as np
 import trimesh
 import subprocess
 from pygem import FFD
+from datetime import datetime
+
+
+def log(msg):
+    now = datetime.now().strftime("%H:%M:%S")
+    print(f"[{now}] {msg}")
 
 
 # ============================================================
@@ -132,8 +138,8 @@ def generate_global_cubic_hex_mesh(
 
     mesh = trimesh.load(input_stl)
 
-    print(f"[VOXEL] Loaded mesh from {input_stl}")
-    print(f"[VOXEL] Watertight: {mesh.is_watertight}, bbox extents: {mesh.extents}")
+    log(f"[VOXEL] Loaded mesh from {input_stl}")
+    log(f"[VOXEL] Watertight: {mesh.is_watertight}, bbox extents: {mesh.extents}")
 
     # vh: Move mesh on Y axis (goes from us to depth of cylinder) so its in the middle of Y voxels
     bounds_orig = mesh.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]
@@ -205,7 +211,7 @@ def generate_global_cubic_hex_mesh(
     dz_left = z_left - cz_cyl
     theta_leftmost = math.atan2(dz_left, dx_left)
 
-    print(
+    log(
         f"[VOXEL] Left-most bbox vertex: "
         f"({x_left:.3f}, {y_left:.3f}, {z_left:.3f}), "
         f"theta_left={theta_leftmost:.6f} rad"
@@ -247,13 +253,13 @@ def generate_global_cubic_hex_mesh(
         float(cz_cyl + r_edge * math.sin(theta_right)),
     )
 
-    print(
+    log(
         "[VOXEL] Angular edges: dtheta_left="
         f"{float(dtheta_all[idx_left]):.6f}, "
         f"dtheta_right={float(dtheta_all[idx_right]):.6f}"
     )
 
-    print(
+    log(
         f"[VOXEL] Cyl center from lowest Z vertex: "
         f"min_z={z_low:.3f}, lowest_pt=({x_low:.3f}, {y_low:.3f}, {z_low:.3f}), "
         f"r_low={r_lowest:.6f}, theta_low={theta_lowest:.6f} rad"
@@ -280,7 +286,7 @@ def generate_global_cubic_hex_mesh(
 
     # Final cylinder mapping radius
     R0 = float(R0_param)
-    print(
+    log(
         f"[VOXEL] Cylindrical voxel mode: axis=+Y, "
         f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), R0={R0:.6f}"
     )
@@ -291,7 +297,7 @@ def generate_global_cubic_hex_mesh(
     float_cubes = theta_length / theta_cube_size
     ceil_cubes = math.ceil(float_cubes)
     reminder = (ceil_cubes - float_cubes) / 2
-    print(f"vh2 {theta_cube_size} {theta_length} {float_cubes} {ceil_cubes} {reminder} {theta_leftmost}")
+    log(f"vh2 {theta_cube_size} {theta_length} {float_cubes} {ceil_cubes} {reminder} {theta_leftmost}")
     theta_leftmost = theta_leftmost #??? + theta_cube_size / 2 - (reminder * theta_cube_size)
     # vh: ---
 
@@ -300,7 +306,7 @@ def generate_global_cubic_hex_mesh(
     v_offset = -v_ref
     angle_offset = -theta_ref
 
-    print(
+    log(
         f"[VOXEL] Rotating so left-most bbox point is at angle 0: "
         f"theta_ref={theta_ref:.6f} rad, "
         f"v_ref={v_ref:.6f}, "
@@ -326,19 +332,19 @@ def generate_global_cubic_hex_mesh(
     # --- Tangential (v) extents of the STL in param space -------------
     v_min_mesh = float(verts_param[:, 1].min())
     v_max_mesh = float(verts_param[:, 1].max())
-    print(
+    log(
         f"[VOXEL] Param v extents of STL: v_min={v_min_mesh:.6f}, "
         f"v_max={v_max_mesh:.6f}"
     )
 
     # --- Voxelization in param coordinates ---
-    print(f"[VOXEL] Voxelizing with cube size = {cube_size} ...")
+    log(f"[VOXEL] Voxelizing with cube size = {cube_size} ...")
     vox = mesh.voxelized(pitch=cube_size)
     vox.fill()
 
     indices = vox.sparse_indices  # (N,3) with (ix,iy,iz) in param grid
     total_voxels = indices.shape[0]
-    print(f"[VOXEL] Total filled voxels (cubes): {total_voxels}")
+    log(f"[VOXEL] Total filled voxels (cubes): {total_voxels}")
 
     # sort by iz, iy, ix (radial, tangential, axial indices)
     order = np.lexsort((indices[:, 0], indices[:, 1], indices[:, 2]))
@@ -380,7 +386,7 @@ def generate_global_cubic_hex_mesh(
         return idx
 
     # --- Build voxel-node lattice & hex connectivity (curved hexa nodes) ---
-    print("[VOXEL] Building voxel-node lattice (curved hexa nodes) ...")
+    log("[VOXEL] Building voxel-node lattice (curved hexa nodes) ...")
 
     for (ix, iy, iz) in indices_sorted:
         center_param = vox.indices_to_points(
@@ -435,7 +441,7 @@ def generate_global_cubic_hex_mesh(
     # Store cylindrical parameters + v_offset + y_offset
     cyl_params = (cx_cyl, cz_cyl, R0, v_offset, y_offset)  # <<< CHANGED
 
-    print(
+    log(
         f"[VOXEL] Built mesh (voxelization frame): {len(vertices)} nodes, "
         f"{len(hexes)} hex elements, {len(z_slices)} radial slices."
     )
@@ -461,7 +467,7 @@ def generate_global_cubic_hex_mesh(
         rx, ry, rz = edge_right_world
         edge_right_world = (rx, ry - y_offset, rz)
 
-    print(
+    log(
         f"[VOXEL] Shifted voxel nodes and marker points back by {-y_offset:.6f} in Y "
         "(original STL frame)"
     )
@@ -554,7 +560,7 @@ def write_calculix_job(
                 continue
             valid_eids = [eid for eid in eids if 1 <= eid <= n_elems]
             if not valid_eids:
-                print(
+                log(
                     f"[WARN] Slice {slice_idx} has no valid element "
                     f"IDs within 1..{n_elems}"
                 )
@@ -736,8 +742,8 @@ def write_calculix_job(
                 f.write("*END STEP\n")
                 step_counter += 1
 
-    print(f"[CCX] Wrote incremental-cure UT-D job to: {path}")
-    print(
+    log(f"[CCX] Wrote incremental-cure UT-D job to: {path}")
+    log(
         f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, "
         f"slices: {n_slices}, shrinkage_curve={shrinkage_curve}, "
         f"cure_shrink_per_unit={cure_shrink_per_unit}"
@@ -749,7 +755,7 @@ def write_calculix_job(
 # ============================================================
 
 def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
-    print(f"[RUN] Launching CalculiX: {ccx_cmd} {job_name}")
+    log(f"[RUN] Launching CalculiX: {ccx_cmd} {job_name}")
     try:
         my_env = os.environ.copy()
         my_env["OMP_NUM_THREADS"] = "12"
@@ -761,17 +767,17 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
             env=my_env
         )
     except FileNotFoundError:
-        print(f"[RUN] ERROR: CalculiX command not found: {ccx_cmd}")
+        log(f"[RUN] ERROR: CalculiX command not found: {ccx_cmd}")
         return False
 
-    print(f"[RUN] CalculiX return code: {result.returncode}")
+    log(f"[RUN] CalculiX return code: {result.returncode}")
     if result.stdout:
-        print("----- CalculiX STDOUT -----")
-        print(result.stdout)
+        log("----- CalculiX STDOUT -----")
+        log(result.stdout)
     if result.stderr:
-        print("----- CalculiX STDERR -----")
-        print(result.stderr)
-    print("[RUN] Done.")
+        log("----- CalculiX STDERR -----")
+        log(result.stderr)
+    log("[RUN] Done.")
     return result.returncode == 0
 
 
@@ -781,13 +787,13 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
 
 def read_frd_displacements(frd_path: str) -> Dict[int, np.ndarray]:
     if not os.path.isfile(frd_path):
-        print(f"[FRD] File not found: {frd_path}")
+        log(f"[FRD] File not found: {frd_path}")
         return {}
 
     disp: Dict[int, np.ndarray] = {}
     in_disp = False
 
-    print(f"[FRD] Parsing displacements from: {frd_path}")
+    log(f"[FRD] Parsing displacements from: {frd_path}")
 
     with open(frd_path, "r", encoding="utf-8", errors="ignore") as f:
         for raw_line in f:
@@ -824,7 +830,7 @@ def read_frd_displacements(frd_path: str) -> Dict[int, np.ndarray]:
                 except ValueError:
                     continue
 
-    print(f"[FRD] Parsed displacement data for {len(disp)} nodes.")
+    log(f"[FRD] Parsed displacement data for {len(disp)} nodes.")
     return disp
 
 
@@ -881,13 +887,13 @@ def build_ffd_from_lattice(
     ny = compute_nodes(Ly)
     nz = compute_nodes(Lz)
 
-    print(
+    log(
         "[FFD] World-space extents (voxel nodes):\n"
         f"      x=[{x_min:.6f}, {x_max:.6f}] (Lx={Lx:.6f})\n"
         f"      y=[{y_min:.6f}, {y_max:.6f}] (Ly={Ly:.6f})\n"
         f"      z=[{z_min:.6f}, {z_max:.6f}] (Lz={Lz:.6f})"
     )
-    print(f"[FFD] FFD resolution (nodes): ({nx}, {ny}, {nz})")
+    log(f"[FFD] FFD resolution (nodes): ({nx}, {ny}, {nz})")
 
     # ------------------------------------------------------------
     # Construct FFD object in world coordinates
@@ -968,7 +974,7 @@ def export_lattice_ply_split(
       - radial line from axis to right angular edge.
     """
     if not vertices:
-        print("[PLY] No vertices, skipping lattice export.")
+        log("[PLY] No vertices, skipping lattice export.")
         return
 
     if not orig_path and not def_path:
@@ -1001,7 +1007,7 @@ def export_lattice_ply_split(
         original_points = np.vstack([original_points, marker_vert])
         deformed_points = np.vstack([deformed_points, marker_vert])
 
-        print(
+        log(
             f"[PLY] Added vertical marker line through lowest point "
             f"({x0:.6f}, {y0:.6f}, {z0:.6f}) with {marker_segments_vertical} points."
         )
@@ -1026,7 +1032,7 @@ def export_lattice_ply_split(
         original_points = np.vstack([original_points, marker_radial])
         deformed_points = np.vstack([deformed_points, marker_radial])
 
-        print(
+        log(
             f"[PLY] Added radial marker line axis->lowest "
             f"({cx:.6f}, {y0:.6f}, {cz:.6f}) -> ({x0:.6f}, {y0:.6f}, {z0:.6f})."
         )
@@ -1044,7 +1050,7 @@ def export_lattice_ply_split(
         original_points = np.vstack([original_points, marker_left])
         deformed_points = np.vstack([deformed_points, marker_left])
 
-        print(
+        log(
             "[PLY] Added LEFT edge radial line "
             f"axis({ax:.6f},{ay:.6f},{az:.6f}) -> "
             f"edge_left({lx:.6f},{ly:.6f},{lz:.6f})."
@@ -1062,7 +1068,7 @@ def export_lattice_ply_split(
         original_points = np.vstack([original_points, marker_right])
         deformed_points = np.vstack([deformed_points, marker_right])
 
-        print(
+        log(
             "[PLY] Added RIGHT edge radial line "
             f"axis({ax:.6f},{ay:.6f},{az:.6f}) -> "
             f"edge_right({rx:.6f},{ry:.6f},{rz:.6f})."
@@ -1080,7 +1086,7 @@ def export_lattice_ply_split(
             f.write("end_header\n")
             for x, y, z in original_points:
                 f.write(f"{x} {y} {z}\n")
-        print(f"[PLY] Original lattice written to: {orig_path}")
+        log(f"[PLY] Original lattice written to: {orig_path}")
 
     if def_path:
         with open(def_path, "w", encoding="utf-8") as f:
@@ -1093,7 +1099,7 @@ def export_lattice_ply_split(
             f.write("end_header\n")
             for x, y, z in deformed_points:
                 f.write(f"{x} {y} {z}\n")
-        print(f"[PLY] Deformed lattice written to: {def_path}")
+        log(f"[PLY] Deformed lattice written to: {def_path}")
 
 
 def export_ffd_control_points(ffd, basepath: str):
@@ -1109,7 +1115,7 @@ def export_ffd_control_points(ffd, basepath: str):
     """
     # Need these attributes from PyGeM's FFD
     if not hasattr(ffd, "array_mu_x") or not hasattr(ffd, "box_origin") or not hasattr(ffd, "box_length"):
-        print("[PLY] FFD control-point export not supported by this PyGeM FFD object.")
+        log("[PLY] FFD control-point export not supported by this PyGeM FFD object.")
         return
 
     mu_x = np.asarray(ffd.array_mu_x, dtype=float)
@@ -1122,7 +1128,7 @@ def export_ffd_control_points(ffd, basepath: str):
     length = np.asarray(ffd.box_length, dtype=float).reshape(3)
     Lx, Ly, Lz = length
 
-    print(
+    log(
         "[PLY] Exporting FFD control arrows in FFD box coords "
         f"(origin={origin}, length={length}, "
         f"shape=({nx},{ny},{nz}))"
@@ -1160,7 +1166,7 @@ def export_ffd_control_points(ffd, basepath: str):
 
     n = pts_orig.shape[0]
     if n != pts_def.shape[0]:
-        print("[PLY] ERROR: mismatch between original and deformed control point counts.")
+        log("[PLY] ERROR: mismatch between original and deformed control point counts.")
         return
 
     # Combine vertices: first all originals, then all deformed
@@ -1191,7 +1197,7 @@ def export_ffd_control_points(ffd, basepath: str):
         for v1, v2 in edges:
             f.write(f"{v1} {v2}\n")
 
-    print(f"[PLY] FFD control arrows written to: {out_path}")
+    log(f"[PLY] FFD control arrows written to: {out_path}")
 
 
 def export_deformed_voxels_stl(
@@ -1210,7 +1216,7 @@ def export_deformed_voxels_stl(
     hex nodes by their nodal displacements.
     """
     if not vertices or not hexes:
-        print("[VOXDBG] No vertices/hexes, skipping deformed voxel export.")
+        log("[VOXDBG] No vertices/hexes, skipping deformed voxel export.")
         return
 
     verts_orig = np.array(vertices, dtype=float)
@@ -1254,7 +1260,7 @@ def export_deformed_voxels_stl(
             all_tri_faces.append((base_idx + a, base_idx + b, base_idx + c))
 
     if not all_tri_vertices:
-        print("[VOXDBG] No triangles produced for deformed voxels.")
+        log("[VOXDBG] No triangles produced for deformed voxels.")
         return
 
     vertices_np = np.array(all_tri_vertices, dtype=float)
@@ -1262,7 +1268,7 @@ def export_deformed_voxels_stl(
 
     mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces_np, process=False)
     mesh.export(out_path)
-    print(f"[VOXDBG] Deformed voxel STL written: {out_path}")
+    log(f"[VOXDBG] Deformed voxel STL written: {out_path}")
 
 # ============================================================
 #  STL deformation with PyGeM (forward + pre-deformed)
@@ -1292,16 +1298,16 @@ def deform_input_stl_with_frd_pygem(
 ):
 
     if FFD is None:
-        print("[FFD] PyGeM FFD not available; skipping STL deformation.")
+        log("[FFD] PyGeM FFD not available; skipping STL deformation.")
         return
 
     displacements = read_frd_displacements(mech_frd_path)
     if not displacements:
-        print("[FFD] No displacements found, skipping STL deformation.")
+        log("[FFD] No displacements found, skipping STL deformation.")
         return
 
-    print(f"[FFD] Displacements available for {len(displacements)} nodes "
-          f"out of {len(vertices)} total.")
+    log(f"[FFD] Displacements available for {len(displacements)} nodes "
+        f"out of {len(vertices)} total.")
     
     # Deformed voxel STL export (if requested)
     if hexes is not None and deformed_voxels_path:
@@ -1345,19 +1351,19 @@ def deform_input_stl_with_frd_pygem(
         if isinstance(mesh, trimesh.Scene):
             mesh = trimesh.util.concatenate(mesh.dump())
         else:
-            print("[FFD] Could not load input STL mesh, aborting deformation.")
+            log("[FFD] Could not load input STL mesh, aborting deformation.")
             return
 
     orig_verts = mesh.vertices.copy()
     n_verts = orig_verts.shape[0]
-    print(f"[FFD] Deforming input STL with {n_verts} vertices using PyGeM FFD...")
+    log(f"[FFD] Deforming input STL with {n_verts} vertices using PyGeM FFD...")
 
     deformed_verts = ffd_apply_points(ffd, orig_verts)
     mesh.vertices = deformed_verts
     mesh.export(output_stl)
-    print(f"[FFD] Deformed STL (PyGeM) written to: {output_stl}")
+    log(f"[FFD] Deformed STL (PyGeM) written to: {output_stl}")
 
-    print("[FFD] Computing pre-deformed STL by reversing FFD control displacements...")
+    log("[FFD] Computing pre-deformed STL by reversing FFD control displacements...")
 
     mesh.vertices = orig_verts
 
@@ -1367,17 +1373,17 @@ def deform_input_stl_with_frd_pygem(
             ffd.array_mu_y *= -1.0
             ffd.array_mu_z *= -1.0
         else:
-            print("[FFD] WARNING: FFD inversion via weight flipping not supported by this PyGeM API.")
+            log("[FFD] WARNING: FFD inversion via weight flipping not supported by this PyGeM API.")
             return
     except Exception as e:
-        print(f"[FFD] Error while flipping FFD control weights for pre-deformation: {e}")
+        log(f"[FFD] Error while flipping FFD control weights for pre-deformation: {e}")
         return
 
     predeformed_verts = ffd_apply_points(ffd, orig_verts)
     predeformed_path = os.path.splitext(output_stl)[0] + "_pre.stl"
     mesh.vertices = predeformed_verts
     mesh.export(predeformed_path)
-    print(f"[FFD] Pre-deformed STL written to: {predeformed_path}")
+    log(f"[FFD] Pre-deformed STL written to: {predeformed_path}")
 
 
 def export_voxel_debug_stl(
@@ -1454,7 +1460,7 @@ def export_voxel_debug_stl(
     faces_np = np.array(faces, dtype=np.int32)
     mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces_np, process=False)
     mesh.export(out_path)
-    print(f"[VOXDBG] Voxel debug STL written: {out_path}")
+    log(f"[VOXDBG] Voxel debug STL written: {out_path}")
 
 
 # ============================================================
@@ -1473,11 +1479,10 @@ def main():
     )
     parser.add_argument("input_stl", help="Path to input STL file")
     parser.add_argument(
-        "job_name",
-        help=(
-            "Base job name (UTD .inp will be '<job_name>_utd.inp'; CalculiX will "
-            "produce '<job_name>_utd.frd')."
-        ),
+        "--out-dir",
+        "-o",
+        default=".",
+        help="Directory for all output files (default: current directory).",
     )
     parser.add_argument(
         "--cube-size",
@@ -1501,8 +1506,9 @@ def main():
         "--export-lattice",
         action="store_true",
         help=(
-            "Export FFD lattice as '<job_name>_lattice_orig.ply' and "
-            "'<job_name>_lattice_def.ply' point clouds."
+            "Export FFD lattice as '<base_name>_lattice_orig.ply' and "
+            "'<base_name>_lattice_def.ply' point clouds, where <base_name> is "
+            "derived from the input STL filename."
         ),
     )
     # Cylindrical options
@@ -1518,8 +1524,14 @@ def main():
     args = parser.parse_args()
 
     if not os.path.isfile(args.input_stl):
-        print(f"Input STL not found: {args.input_stl}")
+        log(f"Input STL not found: {args.input_stl}")
         raise SystemExit(1)
+
+    out_dir = os.path.abspath(args.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    job_base = os.path.splitext(os.path.basename(args.input_stl))[0]
+    basepath = os.path.join(out_dir, job_base)
 
     # 1) Mesh (cylindrical curved voxels only)
     (
@@ -1546,11 +1558,11 @@ def main():
         vox,
         args.cube_size,
         cyl_params,
-        args.job_name + "_voxels.stl"
+        basepath + "_voxels.stl"
     )
 
     # 2) Single uncoupled thermo-mechanical job
-    utd_job = args.job_name + "_utd"
+    utd_job = basepath + "_utd"
     utd_inp = utd_job + ".inp"
 
     write_calculix_job(
@@ -1567,14 +1579,14 @@ def main():
     if args.run_ccx:
         ok = run_calculix(utd_job, ccx_cmd=args.ccx_cmd)
         if not ok:
-            print("[RUN] UTD job failed, skipping FFD.")
+            log("[RUN] UTD job failed, skipping FFD.")
             return
 
         utd_frd = utd_job + ".frd"
         if os.path.isfile(utd_frd):
-            deformed_stl = args.job_name + "_deformed.stl"
-            lattice_basepath = args.job_name + "_lattice" if args.export_lattice else None
-            deformed_voxels_stl = args.job_name + "_voxels_def.stl"
+            deformed_stl = basepath + "_deformed.stl"
+            lattice_basepath = basepath + "_lattice" if args.export_lattice else None
+            deformed_voxels_stl = basepath + "_voxels_def.stl"
 
             deform_input_stl_with_frd_pygem(
                 args.input_stl,
@@ -1592,9 +1604,8 @@ def main():
                 deformed_voxels_path=deformed_voxels_stl,
             )
 
-
         else:
-            print(f"[FFD] Thermo-mechanical FRD '{utd_frd}' not found, skipping STL deformation.")
+            log(f"[FFD] Thermo-mechanical FRD '{utd_frd}' not found, skipping STL deformation.")
 
 
 if __name__ == "__main__":
