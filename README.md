@@ -7,7 +7,8 @@ https://github.com/calculix/CalculiX-Windows/blob/master/releases/CalculiX-2.23.
 cmd
 conda activate py313
 python stl_voxel_to_ccx_job.py MODELS/CSC16_U00P_.stl --out-dir OUTPUT --cube-size 5 --run-ccx --ccx-cmd "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe" --cyl-radius 199.82 --export-lattice
-python gen_grid.py MODELS/fugo_para_long.stl cube_job --cube-size 5 --cyl-radius 199.82
+python gen_grid.py MODELS/fugo_para_long.stl cube_job --cube-size 5 --cyl-radius 199.82 --output-stride 5
+python apply_ffd.py MODELS/CSC16_U00P_.stl OUTPUT/CSC16_U00P__lattice_ffd.json FFD.stl
 
 # Convert to paraview
 python -m ccx2paraview donut_job.frd vtu

@@ -1312,6 +1312,29 @@ def ffd_apply_points(ffd, pts: np.ndarray) -> np.ndarray:
     except TypeError:
         return ffd.deform(pts)
 
+def save_ffd_lattice(ffd, path):
+    import json
+
+    mu_x = ffd.array_mu_x.tolist()
+    mu_y = ffd.array_mu_y.tolist()
+    mu_z = ffd.array_mu_z.tolist()
+
+    data = {
+        "nx": ffd.array_mu_x.shape[0],
+        "ny": ffd.array_mu_x.shape[1],
+        "nz": ffd.array_mu_x.shape[2],
+        "box_origin": ffd.box_origin.tolist(),
+        "box_length": ffd.box_length.tolist(),
+        "mu_x": mu_x,
+        "mu_y": mu_y,
+        "mu_z": mu_z
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    log(f"[FFD] Saved FFD lattice to: {path}")
+
 
 def deform_input_stl_with_frd_pygem(
     input_stl: str,
@@ -1376,6 +1399,7 @@ def deform_input_stl_with_frd_pygem(
 
     # Export FFD control points (now cylindrical-shaped when cyl_params != None)
     if lattice_basepath:
+        save_ffd_lattice(ffd, lattice_basepath + "_ffd.json")
         export_ffd_control_points(ffd, lattice_basepath)
 
     mesh = trimesh.load(input_stl)
