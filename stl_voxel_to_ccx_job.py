@@ -495,6 +495,7 @@ def write_calculix_job(
     z_slices: List[float],
     shrinkage_curve: List[float],
     cure_shrink_per_unit: float,
+    output_stride: int = 1,
 ):
     """
     Additive-style uncoupled temperature-displacement job with MODEL CHANGE
@@ -513,6 +514,10 @@ def write_calculix_job(
     time_per_layer_step = 1.0
     total_weight = float(sum(shrinkage_curve))
     shrinkage_curve = [float(w) / total_weight for w in shrinkage_curve]
+
+    # ensure sane stride
+    if output_stride < 1:
+        output_stride = 1
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("**\n** Auto-generated incremental-cure shrink job\n**\n")
@@ -611,18 +616,18 @@ def write_calculix_job(
         f.write("** Materials +++++++++++++++++++++++++++++++++++++++++++++++\n")
         f.write("*MATERIAL, NAME=ABS\n")
         f.write("*DENSITY\n")
-        f.write("1.02E-09\n")
+        f.write("1.12e-9\n")
         f.write("*ELASTIC\n")
-        f.write("2000., 0.394\n")
+        f.write("2800., 0.35\n")
 
         alpha = -float(cure_shrink_per_unit)  # higher T -> shrink
         f.write("*EXPANSION, ZERO=0.\n")
         f.write(f"{alpha:.6E}\n")
 
         f.write("*CONDUCTIVITY\n")
-        f.write("0.2256\n")
+        f.write("0.20\n")
         f.write("*SPECIFIC HEAT\n")
-        f.write("1386000000.\n")
+        f.write("1.30e+9\n")
         f.write("*SOLID SECTION, ELSET=ALL, MATERIAL=ABS\n")
 
         # -------------------- INITIAL "TEMPERATURE" (CURE) -------------------
@@ -654,7 +659,7 @@ def write_calculix_job(
 
             if base_nodes:
                 f.write("** Boundary conditions (mechanical) +++++++++++++++++++++++\n")
-                f.write("*BOUNDARY, OP=NEW\n")
+                f.write("*BOUNDARY\n")
                 f.write("BASE, 1, 6, 0.\n")
 
             f.write("*END STEP\n")
@@ -670,6 +675,9 @@ def write_calculix_job(
 
                 if slice_to_add is not None:
                     printed[slice_to_add] = True
+
+                # remember cure state before this step
+                prev_cure_state = cure_state.copy()
 
                 for j in existing_slice_idxs:
                     if not printed[j]:
@@ -721,20 +729,40 @@ def write_calculix_job(
                         f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
                         f.write(f"{name}\n")
 
-                f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
-                f.write("*NODE FILE\n")
-                f.write("U\n")
-                # f.write("*EL FILE\n")
-                # f.write("S, E, HFL, NOE\n")
+                # Decide whether to request field outputs for this curing step:
+                # - every Nth step according to output_stride
+                # - always for the very last curing step
+                write_outputs = (
+                    output_stride <= 1
+                    or (global_k + 1) % output_stride == 0
+                    or global_k == total_cure_steps - 1
+                )
+
+                if write_outputs:
+                    f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
+                    f.write("*NODE FILE\n")
+                    f.write("U\n")
+                    # f.write("*EL FILE\n")
+                    # f.write("S, E, HFL, NOE\n")
+                else:
+                    f.write(
+                        "** Field outputs disabled for this step "
+                        f"(output_stride = {output_stride})\n"
+                    )
+                    # This wipes previous node-file selections so no results are written
+                    f.write("*NODE FILE\n")
 
                 f.write("** Boundary conditions (base + shrinkage-curve cure) +++++\n")
-                f.write("*BOUNDARY, OP=MOD\n")
+                f.write("*BOUNDARY\n")
 
                 for j in existing_slice_idxs:
                     if not printed[j]:
                         continue
                     cure_val = cure_state[j]
                     if cure_val == 0.0:
+                        continue
+                    # skip slices whose cure value did not change in this step
+                    if cure_val == prev_cure_state.get(j, 0.0):
                         continue
                     nset_j = f"SLICE_{j:03d}_NODES"
                     f.write(f"{nset_j}, 11, 11, {cure_val:.6f}\n")
@@ -1507,6 +1535,15 @@ def main():
              "'ccx', 'ccx_static', 'C:\\path\\to\\ccx.exe'",
     )
     parser.add_argument(
+        "--output-stride",
+        type=int,
+        default=1,
+        help=(
+            "Request nodal outputs only every Nth curing step (>=1). "
+            "The very last curing step always produces output."
+        ),
+    )
+    parser.add_argument(
         "--export-lattice",
         action="store_true",
         help=(
@@ -1577,6 +1614,7 @@ def main():
         z_slices,
         shrinkage_curve=[5, 4, 3, 2, 1],
         cure_shrink_per_unit=0.03,  # 3%
+        output_stride=args.output_stride,
     )
 
     # 3) Optional run + PyGeM FFD deformation + lattice export
