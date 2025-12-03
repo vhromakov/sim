@@ -649,7 +649,7 @@ def write_calculix_job(
             f.write("** Step 1: initial dummy step with full model (no curing)\n")
             f.write("** --------------------------------------------------------\n")
             f.write("*STEP\n")
-            f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT\n")
+            f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT, SOLVER=PASTIX\n")
             f.write(f"{time_per_layer_step:.6f}, {time_per_layer:.6f}\n")
 
             if base_nodes:
@@ -700,7 +700,7 @@ def write_calculix_job(
                     )
                 f.write("** --------------------------------------------------------\n")
                 f.write("*STEP\n")
-                f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT\n")
+                f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT, SOLVER=PASTIX\n")
                 f.write(f"{time_per_layer_step:.6f}, {time_per_layer:.6f}\n")
 
                 if slice_to_add is not None:
@@ -756,29 +756,33 @@ def write_calculix_job(
 
 def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
     log(f"[RUN] Launching CalculiX: {ccx_cmd} {job_name}")
+
+    log_path = f"{job_name}_ccx_output.txt"
     try:
         my_env = os.environ.copy()
-        my_env["OMP_NUM_THREADS"] = "12"
-        result = subprocess.run(
-            [ccx_cmd, job_name],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=my_env
-        )
+        # my_env["PASTIX_GPU"] = "1"
+        my_env["OMP_NUM_THREADS"] = "6"
+        my_env["OMP_DYNAMIC"] = "FALSE"
+        my_env["ЬЛД_NUM_THREADS"] = "6"
+        my_env["ЬЛД_DYNAMIC"] = "FALSE"
+
+        with open(log_path, "w", encoding="utf-8") as logfile:
+            proc = subprocess.Popen(
+                [ccx_cmd, job_name],
+                stdout=logfile,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=my_env
+            )
     except FileNotFoundError:
         log(f"[RUN] ERROR: CalculiX command not found: {ccx_cmd}")
         return False
 
-    log(f"[RUN] CalculiX return code: {result.returncode}")
-    if result.stdout:
-        log("----- CalculiX STDOUT -----")
-        log(result.stdout)
-    if result.stderr:
-        log("----- CalculiX STDERR -----")
-        log(result.stderr)
-    log("[RUN] Done.")
-    return result.returncode == 0
+    rc = proc.wait()
+    log(f"[RUN] CalculiX completed with return code {rc}")
+    log(f"[RUN] Full output written to: {log_path}")
+
+    return rc == 0
 
 
 # ============================================================
