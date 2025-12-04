@@ -36,6 +36,10 @@ import subprocess
 from pygem import FFD
 from datetime import datetime
 
+import os
+import json
+import numpy as np
+
 
 def log(msg):
     now = datetime.now().strftime("%H:%M:%S")
@@ -117,7 +121,7 @@ def param_to_world_cyl(
 def generate_global_cubic_hex_mesh(
     input_stl: str,
     cube_size: float,
-    cyl_radius: Optional[float] = None,
+    cyl_radius: float,
 ):
     """
     Voxelize input_stl in cylindrical param space and build a global C3D8R brick mesh
@@ -158,7 +162,7 @@ def generate_global_cubic_hex_mesh(
     x_min_w, y_min_w, z_min_w = bounds[0]
     x_max_w, y_max_w, z_max_w = bounds[1]
 
-    cyl_params: Optional[Tuple[float, ...]] = None  # (cx, cz, R0, v_offset, y_offset)  # <<< CHANGED
+    cyl_params: Optional[Tuple[float, ...]] = None  # (cx, cz, R0, v_offset, y_offset)
     r_lowest: Optional[float] = None
     theta_lowest: Optional[float] = None
     cx_cyl: Optional[float] = None
@@ -266,21 +270,15 @@ def generate_global_cubic_hex_mesh(
     )
 
     # ------------------------------------------------------------
-    # Compute effective mapping radius R0:
-    #   R_true = r_lowest (distance center -> lowest point)
-    #   R0 = R_true + cyl_radius_offset + inward_offset
-    # where inward_offset is sagitta so that the midpoint of a 1-voxel chord
-    # lies on the circle of radius R0.
+    # Compute effective mapping radius R0
     # ------------------------------------------------------------
-
-    # Explicit radius case: treat "radius" as distance center->lowest point
     R_true = r_lowest  # should equal base_radius numerically
 
     half = cube_size * 0.5
 
     # vh: Rize model up, because having it on radius will make bottom layer voxels be on the middle of bottom plane
     inward_offset = R_true - math.sqrt(R_true * R_true - half * half)
-    total_offset = cube_size / 2 + cube_size / 5 # vh: or inward_offset
+    total_offset = cube_size / 2 + cube_size / 5  # vh: or inward_offset
     R0_param = R_true + total_offset
     # vh: ---
 
@@ -298,7 +296,7 @@ def generate_global_cubic_hex_mesh(
     ceil_cubes = math.ceil(float_cubes)
     reminder = (ceil_cubes - float_cubes) / 2
     log(f"vh2 {theta_cube_size} {theta_length} {float_cubes} {ceil_cubes} {reminder} {theta_leftmost}")
-    theta_leftmost = theta_leftmost #??? + theta_cube_size / 2 - (reminder * theta_cube_size)
+    theta_leftmost = theta_leftmost  # ??? + theta_cube_size / 2 - (reminder * theta_cube_size)
     # vh: ---
 
     theta_ref = theta_leftmost
@@ -329,6 +327,41 @@ def generate_global_cubic_hex_mesh(
 
     mesh.vertices = verts_param
 
+    # ----------------------------------------------------------
+    # Create bounding-box mesh of the transformed STL in param space
+    # ----------------------------------------------------------
+    bounds_param = mesh.bounds  # [[xmin, ymin, zmin], [xmax, ymax, zmax]]
+    min_x, min_y, min_w = bounds_param[0]
+    max_x, max_y, max_w = bounds_param[1]
+
+    bbox_corners = np.array([
+        [min_x, min_y, min_w],
+        [max_x, min_y, min_w],
+        [max_x, max_y, min_w],
+        [min_x, max_y, min_w],
+        [min_x, min_y, max_w],
+        [max_x, min_y, max_w],
+        [max_x, max_y, max_w],
+        [min_x, max_y, max_w],
+    ])
+
+    bbox_faces = np.array([
+        [0, 1, 2], [0, 2, 3],  # bottom
+        [4, 5, 6], [4, 6, 7],  # top
+        [0, 1, 5], [0, 5, 4],  # side
+        [1, 2, 6], [1, 6, 5],  # side
+        [2, 3, 7], [2, 7, 6],  # side
+        [3, 0, 4], [3, 4, 7],  # side
+    ])
+
+    bbox_mesh_param = trimesh.Trimesh(
+        vertices=bbox_corners,
+        faces=bbox_faces,
+        process=False
+    )
+
+    log(f"[VOXEL] Created param-space bounding box mesh: {bbox_mesh_param.bounds}")
+
     # --- Tangential (v) extents of the STL in param space -------------
     v_min_mesh = float(verts_param[:, 1].min())
     v_max_mesh = float(verts_param[:, 1].max())
@@ -337,20 +370,30 @@ def generate_global_cubic_hex_mesh(
         f"v_max={v_max_mesh:.6f}"
     )
 
-    # --- Voxelization in param coordinates ---
-    log(f"[VOXEL] Voxelizing with cube size = {cube_size} ...")
+    # --- Voxelization in param coordinates (STL) ---
+    log(f"[VOXEL] Voxelizing STL with cube size = {cube_size} ...")
     vox = mesh.voxelized(pitch=cube_size)
     vox.fill()
 
     indices = vox.sparse_indices  # (N,3) with (ix,iy,iz) in param grid
     total_voxels = indices.shape[0]
-    log(f"[VOXEL] Total filled voxels (cubes): {total_voxels}")
+    log(f"[VOXEL] Total filled voxels (STL cubes): {total_voxels}")
 
-    # sort by iz, iy, ix (radial, tangential, axial indices)
     order = np.lexsort((indices[:, 0], indices[:, 1], indices[:, 2]))
     indices_sorted = indices[order]
 
-    # --- Map iz -> slice "position" in param space: w_center (radial layers) ---
+    # --- Voxelization in param coordinates (BBOX) ---
+    log(f"[VOXEL] Voxelizing bounding-box with cube size = {cube_size} ...")
+    vox_bbox = bbox_mesh_param.voxelized(pitch=cube_size)
+    vox_bbox.fill()
+
+    indices_bbox = vox_bbox.sparse_indices
+    log(f"[VOXEL] Total filled bbox voxels: {indices_bbox.shape[0]}")
+
+    order_bbox = np.lexsort((indices_bbox[:, 0], indices_bbox[:, 1], indices_bbox[:, 2]))
+    indices_bbox_sorted = indices_bbox[order_bbox]
+
+    # --- Map iz -> slice "position" in param space: w_center (STL) ---
     unique_iz = np.unique(indices_sorted[:, 2])
     layer_info: List[Tuple[int, float]] = []
     for iz in unique_iz:
@@ -359,7 +402,6 @@ def generate_global_cubic_hex_mesh(
         slice_coord = float(pt[2])  # w in cylindrical param space
         layer_info.append((int(iz), slice_coord))
 
-    # Sorting slice order: high w first (outer radial band as base slice)
     layer_info.sort(key=lambda x: x[1], reverse=True)
 
     iz_to_slice: Dict[int, int] = {}
@@ -368,7 +410,24 @@ def generate_global_cubic_hex_mesh(
         iz_to_slice[int(iz)] = slice_idx
         z_slices.append(pos)
 
-    # --- Prepare lattice building structures (curved hexa mesh) ---
+    # --- Map iz -> slice "position" in param space: w_center (BBOX) ---
+    unique_iz_bbox = np.unique(indices_bbox_sorted[:, 2])
+    layer_info_bbox: List[Tuple[int, float]] = []
+    for iz in unique_iz_bbox:
+        idx_arr = np.array([[0, 0, iz]], dtype=float)
+        pt = vox_bbox.indices_to_points(idx_arr)[0]
+        slice_coord = float(pt[2])
+        layer_info_bbox.append((int(iz), slice_coord))
+
+    layer_info_bbox.sort(key=lambda x: x[1], reverse=True)
+
+    iz_to_slice_bbox: Dict[int, int] = {}
+    z_slices_bbox: List[float] = []
+    for slice_idx, (iz, pos) in enumerate(layer_info_bbox):
+        iz_to_slice_bbox[int(iz)] = slice_idx
+        z_slices_bbox.append(pos)
+
+    # --- Prepare lattice structures (STL) ---
     vertex_index_map: Dict[Tuple[int, int, int], int] = {}
     vertices: List[Tuple[float, float, float]] = []
     hexes: List[Tuple[int, int, int, int, int, int, int, int]] = []
@@ -385,8 +444,27 @@ def generate_global_cubic_hex_mesh(
         vertices.append(coord)
         return idx
 
-    # --- Build voxel-node lattice & hex connectivity (curved hexa nodes) ---
-    log("[VOXEL] Building voxel-node lattice (curved hexa nodes) ...")
+    # --- Prepare lattice structures (BBOX) ---
+    vertex_index_map_bbox: Dict[Tuple[int, int, int], int] = {}
+    vertices_bbox: List[Tuple[float, float, float]] = []
+    hexes_bbox: List[Tuple[int, int, int, int, int, int, int, int]] = []
+    slice_to_eids_bbox: Dict[int, List[int]] = {
+        i: [] for i in range(len(z_slices_bbox))
+    }
+
+    def get_vertex_index_bbox(
+        key: Tuple[int, int, int],
+        coord: Tuple[float, float, float],
+    ) -> int:
+        if key in vertex_index_map_bbox:
+            return vertex_index_map_bbox[key]
+        idx = len(vertices_bbox) + 1
+        vertex_index_map_bbox[key] = idx
+        vertices_bbox.append(coord)
+        return idx
+
+    # --- Build voxel-node lattice & hex connectivity (STL) ---
+    log("[VOXEL] Building voxel-node lattice (curved hexa nodes) for STL ...")
 
     for (ix, iy, iz) in indices_sorted:
         center_param = vox.indices_to_points(
@@ -401,7 +479,6 @@ def generate_global_cubic_hex_mesh(
         v0, v1 = v_c - half, v_c + half
         w0, w1 = w_c - half, w_c + half
 
-        # param-space corners of this voxel
         p0 = (u0, v0, w0)
         p1 = (u1, v0, w0)
         p2 = (u1, v1, w0)
@@ -411,7 +488,6 @@ def generate_global_cubic_hex_mesh(
         p6 = (u1, v1, w1)
         p7 = (u0, v1, w1)
 
-        # map to world (curved hexa) in voxelization frame (Y >= 0)
         x0, y0, z0 = param_to_world_cyl(p0, cx_cyl, cz_cyl, R0)
         x1, y1, z1 = param_to_world_cyl(p1, cx_cyl, cz_cyl, R0)
         x2, y2, z2 = param_to_world_cyl(p2, cx_cyl, cz_cyl, R0)
@@ -421,7 +497,6 @@ def generate_global_cubic_hex_mesh(
         x6, y6, z6 = param_to_world_cyl(p6, cx_cyl, cz_cyl, R0)
         x7, y7, z7 = param_to_world_cyl(p7, cx_cyl, cz_cyl, R0)
 
-        # Deduplicate nodes by (ix,iy,iz-based) key
         v0_idx = get_vertex_index((ix,   iy,   iz),   (x0, y0, z0))
         v1_idx = get_vertex_index((ix+1, iy,   iz),   (x1, y1, z1))
         v2_idx = get_vertex_index((ix+1, iy+1, iz),   (x2, y2, z2))
@@ -438,18 +513,71 @@ def generate_global_cubic_hex_mesh(
         slice_idx = iz_to_slice[int(iz)]
         slice_to_eids[slice_idx].append(eid)
 
+    # --- Build voxel-node lattice & hex connectivity (BBOX) ---
+    log("[VOXEL] Building voxel-node lattice (curved hexa nodes) for BBOX ...")
+
+    for (ix, iy, iz) in indices_bbox_sorted:
+        center_param = vox_bbox.indices_to_points(
+            np.array([[ix, iy, iz]], dtype=float)
+        )[0]
+        u_c, v_c, w_c = center_param
+
+        # Undo the tangential rotation before mapping back to world
+        v_c -= v_offset
+
+        u0, u1 = u_c - half, u_c + half
+        v0, v1 = v_c - half, v_c + half
+        w0, w1 = w_c - half, w_c + half
+
+        p0 = (u0, v0, w0)
+        p1 = (u1, v0, w0)
+        p2 = (u1, v1, w0)
+        p3 = (u0, v1, w0)
+        p4 = (u0, v0, w1)
+        p5 = (u1, v0, w1)
+        p6 = (u1, v1, w1)
+        p7 = (u0, v1, w1)
+
+        x0, y0, z0 = param_to_world_cyl(p0, cx_cyl, cz_cyl, R0)
+        x1, y1, z1 = param_to_world_cyl(p1, cx_cyl, cz_cyl, R0)
+        x2, y2, z2 = param_to_world_cyl(p2, cx_cyl, cz_cyl, R0)
+        x3, y3, z3 = param_to_world_cyl(p3, cx_cyl, cz_cyl, R0)
+        x4, y4, z4 = param_to_world_cyl(p4, cx_cyl, cz_cyl, R0)
+        x5, y5, z5 = param_to_world_cyl(p5, cx_cyl, cz_cyl, R0)
+        x6, y6, z6 = param_to_world_cyl(p6, cx_cyl, cz_cyl, R0)
+        x7, y7, z7 = param_to_world_cyl(p7, cx_cyl, cz_cyl, R0)
+
+        v0_idx = get_vertex_index_bbox((ix,   iy,   iz),   (x0, y0, z0))
+        v1_idx = get_vertex_index_bbox((ix+1, iy,   iz),   (x1, y1, z1))
+        v2_idx = get_vertex_index_bbox((ix+1, iy+1, iz),   (x2, y2, z2))
+        v3_idx = get_vertex_index_bbox((ix,   iy+1, iz),   (x3, y3, z3))
+        v4_idx = get_vertex_index_bbox((ix,   iy,   iz+1), (x4, y4, z4))
+        v5_idx = get_vertex_index_bbox((ix+1, iy,   iz+1), (x5, y5, z5))
+        v6_idx = get_vertex_index_bbox((ix+1, iy+1, iz+1), (x6, y6, z6))
+        v7_idx = get_vertex_index_bbox((ix,   iy+1, iz+1), (x7, y7, z7))
+
+        hexes_bbox.append((v0_idx, v1_idx, v2_idx, v3_idx,
+                           v4_idx, v5_idx, v6_idx, v7_idx))
+
+        eid = len(hexes_bbox)
+        slice_idx = iz_to_slice_bbox[int(iz)]
+        slice_to_eids_bbox[slice_idx].append(eid)
+
     # Store cylindrical parameters + v_offset + y_offset
-    cyl_params = (cx_cyl, cz_cyl, R0, v_offset, y_offset)  # <<< CHANGED
+    cyl_params = (cx_cyl, cz_cyl, R0, v_offset, y_offset)
 
     log(
-        f"[VOXEL] Built mesh (voxelization frame): {len(vertices)} nodes, "
+        f"[VOXEL] Built STL mesh (voxelization frame): {len(vertices)} nodes, "
         f"{len(hexes)} hex elements, {len(z_slices)} radial slices."
+    )
+    log(
+        f"[VOXEL] Built BBOX mesh (voxelization frame): {len(vertices_bbox)} nodes, "
+        f"{len(hexes_bbox)} hex elements, {len(z_slices_bbox)} radial slices."
     )
 
     # --- Undo Y-shift for returned data so voxels sit back where STL was ---
-    vertices = [
-        (x, y - y_offset, z) for (x, y, z) in vertices
-    ]
+    vertices = [(x, y - y_offset, z) for (x, y, z) in vertices]
+    vertices_bbox = [(x, y - y_offset, z) for (x, y, z) in vertices_bbox]
 
     if lowest_point_world is not None:
         lx, ly, lz = lowest_point_world
@@ -473,6 +601,7 @@ def generate_global_cubic_hex_mesh(
     )
 
     return (
+        # STL mesh results
         vertices,
         hexes,
         slice_to_eids,
@@ -482,8 +611,16 @@ def generate_global_cubic_hex_mesh(
         axis_point_world,
         edge_left_world,
         edge_right_world,
-        indices_sorted,   # for debug export
-        vox               # for debug export
+        indices_sorted,      # for STL debug export
+        vox,                 # for STL debug export
+
+        # BBOX mesh results
+        vertices_bbox,
+        hexes_bbox,
+        slice_to_eids_bbox,
+        z_slices_bbox,
+        indices_bbox_sorted, # for BBOX debug export
+        vox_bbox,            # for BBOX debug export
     )
 
 
@@ -1519,6 +1656,402 @@ def export_voxel_debug_stl(
     log(f"[VOXDBG] Voxel debug STL written: {out_path}")
 
 
+def build_curved_ffd_from_bbox_voxels(
+    indices_bbox_sorted: np.ndarray,
+    vox_bbox: "trimesh.voxel.VoxelGrid",
+    cube_size: float,
+    cyl_params: Tuple[float, float, float, float, float],
+):
+    """
+    Build a curved FFD lattice from the cylindrical bbox voxels.
+
+    Each FFD control point corresponds 1:1 to a voxel vertex of the bbox
+    hexahedral lattice, but we implement it using the classic PyGeM
+    interface (box_origin, box_length, array_mu_*).
+
+    Returns:
+        ffd:        PyGeM FFD object whose control points equal the curved lattice
+        ctrl_pts:   (nx, ny, nz, 3) array of target control point coordinates
+        dims:       (nx, ny, nz)
+        index_base: (ix_min, iy_min, iz_min) integer grid origin (voxel index)
+    """
+    cx_cyl, cz_cyl, R0, v_offset, y_offset = cyl_params
+    half = cube_size * 0.5
+
+    # --- 1) Grid ranges & lattice dimensions (in voxel index space) ---
+    ix_vals = indices_bbox_sorted[:, 0]
+    iy_vals = indices_bbox_sorted[:, 1]
+    iz_vals = indices_bbox_sorted[:, 2]
+
+    ix_min, ix_max = int(ix_vals.min()), int(ix_vals.max())
+    iy_min, iy_max = int(iy_vals.min()), int(iy_vals.max())
+    iz_min, iz_max = int(iz_vals.min()), int(iz_vals.max())
+
+    # Nodes are voxel corners: range ix_min..ix_max+1 etc.
+    nx = (ix_max - ix_min + 1) + 1
+    ny = (iy_max - iy_min + 1) + 1
+    nz = (iz_max - iz_min + 1) + 1
+
+    log(
+        f"[FFD] BBOX voxel grid index ranges: "
+        f"ix=[{ix_min},{ix_max}], iy=[{iy_min},{iy_max}], iz=[{iz_min},{iz_max}] "
+        f"-> ctrl dims (nx,ny,nz)=({nx},{ny},{nz})"
+    )
+
+    # --- 2) Build map (global node index) -> world coord, then pack to array ---
+    vertex_coord_map: Dict[Tuple[int, int, int], Tuple[float, float, float]] = {}
+
+    for (ix, iy, iz) in indices_bbox_sorted:
+        # Center of this bbox voxel in param space
+        center_param = vox_bbox.indices_to_points(
+            np.array([[ix, iy, iz]], dtype=float)
+        )[0]
+        u_c, v_c, w_c = center_param
+
+        # Undo tangential rotation before mapping back to world
+        v_c -= v_offset
+
+        u0, u1 = u_c - half, u_c + half
+        v0, v1 = v_c - half, v_c + half
+        w0, w1 = w_c - half, w_c + half
+
+        # Eight corners in param space + their integer node indices
+        corner_defs = [
+            ((ix,     iy,     iz    ), (u0, v0, w0)),
+            ((ix + 1, iy,     iz    ), (u1, v0, w0)),
+            ((ix + 1, iy + 1, iz    ), (u1, v1, w0)),
+            ((ix,     iy + 1, iz    ), (u0, v1, w0)),
+            ((ix,     iy,     iz + 1), (u0, v0, w1)),
+            ((ix + 1, iy,     iz + 1), (u1, v0, w1)),
+            ((ix + 1, iy + 1, iz + 1), (u1, v1, w1)),
+            ((ix,     iy + 1, iz + 1), (u0, v1, w1)),
+        ]
+
+        for (gx, gy, gz), (u, v, w) in corner_defs:
+            key = (gx, gy, gz)
+            if key in vertex_coord_map:
+                continue
+            x, y, z = param_to_world_cyl((u, v, w), cx_cyl, cz_cyl, R0)
+            # Undo the initial Y shift so we are back in original STL frame
+            y -= y_offset
+            vertex_coord_map[key] = (x, y, z)
+
+    log(f"[FFD] Total unique bbox lattice nodes: {len(vertex_coord_map)}")
+
+    # Pack into target control-points array (curved lattice)
+    ctrl_points = np.zeros((nx, ny, nz, 3), dtype=float)
+
+    for (gx, gy, gz), (x, y, z) in vertex_coord_map.items():
+        i = gx - ix_min
+        j = gy - iy_min
+        k = gz - iz_min
+        ctrl_points[i, j, k, :] = (x, y, z)
+
+    # --- 3) Define FFD box to span these target ctrl_points ---
+    xs = ctrl_points[..., 0]
+    ys = ctrl_points[..., 1]
+    zs = ctrl_points[..., 2]
+
+    x_min = float(xs.min())
+    x_max = float(xs.max())
+    y_min = float(ys.min())
+    y_max = float(ys.max())
+    z_min = float(zs.min())
+    z_max = float(zs.max())
+
+    Lx = x_max - x_min
+    Ly = y_max - y_min
+    Lz = z_max - z_min
+
+    # Tiny epsilons in case something degenerates
+    eps = 1e-12
+    if Lx < eps: Lx = eps
+    if Ly < eps: Ly = eps
+    if Lz < eps: Lz = eps
+
+    # --- 4) Create PyGeM FFD with classic interface ---
+    ffd = FFD(n_control_points=[nx, ny, nz])
+
+    ffd.box_origin[:] = np.array([x_min, y_min, z_min], dtype=float)
+    ffd.box_length[:] = np.array([Lx, Ly, Lz], dtype=float)
+    ffd.rot_angle[:] = np.array([0.0, 0.0, 0.0], dtype=float)
+
+    if hasattr(ffd, "reset_weights"):
+        ffd.reset_weights()
+    else:
+        ffd.array_mu_x[:] = 0.0
+        ffd.array_mu_y[:] = 0.0
+        ffd.array_mu_z[:] = 0.0
+
+    # --- 5) Compute base grid positions and mu so ctrl_points == curved lattice ---
+
+    # Precompute param positions along each axis (0..1)
+    if nx > 1:
+        alphas = np.linspace(0.0, 1.0, nx)
+    else:
+        alphas = np.zeros(1)
+    if ny > 1:
+        betas = np.linspace(0.0, 1.0, ny)
+    else:
+        betas = np.zeros(1)
+    if nz > 1:
+        gammas = np.linspace(0.0, 1.0, nz)
+    else:
+        gammas = np.zeros(1)
+
+    # We'll fill array_mu_x/y/z so that:
+    #   base + mu * L = target_ctrl
+    for i in range(nx):
+        alpha = alphas[i]
+        base_x = x_min + alpha * Lx
+        for j in range(ny):
+            beta = betas[j]
+            base_y = y_min + beta * Ly
+            for k in range(nz):
+                gamma = gammas[k]
+                base_z = z_min + gamma * Lz
+
+                tx, ty, tz = ctrl_points[i, j, k, :]
+
+                ffd.array_mu_x[i, j, k] = (tx - base_x) / Lx
+                ffd.array_mu_y[i, j, k] = (ty - base_y) / Ly
+                ffd.array_mu_z[i, j, k] = (tz - base_z) / Lz
+
+    log(
+        f"[FFD] Curved FFD lattice built via mu arrays: "
+        f"ctrl_points shape={ctrl_points.shape}, "
+        f"box_origin={ffd.box_origin}, box_length={ffd.box_length}"
+    )
+
+    return ffd, ctrl_points, (nx, ny, nz), (ix_min, iy_min, iz_min)
+
+
+def export_ffd_lattice_points_to_ply(
+    ctrl_points: np.ndarray,
+    output_ply: str,
+):
+    """
+    Export FFD control points (nx, ny, nz, 3) as a PLY point cloud.
+
+    Args:
+        ctrl_points : np.ndarray of shape (nx, ny, nz, 3)
+            The control point coordinates in world space.
+        output_ply  : str
+            Path to output .ply file.
+    """
+    if ctrl_points.ndim != 4 or ctrl_points.shape[3] != 3:
+        raise ValueError(
+            f"ctrl_points must have shape (nx, ny, nz, 3), got {ctrl_points.shape}"
+        )
+
+    nx, ny, nz, _ = ctrl_points.shape
+
+    # Flatten to (N, 3)
+    verts = ctrl_points.reshape(-1, 3)
+
+    # Create point cloud
+    pc = trimesh.points.PointCloud(verts)
+
+    # Make sure directory exists
+    out_dir = os.path.dirname(os.path.abspath(output_ply))
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    pc.export(output_ply)
+
+    log(
+        f"[PLY] FFD lattice points exported: {output_ply} "
+        f"(nx,ny,nz)=({nx},{ny},{nz}), total points={verts.shape[0]}"
+    )
+
+
+def deform_bbox_ffd_ctrl_points_from_voxel_displacements(
+    ctrl_points: np.ndarray,
+    vertices: List[Tuple[float, float, float]],
+    displacements: Dict[int, Tuple[float, float, float]],
+    tol: float = 1e-6,
+) -> np.ndarray:
+    """
+    Given:
+      - ctrl_points: (nx, ny, nz, 3) FFD lattice (bbox, undeformed, world coords)
+      - vertices:    list of voxel-mesh node coords (world coords), index = nid-1
+      - displacements: dict {node_id -> (ux, uy, uz)}
+        (node_id starts from 1, as in your existing code)
+    
+    Return:
+      - ctrl_points_def: (nx, ny, nz, 3) deformed FFD control points where
+        control points that coincide with voxel nodes get the same displacement.
+    
+    Points that do not have a matching voxel node remain unchanged.
+    """
+    if ctrl_points.ndim != 4 or ctrl_points.shape[3] != 3:
+        raise ValueError(
+            f"ctrl_points must have shape (nx, ny, nz, 3), got {ctrl_points.shape}"
+        )
+
+    nx, ny, nz, _ = ctrl_points.shape
+    inv_tol = 1.0 / float(tol)
+
+    # ------------------------------------------------------------
+    # 1) Build a map from quantized node position -> displacement
+    #    Only store nodes that actually have displacement data.
+    # ------------------------------------------------------------
+    node_map: Dict[Tuple[int, int, int], Tuple[float, float, float]] = {}
+
+    for nid, (x, y, z) in enumerate(vertices, start=1):
+        u = displacements.get(nid)
+        if u is None:
+            continue
+        key = (
+            int(round(x * inv_tol)),
+            int(round(y * inv_tol)),
+            int(round(z * inv_tol)),
+        )
+        # If duplicates occur (they shouldn't), last one wins; that's fine here.
+        node_map[key] = u
+
+    log(
+        f"[FFD-DEF] Built voxel-node displacement map: {len(node_map)} entries "
+        f"(tol={tol})"
+    )
+
+    # ------------------------------------------------------------
+    # 2) Apply displacements where ctrl_points coincide with voxel nodes
+    # ------------------------------------------------------------
+    ctrl_points_def = ctrl_points.copy()
+    total_ctrl = nx * ny * nz
+    matched = 0
+
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                x, y, z = ctrl_points[i, j, k, :]
+                key = (
+                    int(round(x * inv_tol)),
+                    int(round(y * inv_tol)),
+                    int(round(z * inv_tol)),
+                )
+                u = node_map.get(key)
+                if u is None:
+                    continue
+
+                ux, uy, uz = u
+                ctrl_points_def[i, j, k, 0] = x + ux
+                ctrl_points_def[i, j, k, 1] = y + uy
+                ctrl_points_def[i, j, k, 2] = z + uz
+                matched += 1
+
+    log(
+        f"[FFD-DEF] Deformed bbox FFD ctrl points: "
+        f"matched {matched} / {total_ctrl} control points to voxel nodes."
+    )
+
+    return ctrl_points_def
+
+
+def export_three_bbox_ffd_lattices_json(
+    ffd_bbox,
+    ctrl_points_curved: np.ndarray,
+    ctrl_points_deformed: np.ndarray,
+    out_prefix: str,
+):
+    """
+    Export three FFD lattices as JSON:
+
+      1) Non-curved (rectangular) bbox FFD lattice with correct dimensions.
+      2) Curved bbox FFD lattice (ctrl_points_curved).
+      3) Deformed bbox FFD lattice (ctrl_points_deformed).
+
+    JSON format:
+      {
+        "nx": nx,
+        "ny": ny,
+        "nz": nz,
+        "points": [[[[x,y,z], ...], ...], ...]
+      }
+    """
+
+    if ctrl_points_curved.shape != ctrl_points_deformed.shape:
+        raise ValueError(
+            f"Curved and deformed lattices must have same shape, "
+            f"got {ctrl_points_curved.shape} vs {ctrl_points_deformed.shape}"
+        )
+
+    if ctrl_points_curved.ndim != 4 or ctrl_points_curved.shape[3] != 3:
+        raise ValueError(
+            f"ctrl_points_curved must have shape (nx, ny, nz, 3), "
+            f"got {ctrl_points_curved.shape}"
+        )
+
+    nx, ny, nz, _ = ctrl_points_curved.shape
+
+    # 1) Build non-curved base lattice from ffd_bbox box_origin/box_length
+    x_min, y_min, z_min = [float(v) for v in ffd_bbox.box_origin]
+    Lx, Ly, Lz = [float(v) for v in ffd_bbox.box_length]
+
+    base_ctrl = np.zeros_like(ctrl_points_curved, dtype=float)
+
+    # Parameters along each axis in [0,1]
+    if nx > 1:
+        alphas = np.linspace(0.0, 1.0, nx)
+    else:
+        alphas = np.zeros(1)
+    if ny > 1:
+        betas = np.linspace(0.0, 1.0, ny)
+    else:
+        betas = np.zeros(1)
+    if nz > 1:
+        gammas = np.linspace(0.0, 1.0, nz)
+    else:
+        gammas = np.zeros(1)
+
+    for i in range(nx):
+        alpha = alphas[i]
+        base_x = x_min + alpha * Lx
+        for j in range(ny):
+            beta = betas[j]
+            base_y = y_min + beta * Ly
+            for k in range(nz):
+                gamma = gammas[k]
+                base_z = z_min + gamma * Lz
+                base_ctrl[i, j, k, :] = (base_x, base_y, base_z)
+
+    log(
+        f"[FFD-EXPORT] Base lattice built from ffd_bbox: "
+        f"box_origin=({x_min:.6f},{y_min:.6f},{z_min:.6f}), "
+        f"box_length=({Lx:.6f},{Ly:.6f},{Lz:.6f}), "
+        f"(nx,ny,nz)=({nx},{ny},{nz})"
+    )
+
+    # Helper to dump a single lattice
+    def _dump_lattice(ctrl_pts: np.ndarray, path: str):
+        data = {
+            "nx": nx,
+            "ny": ny,
+            "nz": nz,
+            "points": ctrl_pts.tolist(),
+        }
+        out_dir = os.path.dirname(os.path.abspath(path))
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        log(
+            f"[FFD-EXPORT] Lattice exported to {path} "
+            f"(nx,ny,nz)=({nx},{ny},{nz})"
+        )
+
+    base_path     = f"{out_prefix}_lattice1_base.json"
+    curved_path   = f"{out_prefix}_lattice2_curved.json"
+    deformed_path = f"{out_prefix}_lattice3_deformed.json"
+
+    _dump_lattice(base_ctrl,          base_path)
+    _dump_lattice(ctrl_points_curved, curved_path)
+    _dump_lattice(ctrl_points_deformed, deformed_path)
+
+    return base_path, curved_path, deformed_path
+
+
 # ============================================================
 #  CLI
 # ============================================================
@@ -1611,10 +2144,29 @@ def main():
         edge_right_point,
         indices_sorted,
         vox,
+
+        # BBOX mesh results
+        vertices_bbox,
+        hexes_bbox,
+        slice_to_eids_bbox,
+        z_slices_bbox,
+        indices_bbox_sorted, # for BBOX debug export
+        vox_bbox,            # for BBOX debug export
     ) = generate_global_cubic_hex_mesh(
         args.input_stl,
         args.cube_size,
         cyl_radius=args.cyl_radius,
+    )
+
+    ffd_bbox, ctrl_pts_bbox, (nx, ny, nz), index_base = build_curved_ffd_from_bbox_voxels(
+        indices_bbox_sorted=indices_bbox_sorted,
+        vox_bbox=vox_bbox,
+        cube_size=args.cube_size,
+        cyl_params=cyl_params,
+    )
+    export_ffd_lattice_points_to_ply(
+        ctrl_points=ctrl_pts_bbox,
+        output_ply=basepath + "_bbox_ffd_points.ply",
     )
 
     # --- Export voxel debug STL ---
@@ -1637,7 +2189,7 @@ def main():
         slice_to_eids,
         z_slices,
         shrinkage_curve=[5, 4, 3, 2, 1],
-        cure_shrink_per_unit=0.03,  # 3%
+        cure_shrink_per_unit=0.3,  # 3%
         output_stride=args.output_stride,
     )
 
@@ -1649,29 +2201,47 @@ def main():
             return
 
         utd_frd = utd_job + ".frd"
-        if os.path.isfile(utd_frd):
-            deformed_stl = basepath + "_deformed.stl"
-            lattice_basepath = basepath + "_lattice" if args.export_lattice else None
-            deformed_voxels_stl = basepath + "_voxels_def.stl"
+        displacements = read_frd_displacements(utd_frd)
+        ctrl_pts_bbox_def = deform_bbox_ffd_ctrl_points_from_voxel_displacements(
+            ctrl_points=ctrl_pts_bbox,
+            vertices=vertices,
+            displacements=displacements,
+            tol=1e-6,
+        )
+        export_ffd_lattice_points_to_ply(
+            ctrl_points=ctrl_pts_bbox_def,
+            output_ply=basepath + "_bbox_ffd_def.ply",
+        )
+        base_json, curved_json, def_json = export_three_bbox_ffd_lattices_json(
+            ffd_bbox=ffd_bbox,
+            ctrl_points_curved=ctrl_pts_bbox,
+            ctrl_points_deformed=ctrl_pts_bbox_def,
+            out_prefix=basepath + "_json",
+        )
 
-            deform_input_stl_with_frd_pygem(
-                args.input_stl,
-                utd_frd,
-                vertices,
-                args.cube_size,
-                deformed_stl,
-                lattice_basepath=lattice_basepath,
-                cyl_params=cyl_params,
-                lowest_point=lowest_point,
-                axis_point=axis_point,
-                edge_left_point=edge_left_point,
-                edge_right_point=edge_right_point,
-                hexes=hexes,
-                deformed_voxels_path=deformed_voxels_stl,
-            )
+        # if os.path.isfile(utd_frd):
+        #     deformed_stl = basepath + "_deformed.stl"
+        #     lattice_basepath = basepath + "_lattice" if args.export_lattice else None
+        #     deformed_voxels_stl = basepath + "_voxels_def.stl"
 
-        else:
-            log(f"[FFD] Thermo-mechanical FRD '{utd_frd}' not found, skipping STL deformation.")
+        #     deform_input_stl_with_frd_pygem(
+        #         args.input_stl,
+        #         utd_frd,
+        #         vertices,
+        #         args.cube_size,
+        #         deformed_stl,
+        #         lattice_basepath=lattice_basepath,
+        #         cyl_params=cyl_params,
+        #         lowest_point=lowest_point,
+        #         axis_point=axis_point,
+        #         edge_left_point=edge_left_point,
+        #         edge_right_point=edge_right_point,
+        #         hexes=hexes,
+        #         deformed_voxels_path=deformed_voxels_stl,
+        #     )
+
+        # else:
+        #     log(f"[FFD] Thermo-mechanical FRD '{utd_frd}' not found, skipping STL deformation.")
 
 
 if __name__ == "__main__":
