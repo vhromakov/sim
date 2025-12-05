@@ -600,6 +600,17 @@ def generate_global_cubic_hex_mesh(
         "(original STL frame)"
     )
 
+    indices_bbox_sorted = indices_bbox_sorted[:, [1, 0, 2]]
+    # indices_bbox_sorted = indices_bbox_sorted[::-1]
+    vertex_index_map_bbox = {
+        (iy, ix, iz): idx
+        for (ix, iy, iz), idx in vertex_index_map_bbox.items()
+    }
+    # vertex_index_map_bbox = {
+    #     k: vertex_index_map_bbox[k]
+    #     for k in reversed(list(vertex_index_map_bbox.keys()))
+    # }
+
     return (
         # STL mesh results
         vertices,
@@ -621,7 +632,180 @@ def generate_global_cubic_hex_mesh(
         z_slices_bbox,
         indices_bbox_sorted, # for BBOX debug export
         vox_bbox,            # for BBOX debug export
+        vertex_index_map_bbox,
     )
+
+
+from typing import Dict, Tuple, List, Iterable
+from typing import Dict, Tuple, List
+
+def retarget_ffd_to_bbox_vertices(
+    vertices_bbox: List[Tuple[float, float, float]],
+    vertex_index_map_bbox: Dict[Tuple[int, int, int], int],
+    ffd,
+) -> None:
+    """
+    Modify FFD in-place so that each FFD control point position matches
+    the corresponding bbox vertex position.
+
+    After this, for every node:
+        bbox_vert == box_origin + t * box_length + mu_new
+
+    where mu_new is stored in ffd.array_mu_x/y/z.
+    """
+
+    num_nodes = len(vertices_bbox)
+
+    # 1) Recover (ix, iy, iz) for each node index, in vertices_bbox order
+    node_keys_in_vertex_order: List[Tuple[int, int, int]] = [None] * num_nodes
+    for (ix, iy, iz), idx in vertex_index_map_bbox.items():
+        node_keys_in_vertex_order[idx - 1] = (ix, iy, iz)
+
+    if any(k is None for k in node_keys_in_vertex_order):
+        raise RuntimeError("Some node indices are missing in vertex_index_map_bbox")
+
+    # 2) Build mapping from global integer coords (ix,iy,iz) to local FFD indices
+    ix_vals = sorted({ix for (ix, _, _) in node_keys_in_vertex_order})
+    iy_vals = sorted({iy for (_, iy, _) in node_keys_in_vertex_order})
+    # IMPORTANT: reverse iz so that "top" (largest iz) comes first,
+    # matching the way cube vertices are traversed (top 4, then bottom 4).
+    iz_vals = sorted({iz for (_, _, iz) in node_keys_in_vertex_order}, reverse=True)
+
+    ix_to_local = {ix: i for i, ix in enumerate(ix_vals)}
+    iy_to_local = {iy: j for j, iy in enumerate(iy_vals)}
+    iz_to_local = {iz: k for k, iz in enumerate(iz_vals)}
+
+    nx = len(ix_vals)
+    ny = len(iy_vals)
+    nz = len(iz_vals)
+
+    # 3) Sanity-check against FFD resolution
+    if hasattr(ffd, "n_control_points"):
+        nx_ffd, ny_ffd, nz_ffd = ffd.n_control_points
+        assert (nx, ny, nz) == (nx_ffd, ny_ffd, nz_ffd), (
+            f"BBox grid ({nx},{ny},{nz}) != FFD grid ({nx_ffd},{ny_ffd},{nz_ffd})"
+        )
+
+    # 4) Pre-read box origin and length
+    ox, oy, oz = map(float, ffd.box_origin)
+    lx, ly, lz = map(float, ffd.box_length)
+
+    # 5) For each node, compute the base position and set mu so that
+    #    control point lands exactly on bbox_vert
+    for i_node, (ix, iy, iz) in enumerate(node_keys_in_vertex_order):
+        # Node data
+        bx, by, bz = vertices_bbox[i_node]
+
+        # Local indices in FFD grid
+        i_local = ix_to_local[ix]
+        j_local = iy_to_local[iy]
+        k_local = iz_to_local[iz]
+
+        # Parametric coordinates t in [0,1] along each axis
+        tx = 0.0 if nx == 1 else i_local / (nx - 1)
+        ty = 0.0 if ny == 1 else j_local / (ny - 1)
+        tz = 0.0 if nz == 1 else k_local / (nz - 1)
+
+        # Base (undeformed) control point position from the box
+        base_x = ox + tx * lx
+        base_y = oy + ty * ly
+        base_z = oz + tz * lz
+
+        # Desired displacement so that control point == bbox_vert
+        dx = bx - base_x
+        dy = by - base_y
+        dz = bz - base_z
+
+        # Write into FFD displacement arrays
+        ffd.array_mu_x[i_local, j_local, k_local] = dx
+        ffd.array_mu_y[i_local, j_local, k_local] = dy
+        ffd.array_mu_z[i_local, j_local, k_local] = dz
+
+
+def traverse_bbox_and_ffd_in_same_order(
+    vertices_bbox: List[Tuple[float, float, float]],
+    vertex_index_map_bbox: Dict[Tuple[int, int, int], int],
+    ffd,
+):
+    """
+    Yield (node_index, bbox_vertex, ffd_pos, ffd_disp) where:
+
+    - node_index: 1-based node index (same as in hex connectivity)
+    - bbox_vertex: coordinates from vertices_bbox in mesh order
+    - ffd_pos:     FFD control point world position (box + mu)
+    - ffd_disp:    FFD displacement vector (mu_x, mu_y, mu_z)
+    """
+
+    num_nodes = len(vertices_bbox)
+
+    # 1) Recover (ix, iy, iz) for each node index, in vertices_bbox order
+    node_keys_in_vertex_order: List[Tuple[int, int, int]] = [None] * num_nodes
+    for (ix, iy, iz), idx in vertex_index_map_bbox.items():
+        node_keys_in_vertex_order[idx - 1] = (ix, iy, iz)
+
+    if any(k is None for k in node_keys_in_vertex_order):
+        raise RuntimeError("Some node indices are missing in vertex_index_map_bbox")
+
+    # 2) Build mapping from global integer coords (ix,iy,iz) to local FFD indices
+    ix_vals = sorted({ix for (ix, _, _) in node_keys_in_vertex_order})
+    iy_vals = sorted({iy for (_, iy, _) in node_keys_in_vertex_order})
+
+    # IMPORTANT: reverse iz so that "top" (largest iz) comes first,
+    # matching the way cube vertices are traversed (top 4, then bottom 4).
+    iz_vals = sorted({iz for (_, _, iz) in node_keys_in_vertex_order}, reverse=True)
+
+    ix_to_local = {ix: i for i, ix in enumerate(ix_vals)}
+    iy_to_local = {iy: j for j, iy in enumerate(iy_vals)}
+    iz_to_local = {iz: k for k, iz in enumerate(iz_vals)}
+
+    nx = len(ix_vals)
+    ny = len(iy_vals)
+    nz = len(iz_vals)
+
+    # 3) Sanity-check against FFD resolution (PyGeM: ffd.n_control_points = [nx,ny,nz])
+    if hasattr(ffd, "n_control_points"):
+        nx_ffd, ny_ffd, nz_ffd = ffd.n_control_points
+        assert (nx, ny, nz) == (nx_ffd, ny_ffd, nz_ffd), (
+            f"BBox grid ({nx},{ny},{nz}) != FFD grid ({nx_ffd},{ny_ffd},{nz_ffd})"
+        )
+
+    # 4) Helpers to get FFD displacement and position
+    def get_ffd_disp(i: int, j: int, k: int):
+        dx = float(ffd.array_mu_x[i, j, k])
+        dy = float(ffd.array_mu_y[i, j, k])
+        dz = float(ffd.array_mu_z[i, j, k])
+        return (dx, dy, dz)
+
+    def get_ffd_pos(i: int, j: int, k: int):
+        # parametric coordinates in [0,1] along each axis
+        tx = 0.0 if nx == 1 else i / (nx - 1)
+        ty = 0.0 if ny == 1 else j / (ny - 1)
+        tz = 0.0 if nz == 1 else k / (nz - 1)
+
+        ox, oy, oz = map(float, ffd.box_origin)
+        lx, ly, lz = map(float, ffd.box_length)
+
+        base_x = ox + tx * lx
+        base_y = oy + ty * ly
+        base_z = oz + tz * lz
+
+        dx, dy, dz = get_ffd_disp(i, j, k)
+
+        return (base_x + dx, base_y + dy, base_z + dz)
+
+    # 5) Traverse in the same order as vertices_bbox
+    for i_node, (ix, iy, iz) in enumerate(node_keys_in_vertex_order):
+        node_index = i_node + 1  # 1-based
+        bbox_vert = vertices_bbox[i_node]
+
+        i_local = ix_to_local[ix]
+        j_local = iy_to_local[iy]
+        k_local = iz_to_local[iz]
+
+        ffd_disp = get_ffd_disp(i_local, j_local, k_local)
+        ffd_pos  = get_ffd_pos(i_local, j_local, k_local)
+
+        yield node_index, bbox_vert, ffd_pos, ffd_disp
 
 
 def write_calculix_job(
@@ -1661,27 +1845,15 @@ def build_curved_ffd_from_bbox_voxels(
     vox_bbox: "trimesh.voxel.VoxelGrid",
     cube_size: float,
     cyl_params: Tuple[float, float, float, float, float],
+    vertices_bbox,
+    vertex_index_map_bbox,
 ):
-    """
-    Build a curved FFD lattice from the cylindrical bbox voxels.
-
-    Each FFD control point corresponds 1:1 to a voxel vertex of the bbox
-    hexahedral lattice, but we implement it using the classic PyGeM
-    interface (box_origin, box_length, array_mu_*).
-
-    Returns:
-        ffd:        PyGeM FFD object whose control points equal the curved lattice
-        ctrl_pts:   (nx, ny, nz, 3) array of target control point coordinates
-        dims:       (nx, ny, nz)
-        index_base: (ix_min, iy_min, iz_min) integer grid origin (voxel index)
-    """
-    cx_cyl, cz_cyl, R0, v_offset, y_offset = cyl_params
-    half = cube_size * 0.5
-
     # --- 1) Grid ranges & lattice dimensions (in voxel index space) ---
     ix_vals = indices_bbox_sorted[:, 0]
     iy_vals = indices_bbox_sorted[:, 1]
     iz_vals = indices_bbox_sorted[:, 2]
+
+    print(indices_bbox_sorted)
 
     ix_min, ix_max = int(ix_vals.min()), int(ix_vals.max())
     iy_min, iy_max = int(iy_vals.min()), int(iy_vals.max())
@@ -1692,82 +1864,16 @@ def build_curved_ffd_from_bbox_voxels(
     ny = (iy_max - iy_min + 1) + 1
     nz = (iz_max - iz_min + 1) + 1
 
-    log(
-        f"[FFD] BBOX voxel grid index ranges: "
-        f"ix=[{ix_min},{ix_max}], iy=[{iy_min},{iy_max}], iz=[{iz_min},{iz_max}] "
-        f"-> ctrl dims (nx,ny,nz)=({nx},{ny},{nz})"
-    )
-
-    # --- 2) Build map (global node index) -> world coord, then pack to array ---
-    vertex_coord_map: Dict[Tuple[int, int, int], Tuple[float, float, float]] = {}
-
-    for (ix, iy, iz) in indices_bbox_sorted:
-        # Center of this bbox voxel in param space
-        center_param = vox_bbox.indices_to_points(
-            np.array([[ix, iy, iz]], dtype=float)
-        )[0]
-        u_c, v_c, w_c = center_param
-
-        # Undo tangential rotation before mapping back to world
-        v_c -= v_offset
-
-        u0, u1 = u_c - half, u_c + half
-        v0, v1 = v_c - half, v_c + half
-        w0, w1 = w_c - half, w_c + half
-
-        # Eight corners in param space + their integer node indices
-        corner_defs = [
-            ((ix,     iy,     iz    ), (u0, v0, w0)),
-            ((ix + 1, iy,     iz    ), (u1, v0, w0)),
-            ((ix + 1, iy + 1, iz    ), (u1, v1, w0)),
-            ((ix,     iy + 1, iz    ), (u0, v1, w0)),
-            ((ix,     iy,     iz + 1), (u0, v0, w1)),
-            ((ix + 1, iy,     iz + 1), (u1, v0, w1)),
-            ((ix + 1, iy + 1, iz + 1), (u1, v1, w1)),
-            ((ix,     iy + 1, iz + 1), (u0, v1, w1)),
-        ]
-
-        for (gx, gy, gz), (u, v, w) in corner_defs:
-            key = (gx, gy, gz)
-            if key in vertex_coord_map:
-                continue
-            x, y, z = param_to_world_cyl((u, v, w), cx_cyl, cz_cyl, R0)
-            # Undo the initial Y shift so we are back in original STL frame
-            y -= y_offset
-            vertex_coord_map[key] = (x, y, z)
-
-    log(f"[FFD] Total unique bbox lattice nodes: {len(vertex_coord_map)}")
-
-    # Pack into target control-points array (curved lattice)
-    ctrl_points = np.zeros((nx, ny, nz, 3), dtype=float)
-
-    for (gx, gy, gz), (x, y, z) in vertex_coord_map.items():
-        i = gx - ix_min
-        j = gy - iy_min
-        k = gz - iz_min
-        ctrl_points[i, j, k, :] = (x, y, z)
-
-    # --- 3) Define FFD box to span these target ctrl_points ---
-    xs = ctrl_points[..., 0]
-    ys = ctrl_points[..., 1]
-    zs = ctrl_points[..., 2]
-
-    x_min = float(xs.min())
-    x_max = float(xs.max())
-    y_min = float(ys.min())
-    y_max = float(ys.max())
-    z_min = float(zs.min())
-    z_max = float(zs.max())
+    x_min = min(v[0] for v in vertices_bbox)
+    x_max = max(v[0] for v in vertices_bbox)
+    y_min = min(v[1] for v in vertices_bbox)
+    y_max = max(v[1] for v in vertices_bbox)
+    z_min = min(v[2] for v in vertices_bbox)
+    z_max = max(v[2] for v in vertices_bbox)
 
     Lx = x_max - x_min
     Ly = y_max - y_min
     Lz = z_max - z_min
-
-    # Tiny epsilons in case something degenerates
-    eps = 1e-12
-    if Lx < eps: Lx = eps
-    if Ly < eps: Ly = eps
-    if Lz < eps: Lz = eps
 
     # --- 4) Create PyGeM FFD with classic interface ---
     ffd = FFD(n_control_points=[nx, ny, nz])
@@ -1776,54 +1882,100 @@ def build_curved_ffd_from_bbox_voxels(
     ffd.box_length[:] = np.array([Lx, Ly, Lz], dtype=float)
     ffd.rot_angle[:] = np.array([0.0, 0.0, 0.0], dtype=float)
 
-    if hasattr(ffd, "reset_weights"):
-        ffd.reset_weights()
-    else:
-        ffd.array_mu_x[:] = 0.0
-        ffd.array_mu_y[:] = 0.0
-        ffd.array_mu_z[:] = 0.0
+    export_ffd_to_ply(
+        ffd=ffd,
+        output_ply="OUTPUT\CSC16_U00P_" + "_lattice1_base.ply",
+    )
+    export_ffd_lattice_json(ffd, "OUTPUT\CSC16_U00P_" + "_json_lattice1_base.json")
 
-    # --- 5) Compute base grid positions and mu so ctrl_points == curved lattice ---
+    for v in vertices_bbox:
+        print(f"({v[0]},{v[1]},{v[2]})")
+    
+    print("-------------")
 
-    # Precompute param positions along each axis (0..1)
-    if nx > 1:
-        alphas = np.linspace(0.0, 1.0, nx)
-    else:
-        alphas = np.zeros(1)
-    if ny > 1:
-        betas = np.linspace(0.0, 1.0, ny)
-    else:
-        betas = np.zeros(1)
-    if nz > 1:
-        gammas = np.linspace(0.0, 1.0, nz)
-    else:
-        gammas = np.zeros(1)
+    retarget_ffd_to_bbox_vertices(vertices_bbox, vertex_index_map_bbox, ffd)
+    for nid, bbox_v, ffd_pos, ffd_disp in traverse_bbox_and_ffd_in_same_order(
+        vertices_bbox,
+        vertex_index_map_bbox,
+        ffd,
+    ):
+        # log(f"vh: {nid} {bbox_v} {ffd_pos} {ffd_disp}")
+        print(f"({ffd_pos[0]},{ffd_pos[1]},{ffd_pos[2]})")
+        # print(f"({ffd_disp[0]},{ffd_disp[1]},{ffd_disp[2]})")
 
-    # We'll fill array_mu_x/y/z so that:
-    #   base + mu * L = target_ctrl
+    return ffd
+
+
+def export_ffd_to_ply(
+    ffd,
+    output_ply: str,
+):
+    """
+    Export PyGeM FFD lattice control points as a PLY point cloud.
+
+    - Computes full control point world coordinates:
+          pos = box_origin + t * box_length + mu
+    - Works with FFD objects containing:
+          n_control_points
+          box_origin
+          box_length
+          array_mu_x/y/z
+
+    Output:
+        A PLY file containing one point per control lattice vertex.
+    """
+
+    import numpy as np
+    import os
+    import trimesh
+
+    # Extract FFD grid resolution
+    nx, ny, nz = ffd.n_control_points
+    ox, oy, oz = map(float, ffd.box_origin)
+    lx, ly, lz = map(float, ffd.box_length)
+
+    # Allocate array for full control point positions
+    ctrl_points = np.zeros((nx, ny, nz, 3), dtype=float)
+
     for i in range(nx):
-        alpha = alphas[i]
-        base_x = x_min + alpha * Lx
+        tx = 0.0 if nx == 1 else i / (nx - 1)
         for j in range(ny):
-            beta = betas[j]
-            base_y = y_min + beta * Ly
+            ty = 0.0 if ny == 1 else j / (ny - 1)
             for k in range(nz):
-                gamma = gammas[k]
-                base_z = z_min + gamma * Lz
+                tz = 0.0 if nz == 1 else k / (nz - 1)
 
-                tx, ty, tz = ctrl_points[i, j, k, :]
+                # Base position from the FFD box
+                base_x = ox + tx * lx
+                base_y = oy + ty * ly
+                base_z = oz + tz * lz
 
-                ffd.array_mu_x[i, j, k] = (tx - base_x) / Lx
-                ffd.array_mu_y[i, j, k] = (ty - base_y) / Ly
-                ffd.array_mu_z[i, j, k] = (tz - base_z) / Lz
+                # Add FFD displacement
+                dx = float(ffd.array_mu_x[i, j, k])
+                dy = float(ffd.array_mu_y[i, j, k])
+                dz = float(ffd.array_mu_z[i, j, k])
+
+                ctrl_points[i, j, k, 0] = base_x + dx
+                ctrl_points[i, j, k, 1] = base_y + dy
+                ctrl_points[i, j, k, 2] = base_z + dz
+
+    # Flatten (nx, ny, nz, 3) -> (N, 3)
+    verts = ctrl_points.reshape(-1, 3)
+
+    # Create point cloud
+    pc = trimesh.points.PointCloud(verts)
+
+    # Ensure output directory exists
+    out_dir = os.path.dirname(os.path.abspath(output_ply))
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    # Export PLY
+    pc.export(output_ply)
 
     log(
-        f"[FFD] Curved FFD lattice built via mu arrays: "
-        f"ctrl_points shape={ctrl_points.shape}, "
-        f"box_origin={ffd.box_origin}, box_length={ffd.box_length}"
+        f"[PLY] FFD lattice points exported: {output_ply} "
+        f"(nx,ny,nz)=({nx},{ny},{nz}), total={verts.shape[0]}"
     )
-
-    return ffd, ctrl_points, (nx, ny, nz), (ix_min, iy_min, iz_min)
 
 
 def export_ffd_lattice_points_to_ply(
@@ -1865,31 +2017,32 @@ def export_ffd_lattice_points_to_ply(
     )
 
 
-def deform_bbox_ffd_ctrl_points_from_voxel_displacements(
-    ctrl_points: np.ndarray,
+def deform_bbox_ffd_from_voxel_displacements(
+    ffd,
     vertices: List[Tuple[float, float, float]],
     displacements: Dict[int, Tuple[float, float, float]],
     tol: float = 1e-6,
-) -> np.ndarray:
+) -> None:
     """
     Given:
-      - ctrl_points: (nx, ny, nz, 3) FFD lattice (bbox, undeformed, world coords)
-      - vertices:    list of voxel-mesh node coords (world coords), index = nid-1
-      - displacements: dict {node_id -> (ux, uy, uz)}
+      - ffd: PyGeM FFD object with fields:
+            n_control_points (nx, ny, nz)
+            box_origin (3,)
+            box_length (3,)
+            array_mu_x, array_mu_y, array_mu_z (nx, ny, nz)
+      - vertices: list of voxel-mesh node coords (world coords), index = nid-1
+      - displacements: dict {node_id -> (ux, uy, uz)} from FRD
         (node_id starts from 1, as in your existing code)
-    
-    Return:
-      - ctrl_points_def: (nx, ny, nz, 3) deformed FFD control points where
-        control points that coincide with voxel nodes get the same displacement.
-    
-    Points that do not have a matching voxel node remain unchanged.
-    """
-    if ctrl_points.ndim != 4 or ctrl_points.shape[3] != 3:
-        raise ValueError(
-            f"ctrl_points must have shape (nx, ny, nz, 3), got {ctrl_points.shape}"
-        )
 
-    nx, ny, nz, _ = ctrl_points.shape
+    Effect:
+      - Modifies ffd.array_mu_x / array_mu_y / array_mu_z in-place so that
+        control points that coincide with voxel nodes get the same displacement.
+      - Control points which do not coincide with voxel nodes are left unchanged.
+    """
+
+    if tol <= 0.0:
+        raise ValueError(f"tol must be > 0, got {tol}")
+
     inv_tol = 1.0 / float(tol)
 
     # ------------------------------------------------------------
@@ -1907,8 +2060,7 @@ def deform_bbox_ffd_ctrl_points_from_voxel_displacements(
             int(round(y * inv_tol)),
             int(round(z * inv_tol)),
         )
-        # If duplicates occur (they shouldn't), last one wins; that's fine here.
-        node_map[key] = u
+        node_map[key] = u  # if duplicates, last wins (fine here)
 
     log(
         f"[FFD-DEF] Built voxel-node displacement map: {len(node_map)} entries "
@@ -1916,16 +2068,38 @@ def deform_bbox_ffd_ctrl_points_from_voxel_displacements(
     )
 
     # ------------------------------------------------------------
-    # 2) Apply displacements where ctrl_points coincide with voxel nodes
+    # 2) Loop over all FFD control points, match them to nodes and
+    #    update array_mu_* in-place.
     # ------------------------------------------------------------
-    ctrl_points_def = ctrl_points.copy()
-    total_ctrl = nx * ny * nz
+    nx, ny, nz = ffd.n_control_points
+    ox, oy, oz = map(float, ffd.box_origin)
+    lx, ly, lz = map(float, ffd.box_length)
+
     matched = 0
+    total_ctrl = nx * ny * nz
 
     for i in range(nx):
+        tx = 0.0 if nx == 1 else i / (nx - 1)
+        base_x = ox + tx * lx
+
         for j in range(ny):
+            ty = 0.0 if ny == 1 else j / (ny - 1)
+            base_y = oy + ty * ly
+
             for k in range(nz):
-                x, y, z = ctrl_points[i, j, k, :]
+                tz = 0.0 if nz == 1 else k / (nz - 1)
+                base_z = oz + tz * lz
+
+                # Current displacement at this control point
+                dx = float(ffd.array_mu_x[i, j, k])
+                dy = float(ffd.array_mu_y[i, j, k])
+                dz = float(ffd.array_mu_z[i, j, k])
+
+                # Current world position of control point
+                x = base_x + dx
+                y = base_y + dy
+                z = base_z + dz
+
                 key = (
                     int(round(x * inv_tol)),
                     int(round(y * inv_tol)),
@@ -1936,120 +2110,75 @@ def deform_bbox_ffd_ctrl_points_from_voxel_displacements(
                     continue
 
                 ux, uy, uz = u
-                ctrl_points_def[i, j, k, 0] = x + ux
-                ctrl_points_def[i, j, k, 1] = y + uy
-                ctrl_points_def[i, j, k, 2] = z + uz
+
+                # Apply voxel-node displacement to this control point:
+                #   new_pos = old_pos + u
+                #   => (base + mu_new) = (base + mu_old) + u
+                #   => mu_new = mu_old + u
+                ffd.array_mu_x[i, j, k] = dx + ux
+                ffd.array_mu_y[i, j, k] = dy + uy
+                ffd.array_mu_z[i, j, k] = dz + uz
+
                 matched += 1
 
     log(
-        f"[FFD-DEF] Deformed bbox FFD ctrl points: "
+        f"[FFD-DEF] Deformed bbox FFD (in-place): "
         f"matched {matched} / {total_ctrl} control points to voxel nodes."
     )
 
-    return ctrl_points_def
 
+import os
+import json
+import numpy as np
 
-def export_three_bbox_ffd_lattices_json(
-    ffd_bbox,
-    ctrl_points_curved: np.ndarray,
-    ctrl_points_deformed: np.ndarray,
-    out_prefix: str,
+def export_ffd_lattice_json(
+    ffd,
+    out_path: str,
 ):
     """
-    Export three FFD lattices as JSON:
+    Export a single PyGeM FFD object as JSON.
 
-      1) Non-curved (rectangular) bbox FFD lattice with correct dimensions.
-      2) Curved bbox FFD lattice (ctrl_points_curved).
-      3) Deformed bbox FFD lattice (ctrl_points_deformed).
+    JSON format (matches load_ffd helper):
 
-    JSON format:
       {
-        "nx": nx,
-        "ny": ny,
-        "nz": nz,
-        "points": [[[[x,y,z], ...], ...], ...]
+        "nx": int,
+        "ny": int,
+        "nz": int,
+        "box_origin": [ox, oy, oz],
+        "box_length": [lx, ly, lz],
+        "mu_x": [[[...]], ...],   # shape (nx, ny, nz)
+        "mu_y": [[[...]], ...],
+        "mu_z": [[[...]], ...]
       }
     """
 
-    if ctrl_points_curved.shape != ctrl_points_deformed.shape:
-        raise ValueError(
-            f"Curved and deformed lattices must have same shape, "
-            f"got {ctrl_points_curved.shape} vs {ctrl_points_deformed.shape}"
-        )
+    # Extract sizes
+    nx, ny, nz = ffd.n_control_points
 
-    if ctrl_points_curved.ndim != 4 or ctrl_points_curved.shape[3] != 3:
-        raise ValueError(
-            f"ctrl_points_curved must have shape (nx, ny, nz, 3), "
-            f"got {ctrl_points_curved.shape}"
-        )
+    data = {
+        "nx": int(nx),
+        "ny": int(ny),
+        "nz": int(nz),
+        "box_origin": [float(v) for v in ffd.box_origin],
+        "box_length": [float(v) for v in ffd.box_length],
+        "mu_x": np.array(ffd.array_mu_x, dtype=float).tolist(),
+        "mu_y": np.array(ffd.array_mu_y, dtype=float).tolist(),
+        "mu_z": np.array(ffd.array_mu_z, dtype=float).tolist(),
+    }
 
-    nx, ny, nz, _ = ctrl_points_curved.shape
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
 
-    # 1) Build non-curved base lattice from ffd_bbox box_origin/box_length
-    x_min, y_min, z_min = [float(v) for v in ffd_bbox.box_origin]
-    Lx, Ly, Lz = [float(v) for v in ffd_bbox.box_length]
-
-    base_ctrl = np.zeros_like(ctrl_points_curved, dtype=float)
-
-    # Parameters along each axis in [0,1]
-    if nx > 1:
-        alphas = np.linspace(0.0, 1.0, nx)
-    else:
-        alphas = np.zeros(1)
-    if ny > 1:
-        betas = np.linspace(0.0, 1.0, ny)
-    else:
-        betas = np.zeros(1)
-    if nz > 1:
-        gammas = np.linspace(0.0, 1.0, nz)
-    else:
-        gammas = np.zeros(1)
-
-    for i in range(nx):
-        alpha = alphas[i]
-        base_x = x_min + alpha * Lx
-        for j in range(ny):
-            beta = betas[j]
-            base_y = y_min + beta * Ly
-            for k in range(nz):
-                gamma = gammas[k]
-                base_z = z_min + gamma * Lz
-                base_ctrl[i, j, k, :] = (base_x, base_y, base_z)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
 
     log(
-        f"[FFD-EXPORT] Base lattice built from ffd_bbox: "
-        f"box_origin=({x_min:.6f},{y_min:.6f},{z_min:.6f}), "
-        f"box_length=({Lx:.6f},{Ly:.6f},{Lz:.6f}), "
+        f"[FFD-EXPORT] FFD lattice exported to {out_path} "
         f"(nx,ny,nz)=({nx},{ny},{nz})"
     )
 
-    # Helper to dump a single lattice
-    def _dump_lattice(ctrl_pts: np.ndarray, path: str):
-        data = {
-            "nx": nx,
-            "ny": ny,
-            "nz": nz,
-            "points": ctrl_pts.tolist(),
-        }
-        out_dir = os.path.dirname(os.path.abspath(path))
-        if out_dir and not os.path.exists(out_dir):
-            os.makedirs(out_dir, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        log(
-            f"[FFD-EXPORT] Lattice exported to {path} "
-            f"(nx,ny,nz)=({nx},{ny},{nz})"
-        )
-
-    base_path     = f"{out_prefix}_lattice1_base.json"
-    curved_path   = f"{out_prefix}_lattice2_curved.json"
-    deformed_path = f"{out_prefix}_lattice3_deformed.json"
-
-    _dump_lattice(base_ctrl,          base_path)
-    _dump_lattice(ctrl_points_curved, curved_path)
-    _dump_lattice(ctrl_points_deformed, deformed_path)
-
-    return base_path, curved_path, deformed_path
+    return out_path
 
 
 # ============================================================
@@ -2152,22 +2281,26 @@ def main():
         z_slices_bbox,
         indices_bbox_sorted, # for BBOX debug export
         vox_bbox,            # for BBOX debug export
+        vertex_index_map_bbox,
     ) = generate_global_cubic_hex_mesh(
         args.input_stl,
         args.cube_size,
         cyl_radius=args.cyl_radius,
     )
 
-    ffd_bbox, ctrl_pts_bbox, (nx, ny, nz), index_base = build_curved_ffd_from_bbox_voxels(
+    ffd_bbox = build_curved_ffd_from_bbox_voxels(
         indices_bbox_sorted=indices_bbox_sorted,
         vox_bbox=vox_bbox,
         cube_size=args.cube_size,
         cyl_params=cyl_params,
+        vertices_bbox=vertices_bbox,
+        vertex_index_map_bbox=vertex_index_map_bbox,
     )
-    export_ffd_lattice_points_to_ply(
-        ctrl_points=ctrl_pts_bbox,
-        output_ply=basepath + "_bbox_ffd_points.ply",
+    export_ffd_to_ply(
+        ffd=ffd_bbox,
+        output_ply=basepath + "_lattice2_curved.ply",
     )
+    export_ffd_lattice_json(ffd_bbox, basepath + "_json_lattice2_curved.json")
 
     # --- Export voxel debug STL ---
     export_voxel_debug_stl(
@@ -2189,7 +2322,7 @@ def main():
         slice_to_eids,
         z_slices,
         shrinkage_curve=[5, 4, 3, 2, 1],
-        cure_shrink_per_unit=0.3,  # 3%
+        cure_shrink_per_unit=0.003,  # 3%
         output_stride=args.output_stride,
     )
 
@@ -2202,22 +2335,17 @@ def main():
 
         utd_frd = utd_job + ".frd"
         displacements = read_frd_displacements(utd_frd)
-        ctrl_pts_bbox_def = deform_bbox_ffd_ctrl_points_from_voxel_displacements(
-            ctrl_points=ctrl_pts_bbox,
+        deform_bbox_ffd_from_voxel_displacements(
+            ffd=ffd_bbox,
             vertices=vertices,
             displacements=displacements,
             tol=1e-6,
         )
-        export_ffd_lattice_points_to_ply(
-            ctrl_points=ctrl_pts_bbox_def,
-            output_ply=basepath + "_bbox_ffd_def.ply",
+        export_ffd_to_ply(
+            ffd=ffd_bbox,
+            output_ply=basepath + "_lattice3_deformed.ply",
         )
-        base_json, curved_json, def_json = export_three_bbox_ffd_lattices_json(
-            ffd_bbox=ffd_bbox,
-            ctrl_points_curved=ctrl_pts_bbox,
-            ctrl_points_deformed=ctrl_pts_bbox_def,
-            out_prefix=basepath + "_json",
-        )
+        export_ffd_lattice_json(ffd_bbox, basepath + "_json_lattice3_deformed.json")
 
         # if os.path.isfile(utd_frd):
         #     deformed_stl = basepath + "_deformed.stl"
