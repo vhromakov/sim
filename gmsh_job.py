@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 """
 STL -> cylindrical voxel C3D8R hex mesh -> uncoupled thermo-mechanical CalculiX job
-+ FFD deformation of the original STL using PyGeM (forward + pre-deformed)
-+ optional lattice visualization as separate PLY point clouds.
++ optional Gmsh per-layer tet remesh
++ optional voxel debug STL.
 
 Pipeline (cylindrical workflow only):
 
 1. Voxelize input STL into cubes of size cube_size in cylindrical param space.
 2. Map cubes to curved C3D8R hexes on a cylinder (axis = global +Y).
-3. Single CalculiX job:
+3. Optionally: for each voxel slice, build a surface mesh (triangulated cubes)
+   and let Gmsh volumetrically remesh that slice into tetrahedra, then stack
+   all slices into a global C3D4 mesh.
+4. Single CalculiX job:
    - Procedure: *UNCOUPLED TEMPERATURE-DISPLACEMENT
    - One step per radial slice:
        * Apply curing (via TEMP DOF) to that slice's NSET.
-       * Base nodes (outer radial face of first radial slice) mechanically fixed.
+       * Base nodes (first slice) mechanically fixed.
        * Temperatures and displacements carry over between steps.
-4. If --run-ccx:
-   - Run the thermo-mechanical job -> <job_name>_utd.frd
-   - Read nodal displacements from that .frd
-   - Build PyGeM FFD lattice matching voxel grid
-   - forward:  deform input STL -> <job_name>_deformed.stl  (PyGeM)
-   - inverse: pre-deform STL   -> <job_name>_deformed_pre.stl  (by flipping FFD control weights)
-   - if --export-lattice:
-        * <job_name>_lattice_orig.ply  (original lattice nodes)
-        * <job_name>_lattice_def.ply   (deformed lattice nodes)
 """
 
 import argparse
@@ -33,12 +27,8 @@ import math
 import numpy as np
 import trimesh
 import subprocess
-from pygem import FFD
+from pygem import FFD  # unused here but kept for compatibility with other variants
 from datetime import datetime
-
-import os
-import json
-import numpy as np
 
 
 def log(msg):
@@ -47,7 +37,7 @@ def log(msg):
 
 
 # ============================================================
-#  Cylindrical mapping helpers (copied from gen_grid.py)
+#  Cylindrical mapping helpers
 # ============================================================
 
 def world_to_param_cyl(
@@ -56,30 +46,15 @@ def world_to_param_cyl(
     cz: float,
     R0: float,
 ):
-    """
-    Map world coordinates (x, y, z) to cylindrical param space (u, v, w).
-
-    Cylinder axis is along global Y and centered at (cx, cz) in XZ plane.
-    R0 is the base cylinder radius used for angular mapping.
-
-    Returns:
-        (u, v, w)
-        u: coordinate along cylinder axis (Y)
-        v: arc length along circumference (R0 * angle)
-        w: radial offset from base cylinder (r - R0)
-    """
     x, y, z = point
     dx = x - cx
     dz = z - cz
 
     u = y
     r = math.sqrt(dx * dx + dz * dz)
-
     theta = math.atan2(dz, dx)
-
     v = R0 * theta
     w = r - R0
-
     return (u, v, w)
 
 
@@ -89,33 +64,18 @@ def param_to_world_cyl(
     cz: float,
     R0: float,
 ):
-    """
-    Map param space point (u, v, w) back to world (x, y, z)
-    using the same cylinder definition.
-
-    Args:
-        param_point: (u, v, w)
-        cx, cz: cylinder center in XZ plane
-        R0: base radius used for angular mapping
-
-    Returns:
-        (x, y, z)
-    """
     u, v, w = param_point
-
     theta = v / R0
     r = R0 + w
 
     x = cx + r * math.cos(theta)
     y = u
     z = cz + r * math.sin(theta)
-
     return (x, y, z)
 
 
 # ============================================================
-#  Voxel mesh -> CalculiX job (cylindrical only, rewritten
-#  around gen_grid.py voxelization pipeline)
+#  Voxel mesh -> CalculiX job (cylindrical only)
 # ============================================================
 
 def generate_global_cubic_hex_mesh(
@@ -123,29 +83,12 @@ def generate_global_cubic_hex_mesh(
     cube_size: float,
     cyl_radius: float,
 ):
-    """
-    Voxelize input_stl in cylindrical param space and build a global C3D8R brick mesh
-    mapped onto a cylinder (curved voxels).
-
-    - Cylinder axis is global +Y.
-    - Cylinder center (cx, cz) chosen so that the lowest-Z vertex defines cx,
-      and cz is either derived from cyl_radius (lowest point lies on that circle)
-      or from bbox center if radius is not given.
-    - The effective mapping radius R0 is:
-          R0 = R_true + cube_size / 2 + inward_offset
-      where:
-          R_true = distance from cylinder center to lowest point
-          inward_offset = sagitta so that midpoint of a 1-voxel chord lies on R0.
-    - We rotate the mesh in param space so that the lowest point ends up at angle 0
-      (v=0), then undo this rotation when mapping voxels back to world.
-    """
-
     mesh = trimesh.load(input_stl)
 
     log(f"[VOXEL] Loaded mesh from {input_stl}")
     log(f"[VOXEL] Watertight: {mesh.is_watertight}, bbox extents: {mesh.extents}")
 
-    # vh: Move mesh on Y axis (goes from us to depth of cylinder) so its in the middle of Y voxels
+    # vh: Move mesh on Y axis so its in the middle of Y voxels
     bounds_orig = mesh.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]
     x_min_o, y_min_o, z_min_o = bounds_orig[0]
     x_max_o, y_max_o, z_max_o = bounds_orig[1]
@@ -155,7 +98,6 @@ def generate_global_cubic_hex_mesh(
     reminder = (ceil_cubes - float_cubes) / 2
     y_offset = -float(y_min_o) - cube_size / 2 + (reminder * cube_size)
     mesh.apply_translation([0.0, y_offset, 0.0])
-    # vh: ---
 
     # Bounds in voxelization world space (shifted STL)
     bounds = mesh.bounds  # [[xmin,ymin,zmin], [xmax,ymax,zmax]]
@@ -190,11 +132,8 @@ def generate_global_cubic_hex_mesh(
     # Use lowest point X as cylinder center X
     cx_cyl = float(x_low)
 
-    # Decide CZ (and possibly initial "design" radius) to place the axis
-    base_radius: Optional[float] = None  # design radius tied to lowest point
-
-    # User-provided radius: we'll place the axis so that the lowest point
-    # lies exactly on this circle.
+    # Decide CZ to place the axis so that lowest point lies on given circle
+    base_radius: Optional[float] = None
     base_radius = float(cyl_radius)
     z_center_bbox = 0.5 * (z_min_w + z_max_w)
     cz_plus = z_low + base_radius
@@ -273,14 +212,11 @@ def generate_global_cubic_hex_mesh(
     # Compute effective mapping radius R0
     # ------------------------------------------------------------
     R_true = r_lowest  # should equal base_radius numerically
-
     half = cube_size * 0.5
 
-    # vh: Rize model up, because having it on radius will make bottom layer voxels be on the middle of bottom plane
     inward_offset = R_true - math.sqrt(R_true * R_true - half * half)
     total_offset = cube_size / 2 + cube_size / 5  # vh: or inward_offset
     R0_param = R_true + total_offset
-    # vh: ---
 
     # Final cylinder mapping radius
     R0 = float(R0_param)
@@ -289,15 +225,14 @@ def generate_global_cubic_hex_mesh(
         f"center=({cx_cyl:.3f}, {cz_cyl:.3f}), R0={R0:.6f}"
     )
 
-    # vh: Here we rotate the model on X axis to make it be in the middle of voxels on X
+    # vh: tangential voxel alignment
     theta_cube_size = cube_size / R0
     theta_length = float(dtheta_all[idx_right] - dtheta_all[idx_left])
     float_cubes = theta_length / theta_cube_size
     ceil_cubes = math.ceil(float_cubes)
     reminder = (ceil_cubes - float_cubes) / 2
     log(f"vh2 {theta_cube_size} {theta_length} {float_cubes} {ceil_cubes} {reminder} {theta_leftmost}")
-    theta_leftmost = theta_leftmost  # ??? + theta_cube_size / 2 - (reminder * theta_cube_size)
-    # vh: ---
+    theta_leftmost = theta_leftmost
 
     theta_ref = theta_leftmost
     v_ref = R0 * theta_ref
@@ -322,9 +257,8 @@ def generate_global_cubic_hex_mesh(
             R0,
         )
 
-    # Apply tangential rotation so the lowest point gets v=0 in param space
+    # Apply tangential rotation so left-most point gets v=0 in param space
     verts_param[:, 1] += v_offset
-
     mesh.vertices = verts_param
 
     # ----------------------------------------------------------
@@ -346,12 +280,12 @@ def generate_global_cubic_hex_mesh(
     ])
 
     bbox_faces = np.array([
-        [0, 1, 2], [0, 2, 3],  # bottom
-        [4, 5, 6], [4, 6, 7],  # top
-        [0, 1, 5], [0, 5, 4],  # side
-        [1, 2, 6], [1, 6, 5],  # side
-        [2, 3, 7], [2, 7, 6],  # side
-        [3, 0, 4], [3, 4, 7],  # side
+        [0, 1, 2], [0, 2, 3],
+        [4, 5, 6], [4, 6, 7],
+        [0, 1, 5], [0, 5, 4],
+        [1, 2, 6], [1, 6, 5],
+        [2, 3, 7], [2, 7, 6],
+        [3, 0, 4], [3, 4, 7],
     ])
 
     bbox_mesh_param = trimesh.Trimesh(
@@ -375,7 +309,7 @@ def generate_global_cubic_hex_mesh(
     vox = mesh.voxelized(pitch=cube_size)
     vox.fill()
 
-    indices = vox.sparse_indices  # (N,3) with (ix,iy,iz) in param grid
+    indices = vox.sparse_indices  # (N,3) with (ix,iy,iz)
     total_voxels = indices.shape[0]
     log(f"[VOXEL] Total filled voxels (STL cubes): {total_voxels}")
 
@@ -398,8 +332,8 @@ def generate_global_cubic_hex_mesh(
     layer_info: List[Tuple[int, float]] = []
     for iz in unique_iz:
         idx_arr = np.array([[0, 0, iz]], dtype=float)
-        pt = vox.indices_to_points(idx_arr)[0]  # in param coordinates
-        slice_coord = float(pt[2])  # w in cylindrical param space
+        pt = vox.indices_to_points(idx_arr)[0]
+        slice_coord = float(pt[2])
         layer_info.append((int(iz), slice_coord))
 
     layer_info.sort(key=lambda x: x[1], reverse=True)
@@ -427,7 +361,7 @@ def generate_global_cubic_hex_mesh(
         iz_to_slice_bbox[int(iz)] = slice_idx
         z_slices_bbox.append(pos)
 
-    # --- Prepare lattice structures (STL) ---
+    # --- Build voxel-node lattice & hex connectivity (STL) ---
     vertex_index_map: Dict[Tuple[int, int, int], int] = {}
     vertices: List[Tuple[float, float, float]] = []
     hexes: List[Tuple[int, int, int, int, int, int, int, int]] = []
@@ -444,7 +378,7 @@ def generate_global_cubic_hex_mesh(
         vertices.append(coord)
         return idx
 
-    # --- Prepare lattice structures (BBOX) ---
+    # --- Build voxel-node lattice & hex connectivity (BBOX) ---
     vertex_index_map_bbox: Dict[Tuple[int, int, int], int] = {}
     vertices_bbox: List[Tuple[float, float, float]] = []
     hexes_bbox: List[Tuple[int, int, int, int, int, int, int, int]] = []
@@ -463,8 +397,9 @@ def generate_global_cubic_hex_mesh(
         vertices_bbox.append(coord)
         return idx
 
-    # --- Build voxel-node lattice & hex connectivity (STL) ---
     log("[VOXEL] Building voxel-node lattice (curved hexa nodes) for STL ...")
+
+    half = cube_size * 0.5
 
     for (ix, iy, iz) in indices_sorted:
         center_param = vox.indices_to_points(
@@ -472,7 +407,6 @@ def generate_global_cubic_hex_mesh(
         )[0]
         u_c, v_c, w_c = center_param
 
-        # Undo the tangential rotation before mapping back to world
         v_c -= v_offset
 
         u0, u1 = u_c - half, u_c + half
@@ -513,7 +447,6 @@ def generate_global_cubic_hex_mesh(
         slice_idx = iz_to_slice[int(iz)]
         slice_to_eids[slice_idx].append(eid)
 
-    # --- Build voxel-node lattice & hex connectivity (BBOX) ---
     log("[VOXEL] Building voxel-node lattice (curved hexa nodes) for BBOX ...")
 
     for (ix, iy, iz) in indices_bbox_sorted:
@@ -522,7 +455,6 @@ def generate_global_cubic_hex_mesh(
         )[0]
         u_c, v_c, w_c = center_param
 
-        # Undo the tangential rotation before mapping back to world
         v_c -= v_offset
 
         u0, u1 = u_c - half, u_c + half
@@ -563,7 +495,6 @@ def generate_global_cubic_hex_mesh(
         slice_idx = iz_to_slice_bbox[int(iz)]
         slice_to_eids_bbox[slice_idx].append(eid)
 
-    # Store cylindrical parameters + v_offset + y_offset
     cyl_params = (cx_cyl, cz_cyl, R0, v_offset, y_offset)
 
     log(
@@ -601,15 +532,10 @@ def generate_global_cubic_hex_mesh(
     )
 
     indices_bbox_sorted = indices_bbox_sorted[:, [1, 0, 2]]
-    # indices_bbox_sorted = indices_bbox_sorted[::-1]
     vertex_index_map_bbox = {
         (iy, ix, iz): idx
         for (ix, iy, iz), idx in vertex_index_map_bbox.items()
     }
-    # vertex_index_map_bbox = {
-    #     k: vertex_index_map_bbox[k]
-    #     for k in reversed(list(vertex_index_map_bbox.keys()))
-    # }
 
     return (
         # STL mesh results
@@ -636,230 +562,433 @@ def generate_global_cubic_hex_mesh(
     )
 
 
-from typing import Dict, Tuple, List, Iterable
-from typing import Dict, Tuple, List
+# ============================================================
+#  Gmsh per-layer remesh helpers
+# ============================================================
 
-
-def remesh_with_gmsh(
-    vertices: List[Tuple[float, float, float]],
-    hexes: List[Tuple[int, int, int, int, int, int, int, int]],
+def build_layer_trimesh(
+    slice_voxels: List[Tuple[int, int, int]],
+    vox,
+    cube_size: float,
     cyl_params: Tuple[float, float, float, float, float],
-    z_slices: List[float],
-    target_size: Optional[float] = None,
-):
+) -> trimesh.Trimesh:
     """
-    Volumetrically remesh the global voxel mesh with Gmsh.
+    Build ONLY the external surface of a voxel layer:
+    - For each voxel, check 6 neighbors.
+    - Emit a face only if the neighbor in that direction is absent.
+    => no internal faces, so no overlapping facets in the boundary mesh.
+    """
+    cx, cz, R0, v_offset, y_offset = cyl_params
+    half = cube_size * 0.5
 
-    - Treats the voxel mesh as a discrete 3D model (single volume entity).
-    - Calls gmsh.model.mesh.refine() once (uniform refinement).
-    - Assumes elements stay 8-node hexahedra.
-    - Rebuilds slice_to_eids by assigning each new element to the
-      nearest original slice in cylindrical param space (w coordinate).
+    slice_set: Set[Tuple[int, int, int]] = set(
+        (int(ix), int(iy), int(iz)) for (ix, iy, iz) in slice_voxels
+    )
+
+    vertices: List[Tuple[float, float, float]] = []
+    faces: List[Tuple[int, int, int]] = []
+
+    # Neighbor directions in index-space
+    neighbor_dirs = {
+        "xm": (-1, 0, 0),
+        "xp": (1, 0, 0),
+        "ym": (0, -1, 0),
+        "yp": (0, 1, 0),
+        "zm": (0, 0, -1),
+        "zp": (0, 0, 1),
+    }
+
+    # For each face, which 4 corner indices (in the 0..7 cube corner list) form that quad
+    face_quads = {
+        "zm": (0, 1, 2, 3),  # bottom in w-
+        "zp": (4, 5, 6, 7),  # top in w+
+        "xm": (0, 3, 7, 4),
+        "xp": (1, 2, 6, 5),
+        "ym": (0, 1, 5, 4),
+        "yp": (3, 2, 6, 7),
+    }
+
+    for (ix, iy, iz) in slice_voxels:
+        ix = int(ix)
+        iy = int(iy)
+        iz = int(iz)
+
+        center_param = vox.indices_to_points(
+            np.array([[ix, iy, iz]], dtype=float)
+        )[0]
+        u_c, v_c, w_c = center_param
+
+        v_c -= v_offset
+
+        u0, u1 = u_c - half, u_c + half
+        v0, v1 = v_c - half, v_c + half
+        w0, w1 = w_c - half, w_c + half
+
+        corners_param = [
+            (u0, v0, w0),  # 0
+            (u1, v0, w0),  # 1
+            (u1, v1, w0),  # 2
+            (u0, v1, w0),  # 3
+            (u0, v0, w1),  # 4
+            (u1, v0, w1),  # 5
+            (u1, v1, w1),  # 6
+            (u0, v1, w1),  # 7
+        ]
+
+        corners_world = []
+        for p in corners_param:
+            x, y, z = param_to_world_cyl(p, cx, cz, R0)
+            y -= y_offset
+            corners_world.append((x, y, z))
+
+        for face_key, (dx, dy, dz) in neighbor_dirs.items():
+            neigh = (ix + dx, iy + dy, iz + dz)
+            if neigh in slice_set:
+                # Internal face → skip
+                continue
+
+            q = face_quads[face_key]
+            base = len(vertices)
+            # append 4 vertices of this quad
+            for idx in q:
+                vertices.append(corners_world[idx])
+
+            # two triangles: (0,1,2) and (0,2,3) in local quad coords
+            faces.append((base + 0, base + 1, base + 2))
+            faces.append((base + 0, base + 2, base + 3))
+
+    if not vertices or not faces:
+        return trimesh.Trimesh(vertices=[], faces=[],
+                               process=False)
+
+    mesh = trimesh.Trimesh(
+        vertices=np.array(vertices, dtype=float),
+        faces=np.array(faces, dtype=np.int32),
+        process=False,
+    )
+
+    # Cleanup to avoid any lingering duplicates/degenerates
+    try:
+        mesh.remove_duplicate_faces()
+        mesh.remove_degenerate_faces()
+        mesh.remove_unreferenced_vertices()
+    except Exception:
+        pass
+
+    return mesh
+
+
+def gmsh_remesh_layer(
+    layer_mesh: trimesh.Trimesh,
+    target_size: Optional[float],
+) -> Tuple[Optional[List[Tuple[float, float, float]]],
+           Optional[List[Tuple[int, int, int, int]]]]:
     """
+    Use Gmsh to volumetrically remesh a single layer surface mesh into tets.
+
+    Supports multiple disconnected components:
+      - Split the layer mesh into connected components.
+      - Remesh each component separately in Gmsh.
+      - Concatenate nodes/tets with proper index offsets.
+
+    Returns:
+      (vertices_all, tets_all)
+      where node indices in tets_all are 1..len(vertices_all),
+      or (None, None) on failure.
+    """
+    if layer_mesh.is_empty:
+        log("[GMSH] Layer mesh is empty; skipping.")
+        return None, None
 
     try:
         import gmsh
     except ImportError:
-        log("[GMSH] gmsh module not found; skipping remesh and using voxel mesh.")
-        return vertices, hexes, None
+        log("[GMSH] gmsh module not found; cannot remesh layer.")
+        return None, None
 
-    cx, cz, R0, v_offset, y_offset = cyl_params
+    import tempfile
 
-    log("[GMSH] Initializing Gmsh for volumetric remesh...")
-    gmsh.initialize()
-    gmsh.option.setNumber("General.Terminal", 0)
+    def _remesh_one_component(comp: trimesh.Trimesh):
+        """Remesh a single connected component with Gmsh (returns local verts/tets)."""
+        if comp.vertices.size == 0 or comp.faces.size == 0:
+            return None, None
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".stl")
+        os.close(tmp_fd)
+
+        try:
+            comp.export(tmp_path)
+
+            gmsh.initialize()
+            gmsh.option.setNumber("General.Terminal", 0)
+            gmsh.model.add("layer_comp")
+
+            gmsh.merge(tmp_path)
+
+            if target_size is not None and target_size > 0.0:
+                gmsh.option.setNumber("Mesh.MeshSizeMin", target_size)
+                gmsh.option.setNumber("Mesh.MeshSizeMax", target_size)
+
+            angle = 40.0
+            forceParametrizablePatches = False
+            includeBoundary = True
+            curveAngle = 180.0
+
+            gmsh.model.mesh.classifySurfaces(
+                angle * math.pi / 180.0,
+                includeBoundary,
+                forceParametrizablePatches,
+                curveAngle * math.pi / 180.0,
+            )
+            gmsh.model.mesh.createGeometry()
+
+            surfs = gmsh.model.getEntities(2)
+            if surfs is None or len(surfs) == 0:
+                log("[GMSH] Component remesh: no surfaces after classifySurfaces.")
+                return None, None
+
+            surf_tags = [s[1] for s in surfs]
+            sl = gmsh.model.geo.addSurfaceLoop(surf_tags)
+            vol = gmsh.model.geo.addVolume([sl])
+            gmsh.model.geo.synchronize()
+
+            gmsh.model.mesh.generate(3)
+
+            node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+            if node_tags.size == 0:
+                log("[GMSH] Component remesh: no nodes after generate.")
+                return None, None
+
+            tag_to_local: Dict[int, int] = {}
+            vertices_local: List[Tuple[float, float, float]] = [None] * len(node_tags)  # type: ignore
+
+            for i, tag in enumerate(node_tags):
+                x = float(node_coords[3 * i + 0])
+                y = float(node_coords[3 * i + 1])
+                z = float(node_coords[3 * i + 2])
+                idx = i + 1
+                tag_to_local[int(tag)] = idx
+                vertices_local[i] = (x, y, z)
+
+            tet_type = gmsh.model.mesh.getElementType("Tetrahedron", 1)
+            types, elem_tags_list, elem_nodes_list = gmsh.model.mesh.getElements(3, vol)
+
+            if not types:
+                log("[GMSH] Component remesh: no volume elements.")
+                return None, None
+
+            tet_idx = None
+            for i, t in enumerate(types):
+                if t == tet_type:
+                    tet_idx = i
+                    break
+
+            if tet_idx is None:
+                log("[GMSH] Component remesh: no tetrahedron elements.")
+                return None, None
+
+            elem_nodes_flat = elem_nodes_list[tet_idx]
+            if len(elem_nodes_flat) % 4 != 0:
+                log("[GMSH] Component remesh: bad tetra connectivity.")
+                return None, None
+
+            tets_local: List[Tuple[int, int, int, int]] = []
+            for i in range(0, len(elem_nodes_flat), 4):
+                conn_tags = elem_nodes_flat[i:i+4]
+                try:
+                    conn = tuple(tag_to_local[int(t)] for t in conn_tags)
+                except KeyError:
+                    log("[GMSH] Component remesh: unknown node tag in connectivity.")
+                    return None, None
+                tets_local.append(conn)
+
+            return vertices_local, tets_local
+
+        finally:
+            try:
+                gmsh.finalize()
+            except Exception:
+                pass
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
 
     try:
-        gmsh.model.add("voxel_remesh")
+        return _remesh_one_component(layer_mesh)
+    except Exception as e:
+        log(f"[GMSH]   Exception during component remesh: {e}")
+        return None, None
 
-        dim = 3
-        entity_tag = 1
 
-        # IMPORTANT: create a discrete 3D entity (Volume 1) first
-        gmsh.model.addDiscreteEntity(dim, entity_tag)
+# ============================================================
+#  CalculiX runner
+# ============================================================
 
-        # ---- Add nodes to that entity ----
-        n_nodes = len(vertices)
-        node_tags = np.arange(1, n_nodes + 1, dtype=np.int64)
-        coords = []
-        for (x, y, z) in vertices:
-            coords.extend([float(x), float(y), float(z)])
+def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
+    log(f"[RUN] Launching CalculiX: {ccx_cmd} {job_name}")
 
-        gmsh.model.mesh.addNodes(dim, entity_tag, node_tags.tolist(), coords)
+    log_path = f"{job_name}_ccx_output.txt"
+    try:
+        my_env = os.environ.copy()
+        my_env["OMP_NUM_THREADS"] = "6"
+        my_env["OMP_DYNAMIC"] = "FALSE"
 
-        # ---- Add elements (hex8) to that entity ----
-        try:
-            etype_hex = gmsh.model.mesh.getElementType("Hexahedron", 1)
-        except Exception:
-            etype_hex = 5  # typical Gmsh code for 8-node hex
-
-        n_elems = len(hexes)
-        elem_tags = np.arange(1, n_elems + 1, dtype=np.int64)
-        elem_nodes_flat = []
-        for e in hexes:
-            elem_nodes_flat.extend(list(e))
-
-        gmsh.model.mesh.addElements(
-            dim,
-            entity_tag,
-            [etype_hex],
-            [elem_tags.tolist()],
-            [elem_nodes_flat],
-        )
-
-        if target_size is not None and target_size > 0.0:
-            gmsh.option.setNumber("Mesh.MeshSizeMin", target_size)
-            gmsh.option.setNumber("Mesh.MeshSizeMax", target_size)
-            log(f"[GMSH] Target element size set to ~{target_size}")
-
-        log("[GMSH] Refining mesh...")
-        gmsh.model.mesh.refine()
-
-        # ---- Extract remeshed nodes ----
-        node_tags_new, node_coords_new, _ = gmsh.model.mesh.getNodes(dim=dim, tag=entity_tag)
-        if node_tags_new.size == 0:
-            log("[GMSH] No nodes after remesh; using original voxel mesh.")
-            return vertices, hexes, None
-
-        # Build contiguous [1..N] node indices for CalculiX
-        tag_to_new_idx: Dict[int, int] = {}
-        vertices_new: List[Tuple[float, float, float]] = [None] * len(node_tags_new)  # type: ignore
-
-        for i, tag in enumerate(node_tags_new):
-            x = float(node_coords_new[3 * i + 0])
-            y = float(node_coords_new[3 * i + 1])
-            z = float(node_coords_new[3 * i + 2])
-            new_idx = i + 1
-            tag_to_new_idx[int(tag)] = new_idx
-            vertices_new[i] = (x, y, z)
-
-        # ---- Extract remeshed elements ----
-        types, all_elem_tags_new, all_elem_nodes_new = gmsh.model.mesh.getElements(dim, entity_tag)
-        if not types:
-            log("[GMSH] No elements after remesh; using original voxel mesh.")
-            return vertices, hexes, None
-
-        etype_new = types[0]
-        if etype_new != etype_hex:
-            log(
-                f"[GMSH] Remeshed elements are not hex8 (etype={etype_new}); "
-                "skipping remesh and using original voxel mesh."
+        with open(log_path, "w", encoding="utf-8") as logfile:
+            proc = subprocess.Popen(
+                [ccx_cmd, job_name],
+                stdout=logfile,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=my_env
             )
-            return vertices, hexes, None
+    except FileNotFoundError:
+        log(f"[RUN] ERROR: CalculiX command not found: {ccx_cmd}")
+        return False
 
-        elem_nodes_flat_new = all_elem_nodes_new[0]
-        if len(elem_nodes_flat_new) % 8 != 0:
-            log(
-                "[GMSH] Unexpected node count per element after remesh; "
-                "skipping remesh."
-            )
-            return vertices, hexes, None
+    rc = proc.wait()
+    log(f"[RUN] CalculiX completed with return code {rc}")
+    log(f"[RUN] Full output written to: {log_path}")
 
-        n_elems_new = len(elem_nodes_flat_new) // 8
-        hexes_new: List[Tuple[int, int, int, int, int, int, int, int]] = []
+    return rc == 0
 
-        for i in range(n_elems_new):
-            local = elem_nodes_flat_new[8 * i : 8 * (i + 1)]
-            conn = tuple(tag_to_new_idx[int(t)] for t in local)
-            hexes_new.append(conn)
 
-        log(
-            f"[GMSH] Remesh complete: nodes {len(vertices)} -> {len(vertices_new)}, "
-            f"elements {len(hexes)} -> {len(hexes_new)}"
-        )
+def export_voxel_debug_stl(
+    indices_sorted,
+    vox,
+    cube_size,
+    cyl_params,
+    out_path
+):
+    cx, cz, R0, v_offset, y_offset = cyl_params
 
-        # ---- Rebuild slice_to_eids by cylindrical 'w' position ----
-        z_slices_arr = np.array(z_slices, dtype=float)
-        n_slices = len(z_slices)
-        slice_to_eids_new: Dict[int, List[int]] = {i: [] for i in range(n_slices)}
+    half = cube_size / 2.0
+    vertices = []
+    faces = []
 
-        for eid, conn in enumerate(hexes_new, start=1):
-            pts = [vertices_new[nid - 1] for nid in conn]
-            cx_e = sum(p[0] for p in pts) / 8.0
-            cy_e = sum(p[1] for p in pts) / 8.0
-            cz_e = sum(p[2] for p in pts) / 8.0
+    for (ix, iy, iz) in indices_sorted:
+        center_param = vox.indices_to_points(
+            np.array([[ix, iy, iz]], dtype=float)
+        )[0]
+        u_c, v_c, w_c = center_param
 
-            _, _, w = world_to_param_cyl((cx_e, cy_e, cz_e), cx, cz, R0)
-            slice_idx = int(np.argmin(np.abs(z_slices_arr - w)))
-            slice_to_eids_new[slice_idx].append(eid)
+        v_c -= v_offset
 
-        return vertices_new, hexes_new, slice_to_eids_new
+        u0, u1 = u_c - half, u_c + half
+        v0, v1 = v_c - half, v_c + half
+        w0, w1 = w_c - half, w_c + half
 
-    finally:
-        gmsh.finalize()
+        corners = [
+            (u0, v0, w0),
+            (u1, v0, w0),
+            (u1, v1, w0),
+            (u0, v1, w0),
+            (u0, v0, w1),
+            (u1, v0, w1),
+            (u1, v1, w1),
+            (u0, v1, w1),
+        ]
 
+        world = []
+        for p in corners:
+            x, y, z = param_to_world_cyl(p, cx, cz, R0)
+            y = y - y_offset
+            world.append((x, y, z))
+
+        base = len(vertices)
+        vertices.extend(world)
+
+        cube_faces = [
+            (0, 1, 2), (0, 2, 3),
+            (4, 5, 6), (4, 6, 7),
+            (0, 1, 5), (0, 5, 4),
+            (1, 2, 6), (1, 6, 5),
+            (2, 3, 7), (2, 7, 6),
+            (3, 0, 4), (3, 4, 7),
+        ]
+        for (a, b, c) in cube_faces:
+            faces.append((base + a, base + b, base + c))
+
+    vertices_np = np.array(vertices, dtype=float)
+    faces_np = np.array(faces, dtype=np.int32)
+    mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces_np, process=False)
+    mesh.export(out_path)
+    log(f"[VOXDBG] Voxel debug STL written: {out_path}")
+
+
+# ============================================================
+#  CalculiX job writer (supports C3D8R and C3D4)
+# ============================================================
 
 def write_calculix_job(
     path: str,
     vertices: List[Tuple[float, float, float]],
-    hexes: List[Tuple[int, int, int, int, int, int, int, int]],
+    elements: List[Tuple[int, ...]],
     slice_to_eids: Dict[int, List[int]],
     z_slices: List[float],
     shrinkage_curve: List[float],
     cure_shrink_per_unit: float,
     output_stride: int = 1,
 ):
-    """
-    Additive-style uncoupled temperature-displacement job with MODEL CHANGE
-    and incremental curing driven by a per-layer shrinkage curve.
-
-    This version assumes cylindrical voxels: the BASE node set is taken from
-    the outer radial faces (nodes 4..7) of the first radial slice.
-    """
-
     n_nodes = len(vertices)
-    n_elems = len(hexes)
+    n_elems = len(elements)
     n_slices = len(z_slices)
 
-    # simple time scheme: 1.0 per step
     time_per_layer = 1.0
     time_per_layer_step = 1.0
     total_weight = float(sum(shrinkage_curve))
     shrinkage_curve = [float(w) / total_weight for w in shrinkage_curve]
 
-    # ensure sane stride
     if output_stride < 1:
         output_stride = 1
+
+    nen = len(elements[0]) if elements else 0
+    is_tet = nen == 4
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("**\n** Auto-generated incremental-cure shrink job\n**\n")
         f.write("*HEADING\n")
         f.write(
-            "Voxel C3D8R uncoupled temperature-displacement "
-            "(layer-wise MODEL CHANGE + shrinkage-curve-driven curing, cylindrical)\n"
+            "Voxel cylindrical mesh uncoupled temperature-displacement "
+            "(layer-wise MODEL CHANGE + shrinkage-curve-driven curing)\n"
         )
 
-        # -------------------- NODES --------------------
+        # NODES
         f.write("** Nodes +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
         f.write("*NODE\n")
         for i, (x, y, z) in enumerate(vertices, start=1):
             f.write(f"{i}, {x}, {y}, {z}\n")
 
-        # -------------------- ELEMENTS --------------------
+        # ELEMENTS
         f.write("** Elements ++++++++++++++++++++++++++++++++++++++++++++++++\n")
-        f.write("*ELEMENT, TYPE=C3D8R, ELSET=ALL\n")
-        for eid, (n0, n1, n2, n3, n4, n5, n6, n7) in enumerate(hexes, start=1):
-            f.write(
-                f"{eid}, {n0}, {n1}, {n2}, {n3}, "
-                f"{n4}, {n5}, {n6}, {n7}\n"
-            )
+        if is_tet:
+            f.write("*ELEMENT, TYPE=C3D4, ELSET=ALL\n")
+            for eid, (n0, n1, n2, n3) in enumerate(elements, start=1):
+                f.write(f"{eid}, {n0}, {n1}, {n2}, {n3}\n")
+        else:
+            f.write("*ELEMENT, TYPE=C3D8R, ELSET=ALL\n")
+            for eid, (n0, n1, n2, n3, n4, n5, n6, n7) in enumerate(elements, start=1):
+                f.write(
+                    f"{eid}, {n0}, {n1}, {n2}, {n3}, "
+                    f"{n4}, {n5}, {n6}, {n7}\n"
+                )
 
-        # -------------------- SETS --------------------
+        # NODE SETS
         f.write("** Node sets +++++++++++++++++++++++++++++++++++++++++++++++\n")
         f.write("*NSET, NSET=ALLNODES, GENERATE\n")
         f.write(f"1, {n_nodes}, 1\n")
 
-        # We'll define BASE after we build per-slice node sets
         base_nodes: List[int] = []
 
         f.write("** Element + node sets (per slice) +++++++++++++++++++++++++\n")
         slice_names: List[str] = []
         slice_node_ids: Dict[int, List[int]] = {}
 
-        def _write_id_list_lines(f, ids: List[int], per_line: int = 16):
+        def _write_id_list_lines(ff, ids: List[int], per_line: int = 16):
             for i in range(0, len(ids), per_line):
-                chunk = ids[i:i + per_line]
-                f.write(", ".join(str(x) for x in chunk) + "\n")
+                chunk = ids[i:i+per_line]
+                ff.write(", ".join(str(x) for x in chunk) + "\n")
 
         for slice_idx in range(n_slices):
             eids = slice_to_eids.get(slice_idx, [])
@@ -873,17 +1002,15 @@ def write_calculix_job(
                 )
                 continue
 
-            # Element set
             name = f"SLICE_{slice_idx:03d}"
             slice_names.append(name)
             f.write(f"*ELSET, ELSET={name}\n")
             _write_id_list_lines(f, valid_eids)
 
-            # Node set from element connectivity
             nodes_in_slice: Set[int] = set()
             for eid in valid_eids:
-                n0, n1, n2, n3, n4, n5, n6, n7 = hexes[eid - 1]
-                nodes_in_slice.update([n0, n1, n2, n3, n4, n5, n6, n7])
+                conn = elements[eid - 1]
+                nodes_in_slice.update(conn)
 
             node_list = sorted(nodes_in_slice)
             slice_node_ids[slice_idx] = node_list
@@ -892,29 +1019,20 @@ def write_calculix_job(
             f.write(f"*NSET, NSET={nset_name}\n")
             _write_id_list_lines(f, node_list)
 
-        # -------------------- BASE from outer radial faces of first slice ---------------
+        # BASE node set: first slice, all its nodes (for tets and hex)
         existing_slice_idxs = sorted(slice_node_ids.keys())
         if existing_slice_idxs:
             base_slice = existing_slice_idxs[0]
-            base_eids = slice_to_eids.get(base_slice, [])
+            base_nodes = slice_node_ids[base_slice]
 
-            base_node_set: Set[int] = set()
-            for eid in base_eids:
-                n0, n1, n2, n3, n4, n5, n6, n7 = hexes[eid - 1]
-
-                # Cylindrical case: "bottom" = outer radial face (w1) = nodes 4..7
-                base_node_set.update([n4, n5, n6, n7])
-
-            base_nodes = sorted(base_node_set)
-
-            f.write("** Base node set = outer radial faces of first slice +++++++++++++++\n")
+            f.write("** Base node set = first slice nodes ++++++++++++++++++++++\n")
             f.write("*NSET, NSET=BASE\n")
             _write_id_list_lines(f, base_nodes)
         else:
             f.write("** Warning: no slices -> no BASE node set.\n")
             base_nodes = []
 
-        # -------------------- MATERIAL (ABS with cure-shrink) ----------------
+        # MATERIAL
         f.write("** Materials +++++++++++++++++++++++++++++++++++++++++++++++\n")
         f.write("*MATERIAL, NAME=ABS\n")
         f.write("*DENSITY\n")
@@ -922,7 +1040,7 @@ def write_calculix_job(
         f.write("*ELASTIC\n")
         f.write("2800., 0.35\n")
 
-        alpha = -float(cure_shrink_per_unit)  # higher T -> shrink
+        alpha = -float(cure_shrink_per_unit)
         f.write("*EXPANSION, ZERO=0.\n")
         f.write(f"{alpha:.6E}\n")
 
@@ -932,12 +1050,12 @@ def write_calculix_job(
         f.write("1.30e+9\n")
         f.write("*SOLID SECTION, ELSET=ALL, MATERIAL=ABS\n")
 
-        # -------------------- INITIAL "TEMPERATURE" (CURE) -------------------
+        # INITIAL CONDITIONS
         f.write("** Initial conditions (cure variable) ++++++++++++++++++++++\n")
         f.write("*INITIAL CONDITIONS, TYPE=TEMPERATURE\n")
-        f.write(f"ALLNODES, {0.0}\n")  # typically 0.0 or 293
+        f.write("ALLNODES, 0.0\n")
 
-        # -------------------- STEPS --------------------
+        # STEPS
         f.write("** Steps +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
         if n_slices == 0 or not slice_names:
             f.write("** No slices -> no steps.\n")
@@ -951,7 +1069,6 @@ def write_calculix_job(
 
             step_counter = 1
 
-            # Step 1: dummy, full model, uncured
             f.write("** --------------------------------------------------------\n")
             f.write("** Step 1: initial dummy step with full model (no curing)\n")
             f.write("** --------------------------------------------------------\n")
@@ -978,7 +1095,6 @@ def write_calculix_job(
                 if slice_to_add is not None:
                     printed[slice_to_add] = True
 
-                # remember cure state before this step
                 prev_cure_state = cure_state.copy()
 
                 for j in existing_slice_idxs:
@@ -1031,9 +1147,6 @@ def write_calculix_job(
                         f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
                         f.write(f"{name}\n")
 
-                # Decide whether to request field outputs for this curing step:
-                # - every Nth step according to output_stride
-                # - always for the very last curing step
                 write_outputs = (
                     output_stride <= 1
                     or (global_k + 1) % output_stride == 0
@@ -1044,14 +1157,11 @@ def write_calculix_job(
                     f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
                     f.write("*NODE FILE\n")
                     f.write("U\n")
-                    # f.write("*EL FILE\n")
-                    # f.write("S, E, HFL, NOE\n")
                 else:
                     f.write(
                         "** Field outputs disabled for this step "
                         f"(output_stride = {output_stride})\n"
                     )
-                    # This wipes previous node-file selections so no results are written
                     f.write("*NODE FILE\n")
 
                 f.write("** Boundary conditions (base + shrinkage-curve cure) +++++\n")
@@ -1063,7 +1173,6 @@ def write_calculix_job(
                     cure_val = cure_state[j]
                     if cure_val == 0.0:
                         continue
-                    # skip slices whose cure value did not change in this step
                     if cure_val == prev_cure_state.get(j, 0.0):
                         continue
                     nset_j = f"SLICE_{j:03d}_NODES"
@@ -1081,118 +1190,6 @@ def write_calculix_job(
 
 
 # ============================================================
-#  CalculiX runner
-# ============================================================
-
-def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
-    log(f"[RUN] Launching CalculiX: {ccx_cmd} {job_name}")
-
-    log_path = f"{job_name}_ccx_output.txt"
-    try:
-        my_env = os.environ.copy()
-        # my_env["PASTIX_GPU"] = "1"
-        my_env["OMP_NUM_THREADS"] = "6"
-        my_env["OMP_DYNAMIC"] = "FALSE"
-        my_env["ЬЛД_NUM_THREADS"] = "6"
-        my_env["ЬЛД_DYNAMIC"] = "FALSE"
-
-        with open(log_path, "w", encoding="utf-8") as logfile:
-            proc = subprocess.Popen(
-                [ccx_cmd, job_name],
-                stdout=logfile,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=my_env
-            )
-    except FileNotFoundError:
-        log(f"[RUN] ERROR: CalculiX command not found: {ccx_cmd}")
-        return False
-
-    rc = proc.wait()
-    log(f"[RUN] CalculiX completed with return code {rc}")
-    log(f"[RUN] Full output written to: {log_path}")
-
-    return rc == 0
-
-
-def export_voxel_debug_stl(
-    indices_sorted,
-    vox,
-    cube_size,
-    cyl_params,
-    out_path
-):
-    """
-    Export all voxels as an STL mesh for visualization.
-    Each voxel is drawn as 12 triangles (6 faces).
-
-    Uses cylindrical mapping:
-      - voxel centers/corners are in param (u,v,w)
-      - corners are mapped through param_to_world_cyl().
-    """
-
-    cx, cz, R0, v_offset, y_offset = cyl_params
-
-    half = cube_size / 2.0
-    vertices = []
-    faces = []
-
-    for (ix, iy, iz) in indices_sorted:
-        # center in param coords
-        center_param = vox.indices_to_points(
-            np.array([[ix, iy, iz]], dtype=float)
-        )[0]
-        u_c, v_c, w_c = center_param
-
-        # Undo the tangential rotation for debug mesh
-        v_c -= v_offset
-
-        # axis-aligned corners in param coords
-        u0, u1 = u_c - half, u_c + half
-        v0, v1 = v_c - half, v_c + half
-        w0, w1 = w_c - half, w_c + half
-
-        corners = [
-            (u0, v0, w0),
-            (u1, v0, w0),
-            (u1, v1, w0),
-            (u0, v1, w0),
-            (u0, v0, w1),
-            (u1, v0, w1),
-            (u1, v1, w1),
-            (u0, v1, w1),
-        ]
-
-        world = []
-        for p in corners:
-            x, y, z = param_to_world_cyl(p, cx, cz, R0)
-            y = y - y_offset # move voxels back to original Y frame
-            world.append((x, y, z))
-
-        base = len(vertices)
-        vertices.extend(world)
-
-        # add 12 triangles of the cube
-        cube_faces = [
-            (0, 1, 2), (0, 2, 3),  # bottom
-            (4, 5, 6), (4, 6, 7),  # top
-            (0, 1, 5), (0, 5, 4),  # front
-            (1, 2, 6), (1, 6, 5),  # right
-            (2, 3, 7), (2, 7, 6),  # back
-            (3, 0, 4), (3, 4, 7),  # left
-        ]
-        for (a, b, c) in cube_faces:
-            faces.append((base + a, base + b, base + c))
-
-    # Export STL
-    vertices_np = np.array(vertices, dtype=float)
-    faces_np = np.array(faces, dtype=np.int32)
-    mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces_np, process=False)
-    mesh.export(out_path)
-    log(f"[VOXDBG] Voxel debug STL written: {out_path}")
-
-
-# ============================================================
 #  CLI
 # ============================================================
 
@@ -1201,9 +1198,8 @@ def main():
         description=(
             "Voxelize an STL in cylindrical coordinates and generate an "
             "uncoupled thermo-mechanical CalculiX job with C3D8R hexahedra "
-            "and layer-by-layer *UNCOUPLED TEMPERATURE-DISPLACEMENT steps, "
-            "then deform the input STL using PyGeM FFD (forward + pre-deformed) "
-            "and optionally export the lattice as separate PLY point clouds."
+            "and layer-by-layer *UNCOUPLED TEMPERATURE-DISPLACEMENT steps. "
+            "Optionally remesh each voxel slice with Gmsh into tetrahedra."
         )
     )
     parser.add_argument("input_stl", help="Path to input STL file")
@@ -1228,8 +1224,7 @@ def main():
     parser.add_argument(
         "--ccx-cmd",
         default="ccx",
-        help="CalculiX executable (default 'ccx'). Example: "
-             "'ccx', 'ccx_static', 'C:\\path\\to\\ccx.exe'",
+        help="CalculiX executable (default 'ccx').",
     )
     parser.add_argument(
         "--output-stride",
@@ -1244,31 +1239,25 @@ def main():
         "--export-lattice",
         action="store_true",
         help=(
-            "Export FFD lattice as '<base_name>_lattice_orig.ply' and "
-            "'<base_name>_lattice_def.ply' point clouds, where <base_name> is "
-            "derived from the input STL filename."
+            "Unused here; placeholder for other variants."
         ),
     )
-    # Cylindrical options
     parser.add_argument(
         "--cyl-radius",
         type=float,
-        help=(
-            "Base cylinder radius R0 for param mapping. "
-            "If omitted, estimated from STL geometry."
-        ),
+        required=True,
+        help="Base cylinder radius R0 for param mapping.",
     )
     parser.add_argument(
-    "--gmsh-size",
-    type=float,
-    default=None,
-    help=(
-        "If set, volumetrically remesh the voxel mesh with Gmsh "
-        "using this target element size (approx). If omitted, "
-        "CalculiX uses the original voxel C3D8R mesh."
-    ),
+        "--gmsh-size",
+        type=float,
+        default=None,
+        help=(
+            "If set, remesh each voxel slice with Gmsh into tetrahedra with "
+            "approximate target size. If omitted, CalculiX uses the original "
+            "voxel C3D8R mesh."
+        ),
     )
-
 
     args = parser.parse_args()
 
@@ -1282,7 +1271,6 @@ def main():
     job_base = os.path.splitext(os.path.basename(args.input_stl))[0]
     basepath = os.path.join(out_dir, job_base)
 
-    # 1) Mesh (cylindrical curved voxels only)
     (
         vertices,
         hexes,
@@ -1296,13 +1284,12 @@ def main():
         indices_sorted,
         vox,
 
-        # BBOX mesh results
         vertices_bbox,
         hexes_bbox,
         slice_to_eids_bbox,
         z_slices_bbox,
-        indices_bbox_sorted, # for BBOX debug export
-        vox_bbox,            # for BBOX debug export
+        indices_bbox_sorted,
+        vox_bbox,
         vertex_index_map_bbox,
     ) = generate_global_cubic_hex_mesh(
         args.input_stl,
@@ -1310,29 +1297,96 @@ def main():
         cyl_radius=args.cyl_radius,
     )
 
-    # Optional: volumetric remesh of the voxel mesh with Gmsh
+    # Optional Gmsh per-layer remesh into tets
     if args.gmsh_size is not None:
         log(
-            f"[GMSH] Starting volumetric remesh with target size "
+            f"[GMSH] Starting per-layer volumetric TET remesh with target size "
             f"{args.gmsh_size} ..."
         )
-        verts_rm, hexes_rm, slice_to_eids_rm = remesh_with_gmsh(
-            vertices,
-            hexes,
-            cyl_params,
-            z_slices,
-            target_size=args.gmsh_size,
-        )
-
-        if slice_to_eids_rm is not None:
-            vertices = verts_rm
-            hexes = hexes_rm
-            slice_to_eids = slice_to_eids_rm
-            log("[GMSH] Using remeshed hex mesh for CalculiX input.")
+        try:
+            import gmsh  # just to check availability
+        except ImportError:
+            log("[GMSH] gmsh module not found; skipping remesh.")
         else:
-            log("[GMSH] Gmsh remesh not used; keeping original voxel mesh.")
+            # Build mapping slice_idx -> list of voxel indices (ix,iy,iz)
+            izs = indices_sorted[:, 2]
+            unique_iz = np.unique(izs)
+            z_arr = np.array(z_slices, dtype=float)
 
-    # --- Export voxel debug STL ---
+            iz_to_slice = {}
+            for iz in unique_iz:
+                idx_arr = np.array([[0, 0, iz]], dtype=float)
+                pt = vox.indices_to_points(idx_arr)[0]
+                w = float(pt[2])
+                slice_idx = int(np.argmin(np.abs(z_arr - w)))
+                iz_to_slice[int(iz)] = slice_idx
+
+            slice_voxel_map: Dict[int, List[Tuple[int, int, int]]] = {
+                i: [] for i in range(len(z_slices))
+            }
+            for (ix, iy, iz) in indices_sorted:
+                sidx = iz_to_slice[int(iz)]
+                slice_voxel_map[sidx].append((int(ix), int(iy), int(iz)))
+
+            vertices_tet: List[Tuple[float, float, float]] = []
+            elements_tet: List[Tuple[int, int, int, int]] = []
+            slice_to_eids_tet: Dict[int, List[int]] = {i: [] for i in range(len(z_slices))}
+            global_node_offset = 0
+            global_elem_offset = 0
+            remesh_ok = True
+
+            for slice_idx in range(len(z_slices)):
+                voxels = slice_voxel_map.get(slice_idx, [])
+                if not voxels:
+                    continue
+
+                log(f"[GMSH] Remeshing slice {slice_idx} with {len(voxels)} voxels...")
+                layer_mesh = build_layer_trimesh(
+                    voxels,
+                    vox,
+                    args.cube_size,
+                    cyl_params,
+                )
+                verts_local, tets_local = gmsh_remesh_layer(
+                    layer_mesh,
+                    args.gmsh_size,
+                )
+
+                if verts_local is None or tets_local is None:
+                    log(f"[GMSH] Slice {slice_idx} remesh failed; aborting Gmsh remesh.")
+                    remesh_ok = False
+                    break
+
+                node_map: Dict[int, int] = {}
+                for local_id, (x, y, z) in enumerate(verts_local, start=1):
+                    global_id = global_node_offset + local_id
+                    vertices_tet.append((x, y, z))
+                    node_map[local_id] = global_id
+                global_node_offset += len(verts_local)
+
+                eids_slice: List[int] = []
+                for i, tet in enumerate(tets_local):
+                    conn_global = tuple(node_map[n] for n in tet)
+                    elements_tet.append(conn_global)
+                    eid_global = global_elem_offset + i + 1
+                    eids_slice.append(eid_global)
+                global_elem_offset += len(tets_local)
+
+                slice_to_eids_tet[slice_idx].extend(eids_slice)
+
+            if remesh_ok and elements_tet:
+                log(
+                    f"[GMSH] Per-layer tet remesh OK: "
+                    f"{len(vertices)} -> {len(vertices_tet)} nodes, "
+                    f"{len(hexes)} -> {len(elements_tet)} elements."
+                )
+                vertices = vertices_tet
+                hexes = elements_tet  # now actually C3D4
+                slice_to_eids = slice_to_eids_tet
+            else:
+                log("[GMSH] Using original voxel C3D8R mesh (tet remesh skipped).")
+
+    # Export voxel debug STL (always based on voxel grid)
     export_voxel_debug_stl(
         indices_sorted,
         vox,
@@ -1341,7 +1395,7 @@ def main():
         basepath + "_voxels.stl"
     )
 
-    # 2) Single uncoupled thermo-mechanical job
+    # Generate CalculiX job
     utd_job = basepath + "_utd"
     utd_inp = utd_job + ".inp"
 
@@ -1352,16 +1406,14 @@ def main():
         slice_to_eids,
         z_slices,
         shrinkage_curve=[5, 4, 3, 2, 1],
-        cure_shrink_per_unit=0.1,  # 3%
+        cure_shrink_per_unit=0.1,
         output_stride=args.output_stride,
     )
 
-    # 3) Optional run + PyGeM FFD deformation + lattice export
     if args.run_ccx:
         ok = run_calculix(utd_job, ccx_cmd=args.ccx_cmd)
         if not ok:
-            log("[RUN] UTD job failed, skipping FFD.")
-            return
+            log("[RUN] UTD job failed.")
 
 
 if __name__ == "__main__":
