@@ -44,6 +44,7 @@ def main():
     # Move mesh so min-corner becomes (0,0,0)
     # -----------------------------
     min_corner = mesh.bounds[0].copy()
+    min_corner[2] += args.pitch / 2
     mesh.apply_translation(-min_corner)
 
     print(f"[MOVE] Translation applied: {-min_corner}")

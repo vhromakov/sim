@@ -19,6 +19,7 @@ from typing import List, Tuple, Dict, Set, Optional
 import math
 import numpy as np
 import trimesh
+from trimesh.voxel import creation
 
 
 # ============================================================
@@ -305,10 +306,39 @@ def generate_cylindrical_voxel_lattice(
         f"v_max={v_max_mesh:.6f}"
     )
 
-    # --- Voxelization in param coordinates ---
-    print(f"[VOXEL] Voxelizing with cube size = {cube_size} ...")
-    vox = mesh.voxelized(pitch=cube_size)
-    vox.fill()
+    # --- Voxelization in param coordinates (using local_voxelize) ---
+    print(f"[VOXEL] Voxelizing with creation.local_voxelize, cube size = {cube_size} ...")
+
+    # We are now in param space: mesh.vertices == verts_param
+    # Compute param-space AABB
+    bounds_param = mesh.bounds  # [[u_min, v_min, w_min], [u_max, v_max, w_max]]
+    center_param = bounds_param.mean(axis=0)  # (u_c, v_c, w_c)
+
+    extent_param = bounds_param[1] - bounds_param[0]  # per-axis spans
+    max_extent = float(extent_param.max())
+
+    # local_voxelize radius = number of cubes in each direction (integer)
+    # We want a cube (2*radius+1 voxels per side) that fully covers the bbox:
+    #   (2 * radius_cubes * cube_size) >= max_extent  ->  radius_cubes >= max_extent/(2*cube_size)
+    radius_cubes = int(math.ceil(max_extent / (2.0 * cube_size))) + 1
+
+    vox = creation.local_voxelize(
+        mesh,          # mesh already in param space
+        center_param,  # point: center of the mesh in (u, v, w)
+        cube_size,     # pitch: voxel edge length in param units
+        radius_cubes,  # radius: integer number of cubes
+        fill=True,     # fill approximated interior
+    )
+
+    indices = vox.sparse_indices  # (N,3) with (ix,iy,iz) in param grid
+    if indices.size == 0:
+        print("[VOXEL] No voxels found – check cube size or input mesh.")
+        return [], None, None, None, None, None
+
+    total_voxels = indices.shape[0]
+    print(f"[VOXEL] Total filled voxels (cubes): {total_voxels}")
+
+
 
     indices = vox.sparse_indices  # (N,3) with (ix,iy,iz) in param grid
     if indices.size == 0:
