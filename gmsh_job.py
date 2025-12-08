@@ -815,11 +815,103 @@ def gmsh_remesh_layer(
                 pass
 
 
+    # Split into connected components (non-watertight allowed)
     try:
-        return _remesh_one_component(layer_mesh)
+        # Weld coincident vertices so touching voxels become a single component
+        layer_mesh.merge_vertices()
+        layer_mesh.remove_unreferenced_vertices()
+
+        parts = [
+            m for m in layer_mesh.split(only_watertight=False)
+            if m.faces.size > 0
+        ]
+
+        # Fallback: if something went wrong and we got nothing, keep whole layer
+        if not parts:
+            parts = [layer_mesh]
+
     except Exception as e:
-        log(f"[GMSH]   Exception during component remesh: {e}")
+        log(f"[GMSH] Layer split failed: {e}")
+        parts = [layer_mesh]
+
+    if isinstance(parts, trimesh.Trimesh):
+        parts = [parts]
+
+    vertices_all: List[Tuple[float, float, float]] = []
+    tets_all: List[Tuple[int, int, int, int]] = []
+    node_offset = 0
+
+    for idx, part in enumerate(parts):
+        log(f"[GMSH]   Remeshing component {idx} of layer...")
+        try:
+            verts_local, tets_local = _remesh_one_component(part)
+        except Exception as e:
+            log(f"[GMSH]   Exception during component remesh: {e}")
+            return None, None
+
+        if verts_local is None or tets_local is None:
+            log("[GMSH]   Component remesh failed.")
+            return None, None
+
+        # Append with node offset
+        for v in verts_local:
+            vertices_all.append(v)
+        for tet in tets_local:
+            tets_all.append(tuple(node_offset + n for n in tet))
+        node_offset += len(verts_local)
+
+    if not vertices_all or not tets_all:
+        log("[GMSH] Layer remesh produced no elements.")
         return None, None
+
+    log(f"[GMSH] Layer remesh OK (all components): {len(vertices_all)} nodes, {len(tets_all)} tets")
+    return vertices_all, tets_all
+
+
+def merge_close_nodes(
+    vertices: List[Tuple[float, float, float]],
+    elements: List[Tuple[int, ...]],
+    tol: float = 1e-6,
+) -> Tuple[List[Tuple[float, float, float]], List[Tuple[int, ...]], Dict[int, int]]:
+    """
+    Merge nodes that are closer than `tol` (global across all slices).
+
+    Returns:
+      vertices_merged, elements_merged, old_to_new
+        - vertices_merged: new node list (1..N)
+        - elements_merged: same element connectivity but with renumbered nodes
+        - old_to_new: mapping from old node index (1-based) to new node index
+    """
+    if not vertices:
+        return vertices, elements, {}
+
+    v = np.array(vertices, dtype=float)
+    # Quantize coordinates to a grid of size `tol` to detect duplicates
+    keys = np.round(v / tol).astype(np.int64)
+
+    key_to_new: Dict[Tuple[int, int, int], int] = {}
+    vertices_new: List[Tuple[float, float, float]] = []
+    old_to_new: Dict[int, int] = {}
+
+    for old_idx, key_vec in enumerate(keys, start=1):
+        key = (int(key_vec[0]), int(key_vec[1]), int(key_vec[2]))
+        if key in key_to_new:
+            new_idx = key_to_new[key]
+        else:
+            new_idx = len(vertices_new) + 1
+            key_to_new[key] = new_idx
+            vertices_new.append(tuple(v[old_idx - 1]))
+        old_to_new[old_idx] = new_idx
+
+    elements_new: List[Tuple[int, ...]] = []
+    for conn in elements:
+        elements_new.append(tuple(old_to_new[n] for n in conn))
+
+    log(
+        f"[GMSH] merge_close_nodes: {len(vertices)} -> {len(vertices_new)} nodes "
+        f"(tol={tol})"
+    )
+    return vertices_new, elements_new, old_to_new
 
 
 # ============================================================
