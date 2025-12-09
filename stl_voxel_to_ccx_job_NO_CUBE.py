@@ -25,6 +25,9 @@ Pipeline (cylindrical workflow only):
         * <job_name>_lattice_def.ply   (deformed lattice nodes)
 """
 
+import triangle as tr
+import tetgen  # <--- ADD THIS
+
 import argparse
 import os
 from typing import List, Tuple, Dict, Set, Optional
@@ -116,6 +119,35 @@ def param_to_world_cyl(
     z = cz + r * math.sin(theta)
 
     return (x, y, z)
+
+
+def write_ply_edges(path: Path, points: np.ndarray, edges: list[tuple[int, int]]) -> None:
+    """
+    Write an ASCII PLY with vertices + edges (no faces).
+    Many viewers (Meshlab, CloudCompare) can show edges.
+    """
+    points = np.asarray(points, dtype=float)
+    n_verts = points.shape[0]
+    edges = list(edges)
+    n_edges = len(edges)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {n_verts}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write(f"element edge {n_edges}\n")
+        f.write("property int vertex1\n")
+        f.write("property int vertex2\n")
+        f.write("end_header\n")
+        # vertices
+        for (x, y, z) in points:
+            f.write(f"{x} {y} {z}\n")
+        # edges
+        for (i0, i1) in edges:
+            f.write(f"{i0} {i1}\n")
 
 
 # ============================================================
@@ -533,43 +565,40 @@ from typing import Dict, Tuple, List, Iterable
 from typing import Dict, Tuple, List
 
 
-def write_calculix_job(
+def write_calculix_job_tet(
     path: str,
     vertices: List[Tuple[float, float, float]],
-    hexes: List[Tuple[int, int, int, int, int, int, int, int]],
+    tet_elements: List[Tuple[int, int, int, int]],
     slice_to_eids: Dict[int, List[int]],
     z_slices: List[float],
     shrinkage_curve: List[float],
     cure_shrink_per_unit: float,
+    cyl_params: Optional[Tuple[float, float, float, float, float]],
+    cube_size: float,
     output_stride: int = 1,
 ):
     """
-    Additive-style uncoupled temperature-displacement job with MODEL CHANGE
-    and incremental curing driven by a per-layer shrinkage curve.
-
-    This version assumes cylindrical voxels: the BASE node set is taken from
-    the outer radial faces (nodes 4..7) of the first radial slice.
+    Same layer-wise uncoupled temperature-displacement job as with hexes,
+    but using C3D4 tets instead of C3D8R hexes.
     """
 
     n_nodes = len(vertices)
-    n_elems = len(hexes)
+    n_elems = len(tet_elements)
     n_slices = len(z_slices)
 
-    # simple time scheme: 1.0 per step
     time_per_layer = 1.0
     time_per_layer_step = 1.0
     total_weight = float(sum(shrinkage_curve))
     shrinkage_curve = [float(w) / total_weight for w in shrinkage_curve]
 
-    # ensure sane stride
     if output_stride < 1:
         output_stride = 1
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write("**\n** Auto-generated incremental-cure shrink job\n**\n")
+        f.write("**\n** Auto-generated incremental-cure shrink job (C3D4 tets)\n**\n")
         f.write("*HEADING\n")
         f.write(
-            "Voxel C3D8R uncoupled temperature-displacement "
+            "Tet C3D4 uncoupled temperature-displacement "
             "(layer-wise MODEL CHANGE + shrinkage-curve-driven curing, cylindrical)\n"
         )
 
@@ -581,53 +610,48 @@ def write_calculix_job(
 
         # -------------------- ELEMENTS --------------------
         f.write("** Elements ++++++++++++++++++++++++++++++++++++++++++++++++\n")
-        f.write("*ELEMENT, TYPE=C3D8R, ELSET=ALL\n")
-        for eid, (n0, n1, n2, n3, n4, n5, n6, n7) in enumerate(hexes, start=1):
-            f.write(
-                f"{eid}, {n0}, {n1}, {n2}, {n3}, "
-                f"{n4}, {n5}, {n6}, {n7}\n"
-            )
+        f.write("*ELEMENT, TYPE=C3D4, ELSET=ALL\n")
+        for eid, (n0, n1, n2, n3) in enumerate(tet_elements, start=1):
+            f.write(f"{eid}, {n0}, {n1}, {n2}, {n3}\n")
 
         # -------------------- SETS --------------------
         f.write("** Node sets +++++++++++++++++++++++++++++++++++++++++++++++\n")
         f.write("*NSET, NSET=ALLNODES, GENERATE\n")
         f.write(f"1, {n_nodes}, 1\n")
 
-        # We'll define BASE after we build per-slice node sets
         base_nodes: List[int] = []
 
         f.write("** Element + node sets (per slice) +++++++++++++++++++++++++\n")
         slice_names: List[str] = []
         slice_node_ids: Dict[int, List[int]] = {}
 
-        def _write_id_list_lines(f, ids: List[int], per_line: int = 16):
+        def _write_id_list_lines(fh, ids: List[int], per_line: int = 16):
             for i in range(0, len(ids), per_line):
                 chunk = ids[i:i + per_line]
-                f.write(", ".join(str(x) for x in chunk) + "\n")
+                fh.write(", ".join(str(x) for x in chunk) + "\n")
 
-        for slice_idx in range(n_slices):
+        # Build per-slice ELSET/NSET from tet elements
+        for slice_idx in sorted(slice_to_eids.keys()):
             eids = slice_to_eids.get(slice_idx, [])
             if not eids:
                 continue
             valid_eids = [eid for eid in eids if 1 <= eid <= n_elems]
             if not valid_eids:
                 log(
-                    f"[WARN] Slice {slice_idx} has no valid element "
+                    f"[WARN] Tet slice {slice_idx} has no valid element "
                     f"IDs within 1..{n_elems}"
                 )
                 continue
 
-            # Element set
             name = f"SLICE_{slice_idx:03d}"
             slice_names.append(name)
             f.write(f"*ELSET, ELSET={name}\n")
             _write_id_list_lines(f, valid_eids)
 
-            # Node set from element connectivity
             nodes_in_slice: Set[int] = set()
             for eid in valid_eids:
-                n0, n1, n2, n3, n4, n5, n6, n7 = hexes[eid - 1]
-                nodes_in_slice.update([n0, n1, n2, n3, n4, n5, n6, n7])
+                n0, n1, n2, n3 = tet_elements[eid - 1]
+                nodes_in_slice.update([n0, n1, n2, n3])
 
             node_list = sorted(nodes_in_slice)
             slice_node_ids[slice_idx] = node_list
@@ -636,29 +660,36 @@ def write_calculix_job(
             f.write(f"*NSET, NSET={nset_name}\n")
             _write_id_list_lines(f, node_list)
 
-        # -------------------- BASE from outer radial faces of first slice ---------------
+        # -------------------- BASE node set via outer radius of first slice -----
         existing_slice_idxs = sorted(slice_node_ids.keys())
-        if existing_slice_idxs:
+        if existing_slice_idxs and cyl_params is not None:
             base_slice = existing_slice_idxs[0]
-            base_eids = slice_to_eids.get(base_slice, [])
+            node_ids = slice_node_ids[base_slice]
 
-            base_node_set: Set[int] = set()
-            for eid in base_eids:
-                n0, n1, n2, n3, n4, n5, n6, n7 = hexes[eid - 1]
+            cx, cz, R0, v_offset, y_off = cyl_params
+            # find nodes on outer cylindrical surface in this slice
+            rs = []
+            for nid in node_ids:
+                x, y, z = vertices[nid - 1]
+                r = math.sqrt((x - cx) ** 2 + (z - cz) ** 2)
+                rs.append(r)
+            if rs:
+                r_max = max(rs)
+                tol_r = cube_size * 0.5
+                base_set: Set[int] = set()
+                for nid, r in zip(node_ids, rs):
+                    if r_max - r <= tol_r:
+                        base_set.add(nid)
+                base_nodes = sorted(base_set)
 
-                # Cylindrical case: "bottom" = outer radial face (w1) = nodes 4..7
-                base_node_set.update([n4, n5, n6, n7])
-
-            base_nodes = sorted(base_node_set)
-
-            f.write("** Base node set = outer radial faces of first slice +++++++++++++++\n")
+        if base_nodes:
+            f.write("** Base node set = outer radial surface of first slice ++++++\n")
             f.write("*NSET, NSET=BASE\n")
             _write_id_list_lines(f, base_nodes)
         else:
-            f.write("** Warning: no slices -> no BASE node set.\n")
-            base_nodes = []
+            f.write("** Warning: no BASE node set defined.\n")
 
-        # -------------------- MATERIAL (ABS with cure-shrink) ----------------
+        # -------------------- MATERIAL (same ABS with cure-shrink) -------------
         f.write("** Materials +++++++++++++++++++++++++++++++++++++++++++++++\n")
         f.write("*MATERIAL, NAME=ABS\n")
         f.write("*DENSITY\n")
@@ -666,7 +697,7 @@ def write_calculix_job(
         f.write("*ELASTIC\n")
         f.write("2800., 0.35\n")
 
-        alpha = -float(cure_shrink_per_unit)  # higher T -> shrink
+        alpha = -float(cure_shrink_per_unit)
         f.write("*EXPANSION, ZERO=0.\n")
         f.write(f"{alpha:.6E}\n")
 
@@ -679,9 +710,9 @@ def write_calculix_job(
         # -------------------- INITIAL "TEMPERATURE" (CURE) -------------------
         f.write("** Initial conditions (cure variable) ++++++++++++++++++++++\n")
         f.write("*INITIAL CONDITIONS, TYPE=TEMPERATURE\n")
-        f.write(f"ALLNODES, {0.0}\n")  # typically 0.0 or 293
+        f.write(f"ALLNODES, {0.0}\n")
 
-        # -------------------- STEPS --------------------
+        # -------------------- STEPS (same structure as hex version) ----------
         f.write("** Steps +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
         if n_slices == 0 or not slice_names:
             f.write("** No slices -> no steps.\n")
@@ -722,7 +753,6 @@ def write_calculix_job(
                 if slice_to_add is not None:
                     printed[slice_to_add] = True
 
-                # remember cure state before this step
                 prev_cure_state = cure_state.copy()
 
                 for j in existing_slice_idxs:
@@ -733,10 +763,7 @@ def write_calculix_job(
                         continue
                     increment = shrinkage_curve[k_applied]
                     if increment != 0.0:
-                        cure_state[j] = min(
-                            1.0,
-                            cure_state[j] + increment,
-                        )
+                        cure_state[j] = min(1.0, cure_state[j] + increment)
                     applied_count[j] = k_applied + 1
 
                 f.write("** --------------------------------------------------------\n")
@@ -775,9 +802,6 @@ def write_calculix_job(
                         f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
                         f.write(f"{name}\n")
 
-                # Decide whether to request field outputs for this curing step:
-                # - every Nth step according to output_stride
-                # - always for the very last curing step
                 write_outputs = (
                     output_stride <= 1
                     or (global_k + 1) % output_stride == 0
@@ -788,26 +812,21 @@ def write_calculix_job(
                     f.write("** Field outputs +++++++++++++++++++++++++++++++++++++++++++\n")
                     f.write("*NODE FILE\n")
                     f.write("U\n")
-                    # f.write("*EL FILE\n")
-                    # f.write("S, E, HFL, NOE\n")
                 else:
                     f.write(
                         "** Field outputs disabled for this step "
                         f"(output_stride = {output_stride})\n"
                     )
-                    # This wipes previous node-file selections so no results are written
                     f.write("*NODE FILE\n")
 
                 f.write("** Boundary conditions (base + shrinkage-curve cure) +++++\n")
                 f.write("*BOUNDARY\n")
-
                 for j in existing_slice_idxs:
                     if not printed[j]:
                         continue
                     cure_val = cure_state[j]
                     if cure_val == 0.0:
                         continue
-                    # skip slices whose cure value did not change in this step
                     if cure_val == prev_cure_state.get(j, 0.0):
                         continue
                     nset_j = f"SLICE_{j:03d}_NODES"
@@ -816,7 +835,7 @@ def write_calculix_job(
                 f.write("*END STEP\n")
                 step_counter += 1
 
-    log(f"[CCX] Wrote incremental-cure UT-D job to: {path}")
+    log(f"[CCX] Wrote incremental-cure UT-D tet job to: {path}")
     log(
         f"[CCX] Nodes: {n_nodes}, elements: {n_elems}, "
         f"slices: {n_slices}, shrinkage_curve={shrinkage_curve}, "
@@ -1244,47 +1263,49 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
     out_dir = Path(getattr(args, "output_dir", "OUTPUT_SLICES"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Directories
+    mc_out_dir = out_dir / "mc_slices"
+    mc_out_dir.mkdir(parents=True, exist_ok=True)
+
+    vol_out_dir = out_dir / "mc_slice_volumes"
+    vol_out_dir.mkdir(parents=True, exist_ok=True)
+
+    tet_out_dir = out_dir / "mc_slice_tets"
+    tet_out_dir.mkdir(parents=True, exist_ok=True)
+
     # -------------------------------------------------------
     # 1) Build iz -> slice_idx mapping from voxel info
     # -------------------------------------------------------
-    # indices_sorted[:, 2] are voxel iz indices
     unique_iz = np.unique(indices_sorted[:, 2])
-
-    # z_slices was built by sorting layers by w descending; since w grows with iz,
-    # that corresponds to iz in descending order too.
-    unique_iz_desc = np.sort(unique_iz)[::-1]
-
-    # Map voxel iz -> slice index (0..num_slices-1), consistent with z_slices
+    unique_iz_desc = np.sort(unique_iz)[::-1]  # slice 0 = outermost / top
     iz_to_slice = {int(iz): int(i) for i, iz in enumerate(unique_iz_desc)}
-
     num_slices = len(unique_iz_desc)
-    slice_to_mc_faces: dict[int, list[int]] = {i: [] for i in range(num_slices)}
 
     # -------------------------------------------------------
-    # 2) Get marching-cubes mesh in index space
+    # 2) Marching-cubes mesh in index + world space
     # -------------------------------------------------------
-    mc_idx = vox.marching_cubes         # vertices in index coords, faces in index space
+    mc_idx = vox.marching_cubes
     mc_verts_idx = np.asarray(mc_idx.vertices, dtype=float)
     mc_faces_idx = np.asarray(mc_idx.faces, dtype=int)
 
-    # We'll use world-space vertices from mc_mesh_world for geometry
     mc_verts_world = np.asarray(mc_mesh_world.vertices, dtype=float)
 
     min_iz = int(unique_iz.min())
     max_iz = int(unique_iz.max())
 
+    # slice_idx -> list of MC face indices
+    slice_to_mc_faces: dict[int, list[int]] = {i: [] for i in range(num_slices)}
+
     # -------------------------------------------------------
-    # 3) Assign each MC triangle to a voxel iz (then to slice)
+    # 3) Assign each MC triangle to iz (-> slice)
     # -------------------------------------------------------
     for f_idx, (i0, i1, i2) in enumerate(mc_faces_idx):
         z0 = mc_verts_idx[i0, 2]
         z1 = mc_verts_idx[i1, 2]
         z2 = mc_verts_idx[i2, 2]
-
         z_mean = (z0 + z1 + z2) / 3.0
         iz = int(math.floor(z_mean + 1e-6))
 
-        # Clamp to valid iz range just in case
         if iz < min_iz:
             iz = min_iz
         elif iz > max_iz:
@@ -1295,47 +1316,46 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
             slice_to_mc_faces[slice_idx].append(f_idx)
 
     # -------------------------------------------------------
-    # 4) Export per-slice marching-cubes STLs in world coords
+    # 4) Per-slice data for later volume + tetgen creation
     # -------------------------------------------------------
-    mc_out_dir = out_dir / "mc_slices"
-    mc_out_dir.mkdir(parents=True, exist_ok=True)
+    # Each entry:
+    #   "verts_world": (Nv,3)
+    #   "verts_idx":   (Nv,3) in index coords
+    #   "side_faces":  (Fs,3) local indices (no original "bottom plane")
+    #   "bottom_cap":  (Fc,3) local indices (cap from loops)
+    slice_data: dict[int, dict[str, np.ndarray]] = {}
 
-    z_tol = 1e-3  # still used for removing original bottom ONLY for slice 0
+    z_tol = 1e-3
 
     for slice_idx, f_indices in slice_to_mc_faces.items():
         if not f_indices:
             continue
 
-        sub_faces_idx = mc_faces_idx[np.asarray(f_indices, dtype=int)]
+        f_indices_arr = np.asarray(f_indices, dtype=int)
+        sub_faces_idx = mc_faces_idx[f_indices_arr]
 
         # Collect vertices actually used and remap to [0..N-1]
         unique_v, inverse = np.unique(sub_faces_idx.flatten(), return_inverse=True)
         sub_verts_world = mc_verts_world[unique_v]
-        sub_faces_remap = inverse.reshape((-1, 3))  # faces in local [0..N-1]
-
-        # Index-space coords for same vertices
         sub_verts_idx = mc_verts_idx[unique_v]
+        sub_faces_local = inverse.reshape((-1, 3))  # faces in local [0..Nv-1]
 
-        # ---------- 1) Remove original bottom only on slice 0 ----------
-        if slice_idx == 0:
-            z_vals_local = sub_verts_idx[:, 2]
-            z_bottom = float(z_vals_local.max())
-            on_bottom = np.abs(z_vals_local - z_bottom) < z_tol
+        # ------------ Remove original "bottom" (max Z) triangles ------------
+        z_vals_local = sub_verts_idx[:, 2]
+        z_bottom = float(z_vals_local.max())
+        on_bottom = np.abs(z_vals_local - z_bottom) < z_tol
 
-            bottom_face_mask = np.array(
-                [on_bottom[tri].all() for tri in sub_faces_remap],
-                dtype=bool,
-            )
+        bottom_face_mask = np.array(
+            [on_bottom[tri].all() for tri in sub_faces_local],
+            dtype=bool,
+        )
 
-            kept_faces = sub_faces_remap[~bottom_face_mask]
-            faces_for_loops = sub_faces_remap  # loops see full shell
-            removed_count = int(bottom_face_mask.sum())
-        else:
-            kept_faces = sub_faces_remap
-            faces_for_loops = sub_faces_remap
-            removed_count = 0
+        kept_faces = sub_faces_local[~bottom_face_mask]
+        faces_for_loops = sub_faces_local  # loops see full shell
 
-        # ---------- 2) Generate new bottom cap from contour loops ----------
+        removed_count = int(bottom_face_mask.sum())
+
+        # ------------ Generate bottom cap from contour loops -----------------
         cap_faces_local = build_bottom_cap_faces_from_loops(
             sub_verts_idx,
             faces_for_loops,
@@ -1357,15 +1377,190 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
                 f"no new bottom-cap triangles generated from loops"
             )
 
-        slice_mesh = trimesh.Trimesh(
+        # Debug STL of capped MC slice (as before)
+        slice_mesh_debug = trimesh.Trimesh(
             vertices=sub_verts_world,
             faces=all_faces_local,
             process=False,
         )
+        debug_path = mc_out_dir / f"{base_name}_mc_slice_{slice_idx:03d}.stl"
+        slice_mesh_debug.export(debug_path.as_posix())
+        log(f"[MC-SLICES] Wrote MC slice {slice_idx} STL to: {debug_path}")
 
-        out_path = mc_out_dir / f"{base_name}_mc_slice_{slice_idx:03d}.stl"
-        slice_mesh.export(out_path.as_posix())
-        log(f"[MC-SLICES] Wrote MC slice {slice_idx} STL to: {out_path}")
+        # Save data for volume + tetgen step
+        slice_data[slice_idx] = {
+            "verts_world": sub_verts_world,
+            "verts_idx": sub_verts_idx,
+            "side_faces": kept_faces,
+            "bottom_cap": cap_faces_local,
+        }
+
+    # -------------------------------------------------------
+    # 5) Build per-layer watertight-ish volumes + TetGen
+    # -------------------------------------------------------
+    # -------------------------------------------------------
+    # 5) Build per-layer watertight-ish volumes + TetGen
+    #    AND assemble a global tet mesh with layer info
+    # -------------------------------------------------------
+    if not slice_data:
+        log("[MC-SLICES] No slice data to build volumes / tets.")
+        return [], [], {}
+
+    max_slice_idx = max(slice_data.keys())
+
+    # Global tet mesh accumulators
+    global_vertices: list[tuple[float, float, float]] = []
+    global_elements: list[tuple[int, int, int, int]] = []  # 1-based node indices
+    slice_to_tet_eids: dict[int, list[int]] = {i: [] for i in range(max_slice_idx + 1)}
+
+    # coord -> global node index (1-based), using rounded coords as key
+    vert_map: dict[tuple[float, float, float], int] = {}
+
+    def get_global_vid(x: float, y: float, z: float, ndp: int = 6) -> int:
+        key = (round(x, ndp), round(y, ndp), round(z, ndp))
+        if key in vert_map:
+            return vert_map[key]
+        idx = len(global_vertices) + 1
+        vert_map[key] = idx
+        global_vertices.append((x, y, z))
+        return idx
+
+    for slice_idx in range(max_slice_idx + 1):
+        if slice_idx not in slice_data:
+            continue
+
+        data = slice_data[slice_idx]
+        verts_world = data["verts_world"]
+        side_faces = data["side_faces"]
+        bottom_cap = data["bottom_cap"]
+
+        if verts_world.size == 0 or side_faces.size == 0:
+            log(f"[MC-SLICES] Slice {slice_idx} has empty geometry; skipping volume/tetgen.")
+            continue
+
+        # Start volume with this slice's own vertices
+        vol_verts = verts_world.copy()
+        vol_faces_list = []
+
+        # Side walls
+        vol_faces_list.append(side_faces.astype(int))
+
+        # Bottom cap (from this slice)
+        if bottom_cap.size > 0:
+            vol_faces_list.append(bottom_cap.astype(int))
+
+        # Top cap: use bottom cap of slice_idx+1 (or own for last slice)
+        if slice_idx < max_slice_idx and (slice_idx + 1) in slice_data:
+            next_data = slice_data[slice_idx + 1]
+            next_bottom = next_data["bottom_cap"]
+            next_verts = next_data["verts_world"]
+            if next_bottom.size > 0:
+                offset = vol_verts.shape[0]
+                vol_verts = np.vstack([vol_verts, next_verts])
+
+                # Use next slice's bottom cap as TOP cap, but flip orientation
+                top_cap = next_bottom.astype(int) + offset
+                top_cap = top_cap[:, [0, 2, 1]]  # flip winding -> flip normals
+
+                vol_faces_list.append(top_cap)
+                log(
+                    f"[MC-SLICES] Slice {slice_idx}: using bottom cap of slice "
+                    f"{slice_idx + 1} as TOP cap (copied {next_bottom.shape[0]} tris, flipped normals)"
+                )
+        else:
+            # Last slice: reuse its own cap as "top" by duplicating vertices.
+            if bottom_cap.size > 0:
+                offset = vol_verts.shape[0]
+                vol_verts = np.vstack([vol_verts, verts_world])
+
+                # Duplicate own bottom cap as TOP cap, flip orientation
+                top_cap = bottom_cap.astype(int) + offset
+                top_cap = top_cap[:, [0, 2, 1]]  # flip winding
+
+                vol_faces_list.append(top_cap)
+                log(
+                    f"[MC-SLICES] Slice {slice_idx}: last slice, reusing its own "
+                    f"bottom cap as TOP cap (duplicated vertices, flipped normals)."
+                )
+
+        vol_faces = np.vstack(vol_faces_list).astype(int)
+
+        # --------- Export pre-TetGen watertight-ish volume surface ----------
+        vol_mesh = trimesh.Trimesh(
+            vertices=vol_verts,
+            faces=vol_faces,
+            process=False,
+        )
+
+        try:
+            trimesh.repair.fix_normals(vol_mesh, multibody=True)
+        except Exception as e:
+            log(f"[MC-VOLUME] Warning: fix_normals failed on slice {slice_idx}: {e}")
+
+        vol_path = vol_out_dir / f"{base_name}_mc_slice_{slice_idx:03d}_volume_preTet.stl"
+        vol_mesh.export(vol_path.as_posix())
+        log(f"[MC-VOLUME] Wrote pre-TetGen volume slice {slice_idx} STL to: {vol_path}")
+
+        # --------- TetGen volumetric mesh for this slice --------------------
+        try:
+            tet = tetgen.TetGen(vol_mesh.vertices, vol_mesh.faces)
+            tet_out = tet.tetrahedralize(
+                order=1,
+                mindihedral=10,
+                minratio=1.5,
+                steinerleft=-1,
+                quality=True,
+            )
+            tet_points = np.asarray(tet_out[0], dtype=float)
+            tet_elements = np.asarray(tet_out[1], dtype=int)
+            log(
+                f"[MC-TETGEN] Slice {slice_idx}: "
+                f"{tet_points.shape[0]} nodes, {tet_elements.shape[0]} tets"
+            )
+        except Exception as e:
+            log(f"[MC-TETGEN] TetGen tetrahedralize() failed on slice {slice_idx}: {e}")
+            continue
+
+        # Build unique edges from local tets (for per-slice PLY)
+        edges_set: set[tuple[int, int]] = set()
+        if tet_elements.ndim == 1:
+            tet_elements = tet_elements.reshape((-1, tet_elements.shape[0]))
+
+        for elem in tet_elements:
+            # Use first 4 nodes as linear tet vertices
+            v = [int(elem[0]), int(elem[1]), int(elem[2]), int(elem[3])]
+            edge_pairs = [
+                (v[0], v[1]), (v[0], v[2]), (v[0], v[3]),
+                (v[1], v[2]), (v[1], v[3]), (v[2], v[3]),
+            ]
+            for a, b in edge_pairs:
+                if a == b:
+                    continue
+                if a > b:
+                    a, b = b, a
+                edges_set.add((a, b))
+
+        edges_list = sorted(edges_set)
+        ply_path = tet_out_dir / f"{base_name}_mc_slice_{slice_idx:03d}_tets.ply"
+        write_ply_edges(ply_path, tet_points, edges_list)
+        log(f"[MC-TETGEN] Wrote TetGen edge PLY for slice {slice_idx} to: {ply_path}")
+
+        # --------- Add this slice's tets to global mesh --------------------
+        # Map local tet nodes -> global node indices
+        local_to_global: dict[int, int] = {}
+        for local_vid, (x, y, z) in enumerate(tet_points):
+            gid = get_global_vid(float(x), float(y), float(z))
+            local_to_global[local_vid] = gid
+
+        for elem in tet_elements:
+            v = [int(elem[0]), int(elem[1]), int(elem[2]), int(elem[3])]
+            g = tuple(local_to_global[i] for i in v)
+            global_elements.append(g)
+            eid = len(global_elements)
+            slice_to_tet_eids[slice_idx].append(eid)
+
+    return global_vertices, global_elements, slice_to_tet_eids
+
 
 
 
@@ -1467,21 +1662,29 @@ def main():
         args.cube_size,
         cyl_radius=args.cyl_radius,
     )
-    export_slices_as_stl(args, vertices, slice_to_eids, hexes)
-    export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world)
+    export_slices_as_stl(args, vertices, slice_to_eids, hexes)  # optional hex debug
 
-    # 2) Single uncoupled thermo-mechanical job
-    utd_job = basepath + "_utd"
+    tet_vertices, tet_elements, tet_slice_to_eids = export_mc_slices_as_stl(
+        args,
+        indices_sorted,
+        vox,
+        mc_mesh_world,
+    )
+
+    # 2) Single uncoupled thermo-mechanical job (TETS instead of HEXES)
+    utd_job = basepath + "_utd_tet"
     utd_inp = utd_job + ".inp"
 
-    write_calculix_job(
+    write_calculix_job_tet(
         utd_inp,
-        vertices,
-        hexes,
-        slice_to_eids,
+        tet_vertices,
+        tet_elements,
+        tet_slice_to_eids,
         z_slices,
         shrinkage_curve=[5, 4, 3, 2, 1],
         cure_shrink_per_unit=0.003,  # 3%
+        cyl_params=cyl_params,
+        cube_size=args.cube_size,
         output_stride=args.output_stride,
     )
 
