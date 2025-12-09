@@ -1006,6 +1006,89 @@ def export_mc_slices(args, cyl_params, mc_mesh_world, z_slices):
         log(f"[MC-SLICES] Wrote MC slice {slice_idx} STL to: {out_path}")
 
 
+def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
+    base_name = Path(args.input_stl).stem
+    out_dir = Path(getattr(args, "output_dir", "OUTPUT_SLICES"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # -------------------------------------------------------
+    # 1) Build iz -> slice_idx mapping from voxel info
+    # -------------------------------------------------------
+    # indices_sorted[:, 2] are voxel iz indices
+    unique_iz = np.unique(indices_sorted[:, 2])
+
+    # z_slices was built by sorting layers by w descending; since w grows with iz,
+    # that corresponds to iz in descending order too.
+    unique_iz_desc = np.sort(unique_iz)[::-1]
+
+    # Map voxel iz -> slice index (0..num_slices-1), consistent with z_slices
+    iz_to_slice = {int(iz): int(i) for i, iz in enumerate(unique_iz_desc)}
+
+    num_slices = len(unique_iz_desc)
+    slice_to_mc_faces: dict[int, list[int]] = {i: [] for i in range(num_slices)}
+
+    # -------------------------------------------------------
+    # 2) Get marching-cubes mesh in index space
+    # -------------------------------------------------------
+    mc_idx = vox.marching_cubes         # vertices in index coords, faces in index space
+    mc_verts_idx = np.asarray(mc_idx.vertices, dtype=float)
+    mc_faces_idx = np.asarray(mc_idx.faces, dtype=int)
+
+    # We'll use world-space vertices from mc_mesh_world for geometry
+    mc_verts_world = np.asarray(mc_mesh_world.vertices, dtype=float)
+
+    min_iz = int(unique_iz.min())
+    max_iz = int(unique_iz.max())
+
+    # -------------------------------------------------------
+    # 3) Assign each MC triangle to a voxel iz (then to slice)
+    # -------------------------------------------------------
+    for f_idx, (i0, i1, i2) in enumerate(mc_faces_idx):
+        z0 = mc_verts_idx[i0, 2]
+        z1 = mc_verts_idx[i1, 2]
+        z2 = mc_verts_idx[i2, 2]
+
+        z_mean = (z0 + z1 + z2) / 3.0
+        iz = int(math.floor(z_mean + 1e-6))
+
+        # Clamp to valid iz range just in case
+        if iz < min_iz:
+            iz = min_iz
+        elif iz > max_iz:
+            iz = max_iz
+
+        slice_idx = iz_to_slice.get(iz)
+        if slice_idx is not None:
+            slice_to_mc_faces[slice_idx].append(f_idx)
+
+    # -------------------------------------------------------
+    # 4) Export per-slice marching-cubes STLs in world coords
+    # -------------------------------------------------------
+    mc_out_dir = out_dir / "mc_slices"
+    mc_out_dir.mkdir(parents=True, exist_ok=True)
+
+    for slice_idx, f_indices in slice_to_mc_faces.items():
+        if not f_indices:
+            continue
+
+        sub_faces_idx = mc_faces_idx[np.asarray(f_indices, dtype=int)]
+
+        # Collect vertices actually used and remap to [0..N-1]
+        unique_v, inverse = np.unique(sub_faces_idx.flatten(), return_inverse=True)
+        sub_verts_world = mc_verts_world[unique_v]
+        sub_faces_remap = inverse.reshape((-1, 3))
+
+        slice_mesh = trimesh.Trimesh(
+            vertices=sub_verts_world,
+            faces=sub_faces_remap,
+            process=False,
+        )
+
+        out_path = mc_out_dir / f"{base_name}_mc_slice_{slice_idx:03d}.stl"
+        slice_mesh.export(out_path.as_posix())
+        log(f"[MC-SLICES] Wrote MC slice {slice_idx} STL to: {out_path}")
+
+
 # ============================================================
 #  CLI
 # ============================================================
@@ -1105,93 +1188,7 @@ def main():
         cyl_radius=args.cyl_radius,
     )
     export_slices_as_stl(args, vertices, slice_to_eids, hexes)
-    mc_out = Path(args.out_dir) / f"{Path(args.input_stl).stem}_mc_surface.stl"
-    mc_mesh_world.export(mc_out.as_posix())
-    log(f"[MC] Exported marching-cubes surface to {mc_out}")
-    
-
-    base_name = Path(args.input_stl).stem
-    out_dir = Path(getattr(args, "output_dir", "OUTPUT_SLICES"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # -------------------------------------------------------
-    # 1) Build iz -> slice_idx mapping from voxel info
-    # -------------------------------------------------------
-    # indices_sorted[:, 2] are voxel iz indices
-    unique_iz = np.unique(indices_sorted[:, 2])
-
-    # z_slices was built by sorting layers by w descending; since w grows with iz,
-    # that corresponds to iz in descending order too.
-    unique_iz_desc = np.sort(unique_iz)[::-1]
-
-    # Map voxel iz -> slice index (0..num_slices-1), consistent with z_slices
-    iz_to_slice = {int(iz): int(i) for i, iz in enumerate(unique_iz_desc)}
-
-    num_slices = len(unique_iz_desc)
-    slice_to_mc_faces: dict[int, list[int]] = {i: [] for i in range(num_slices)}
-
-    # -------------------------------------------------------
-    # 2) Get marching-cubes mesh in index space
-    # -------------------------------------------------------
-    mc_idx = vox.marching_cubes         # vertices in index coords, faces in index space
-    mc_verts_idx = np.asarray(mc_idx.vertices, dtype=float)
-    mc_faces_idx = np.asarray(mc_idx.faces, dtype=int)
-
-    # We'll use world-space vertices from mc_mesh_world for geometry
-    mc_verts_world = np.asarray(mc_mesh_world.vertices, dtype=float)
-
-    min_iz = int(unique_iz.min())
-    max_iz = int(unique_iz.max())
-
-    # -------------------------------------------------------
-    # 3) Assign each MC triangle to a voxel iz (then to slice)
-    # -------------------------------------------------------
-    for f_idx, (i0, i1, i2) in enumerate(mc_faces_idx):
-        z0 = mc_verts_idx[i0, 2]
-        z1 = mc_verts_idx[i1, 2]
-        z2 = mc_verts_idx[i2, 2]
-
-        z_mean = (z0 + z1 + z2) / 3.0
-        iz = int(math.floor(z_mean + 1e-6))
-
-        # Clamp to valid iz range just in case
-        if iz < min_iz:
-            iz = min_iz
-        elif iz > max_iz:
-            iz = max_iz
-
-        slice_idx = iz_to_slice.get(iz)
-        if slice_idx is not None:
-            slice_to_mc_faces[slice_idx].append(f_idx)
-
-    # -------------------------------------------------------
-    # 4) Export per-slice marching-cubes STLs in world coords
-    # -------------------------------------------------------
-    mc_out_dir = out_dir / "mc_slices"
-    mc_out_dir.mkdir(parents=True, exist_ok=True)
-
-    for slice_idx, f_indices in slice_to_mc_faces.items():
-        if not f_indices:
-            continue
-
-        sub_faces_idx = mc_faces_idx[np.asarray(f_indices, dtype=int)]
-
-        # Collect vertices actually used and remap to [0..N-1]
-        unique_v, inverse = np.unique(sub_faces_idx.flatten(), return_inverse=True)
-        sub_verts_world = mc_verts_world[unique_v]
-        sub_faces_remap = inverse.reshape((-1, 3))
-
-        slice_mesh = trimesh.Trimesh(
-            vertices=sub_verts_world,
-            faces=sub_faces_remap,
-            process=False,
-        )
-
-        out_path = mc_out_dir / f"{base_name}_mc_slice_{slice_idx:03d}.stl"
-        slice_mesh.export(out_path.as_posix())
-        log(f"[MC-SLICES] Wrote MC slice {slice_idx} STL to: {out_path}")
-
-
+    export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world)
 
     # 2) Single uncoupled thermo-mechanical job
     utd_job = basepath + "_utd"
