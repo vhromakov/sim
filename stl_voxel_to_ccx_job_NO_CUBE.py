@@ -113,398 +113,6 @@ def param_to_world_cyl(
     return (x, y, z)
 
 
-def build_radial_slices_from_stl(
-    input_stl: str,
-    cube_size: float,
-    cyl_radius: float,
-):
-    """
-    Map input STL into cylindrical param space, heal via voxelization there,
-    and slice radially.
-
-    - Heal: voxel union in (u, v, w) with pitch = cube_size.
-    - Slices: one slice per radial voxel layer (thickness = cube_size).
-    - Triangles crossing slice boundaries are split by clipping.
-    - Output: per-slice meshes in WORLD coordinates.
-
-    Returns
-    -------
-    slice_meshes : list[(verts_world, faces)]
-        verts_world: (Nk, 3), faces: (Mk, 3) int
-    w_slices : list[float]
-        slice centers in param-space w.
-    cyl_params : (cx_cyl, cz_cyl, R0, v_offset, y_offset)
-    """
-
-    # ----------------- Load + light cleanup in WORLD space -----------------
-    mesh = trimesh.load(input_stl)
-
-    if isinstance(mesh, trimesh.Scene):
-        geom = []
-        for name, g in mesh.geometry.items():
-            T = mesh.graph.get_transform(name)
-            mg = g.copy()
-            mg.apply_transform(T)
-            geom.append(mg)
-        mesh = trimesh.util.concatenate(geom)
-
-    if isinstance(mesh, (list, tuple)):
-        mesh = trimesh.util.concatenate(mesh)
-
-    if not isinstance(mesh, trimesh.Trimesh):
-        mesh = mesh.dump().sum()
-
-    log(f"[RADIAL] Loaded mesh from {input_stl}")
-    log(
-        f"[RADIAL] Original watertight={mesh.is_watertight}, "
-        f"faces={mesh.faces.shape[0]}, verts={mesh.vertices.shape[0]}, "
-        f"components={len(mesh.split(only_watertight=False))}"
-    )
-
-    # basic cleanup (no component dropping)
-    before_faces = mesh.faces.shape[0]
-    mask_non_deg = mesh.nondegenerate_faces()
-    mesh.update_faces(mask_non_deg)
-    unique_idx = mesh.unique_faces()
-    mesh.update_faces(unique_idx)
-    mesh.remove_unreferenced_vertices()
-    mesh.merge_vertices()
-    after_faces = mesh.faces.shape[0]
-    if after_faces != before_faces:
-        log(
-            f"[RADIAL] Removed degenerate/duplicate faces: "
-            f"{before_faces} -> {after_faces}"
-        )
-
-    log(
-        f"[RADIAL] After world cleanup: watertight={mesh.is_watertight}, "
-        f"faces={mesh.faces.shape[0]}, verts={mesh.vertices.shape[0]}, "
-        f"components={len(mesh.split(only_watertight=False))}"
-    )
-
-    # ----------------- Y-centering (WORLD) -----------------
-    bounds_orig = mesh.bounds
-    x_min_o, y_min_o, z_min_o = bounds_orig[0]
-    x_max_o, y_max_o, z_max_o = bounds_orig[1]
-    y_length = y_max_o - y_min_o
-
-    float_layers = y_length / cube_size
-    ceil_layers = math.ceil(float_layers)
-    y_rem = (ceil_layers - float_layers) / 2.0
-    y_offset = -float(y_min_o) - cube_size / 2.0 + (y_rem * cube_size)
-
-    mesh.apply_translation([0.0, y_offset, 0.0])
-    log(f"[RADIAL] Applied Y offset {y_offset:.6f} so mesh sits nicely on Y grid")
-
-    # ----------------- Cylinder placement (WORLD) -----------------
-    bounds = mesh.bounds
-    x_min_w, y_min_w, z_min_w = bounds[0]
-    x_max_w, y_max_w, z_max_w = bounds[1]
-
-    verts_world = mesh.vertices.copy()
-    z_coords = verts_world[:, 2]
-    min_z_idx = int(np.argmin(z_coords))
-    x_low, y_low, z_low = verts_world[min_z_idx]
-
-    x_coords = verts_world[:, 0]
-    min_x_idx = int(np.argmin(x_coords))
-    x_left, y_left, z_left = verts_world[min_x_idx]
-
-    cx_cyl = float(x_low)
-
-    base_radius = float(cyl_radius)
-    z_center_bbox = 0.5 * (z_min_w + z_max_w)
-    cz_plus = z_low + base_radius
-    cz_minus = z_low - base_radius
-    if abs(cz_plus - z_center_bbox) < abs(cz_minus - z_center_bbox):
-        cz_cyl = cz_plus
-    else:
-        cz_cyl = cz_minus
-
-    dx_all = verts_world[:, 0] - cx_cyl
-    dz_all = verts_world[:, 2] - cz_cyl
-    r_all = np.sqrt(dx_all * dx_all + dz_all * dz_all)
-
-    dx_left = x_left - cx_cyl
-    dz_left = z_left - cz_cyl
-    theta_leftmost = math.atan2(dz_left, dx_left)
-
-    dx_low = x_low - cx_cyl
-    dz_low = z_low - cz_cyl
-    r_lowest = math.sqrt(dx_low * dx_low + dz_low * dz_low)
-    theta_lowest = math.atan2(dz_low, dx_low)
-
-    log(
-        f"[RADIAL] Cyl center from lowest Z vertex: "
-        f"min_z={z_low:.3f}, lowest_pt=({x_low:.3f},{y_low:.3f},{z_low:.3f}), "
-        f"r_low={r_lowest:.6f}, theta_low={theta_lowest:.6f} rad"
-    )
-
-    R_true = r_lowest
-    R0 = float(R_true)
-    log(
-        f"[RADIAL] Cylindrical mapping radius: R0={R0:.6f}, "
-        f"center=({cx_cyl:.3f},{cz_cyl:.3f})"
-    )
-
-    theta_ref = theta_leftmost
-    v_ref = R0 * theta_ref
-    v_offset = -v_ref
-
-    log(
-        f"[RADIAL] Rotating so left-most bbox point is at angle 0: "
-        f"theta_ref={theta_ref:.6f} rad, v_offset={v_offset:.6f}"
-    )
-
-    # ----------------- Map to PARAM space (u,v,w) -----------------
-    verts_param = np.zeros_like(verts_world)
-    for i, (x, y, z) in enumerate(verts_world):
-        u, v, w = world_to_param_cyl((x, y, z), cx_cyl, cz_cyl, R0)
-        v += v_offset
-        verts_param[i] = (u, v, w)
-
-    mesh_param = trimesh.Trimesh(
-        vertices=verts_param,
-        faces=mesh.faces.copy(),
-        process=False,
-    )
-
-    bounds_param_before = mesh_param.bounds
-    log(
-        f"[RADIAL] Param-space bbox before heal: "
-        f"u=[{bounds_param_before[0,0]:.3f},{bounds_param_before[1,0]:.3f}], "
-        f"v=[{bounds_param_before[0,1]:.3f},{bounds_param_before[1,1]:.3f}], "
-        f"w=[{bounds_param_before[0,2]:.3f},{bounds_param_before[1,2]:.3f}]"
-    )
-
-    # ----------------- HEAL in PARAM space via voxel union -----------------
-    heal_pitch = cube_size   # <--- exactly what you wanted
-    log(f"[RADIAL] Voxel-healing in cylindrical param space, pitch={heal_pitch:.6f}")
-
-    vox = mesh_param.voxelized(pitch=heal_pitch)
-    vox.fill()
-    healed_param = vox.marching_cubes
-
-    # cleanup healed mesh
-    mask_non_deg_h = healed_param.nondegenerate_faces()
-    healed_param.update_faces(mask_non_deg_h)
-    unique_idx_h = healed_param.unique_faces()
-    healed_param.update_faces(unique_idx_h)
-    healed_param.remove_unreferenced_vertices()
-    healed_param.merge_vertices()
-
-    log(
-        f"[RADIAL] After param voxel heal: faces={healed_param.faces.shape[0]}, "
-        f"verts={healed_param.vertices.shape[0]}, "
-        f"components={len(healed_param.split(only_watertight=False))}"
-    )
-
-    verts_param_healed = healed_param.vertices.copy()
-    faces_healed = healed_param.faces.copy()
-
-    bounds_param = healed_param.bounds
-    log(
-        f"[RADIAL] Param-space bbox after heal: "
-        f"u=[{bounds_param[0,0]:.3f},{bounds_param[1,0]:.3f}], "
-        f"v=[{bounds_param[0,1]:.3f},{bounds_param[1,1]:.3f}], "
-        f"w=[{bounds_param[0,2]:.3f},{bounds_param[1,2]:.3f}]"
-    )
-
-    # ----------------- Define slices from healed mesh + heal_pitch -----------------
-    n_faces = faces_healed.shape[0]
-
-    w_all = verts_param_healed[faces_healed, 2]  # (M,3)
-    w_tri_min = float(w_all.min())
-    w_tri_max = float(w_all.max())
-
-    if w_tri_max == w_tri_min:
-        n_slices = 1
-        w_boundaries = [
-            w_tri_min - 0.5 * heal_pitch,
-            w_tri_max + 0.5 * heal_pitch,
-        ]
-        w_slices = [0.5 * (w_boundaries[0] + w_boundaries[1])]
-    else:
-        n_slices = max(
-            1,
-            int(math.ceil((w_tri_max - w_tri_min) / heal_pitch)),
-        )
-        w_boundaries = [
-            w_tri_min + i * heal_pitch for i in range(n_slices + 1)
-        ]
-        w_slices = [
-            0.5 * (w_boundaries[i] + w_boundaries[i + 1])
-            for i in range(n_slices)
-        ]
-
-    log(
-        f"[RADIAL] w-range for triangles (healed param mesh): "
-        f"[{w_tri_min:.6f}, {w_tri_max:.6f}], "
-        f"heal_pitch={heal_pitch:.6f} -> {n_slices} radial slices"
-    )
-
-    # ----------------- Clipping helpers in PARAM space -----------------
-    def clip_poly_against_w_min(poly, w_min_clip):
-        if not poly:
-            return []
-        out = []
-        for i in range(len(poly)):
-            P = poly[i]
-            Q = poly[(i + 1) % len(poly)]
-            wP = P[2]
-            wQ = Q[2]
-            inside_P = (wP >= w_min_clip)
-            inside_Q = (wQ >= w_min_clip)
-
-            if inside_P and inside_Q:
-                out.append(Q)
-            elif inside_P and not inside_Q:
-                if wQ != wP:
-                    t = (w_min_clip - wP) / (wQ - wP)
-                    I = P + t * (Q - P)
-                    out.append(I)
-            elif (not inside_P) and inside_Q:
-                if wQ != wP:
-                    t = (w_min_clip - wP) / (wQ - wP)
-                    I = P + t * (Q - P)
-                    out.append(I)
-                out.append(Q)
-            else:
-                pass
-        return out
-
-    def clip_poly_against_w_max(poly, w_max_clip):
-        if not poly:
-            return []
-        out = []
-        for i in range(len(poly)):
-            P = poly[i]
-            Q = poly[(i + 1) % len(poly)]
-            wP = P[2]
-            wQ = Q[2]
-            inside_P = (wP <= w_max_clip)
-            inside_Q = (wQ <= w_max_clip)
-
-            if inside_P and inside_Q:
-                out.append(Q)
-            elif inside_P and not inside_Q:
-                if wQ != wP:
-                    t = (w_max_clip - wP) / (wQ - wP)
-                    I = P + t * (Q - P)
-                    out.append(I)
-            elif (not inside_P) and inside_Q:
-                if wQ != wP:
-                    t = (w_max_clip - wP) / (wQ - wP)
-                    I = P + t * (Q - P)
-                    out.append(I)
-                out.append(Q)
-            else:
-                pass
-        return out
-
-    cyl_params = (cx_cyl, cz_cyl, R0, v_offset, y_offset)
-
-    slice_vertices_param: List[List[np.ndarray]] = [[] for _ in range(n_slices)]
-    slice_faces: List[List[Tuple[int, int, int]]] = [[] for _ in range(n_slices)]
-    slice_vertex_map: List[Dict[Tuple[float, float, float], int]] = [
-        {} for _ in range(n_slices)
-    ]
-
-    def add_polygon_to_slice(slice_idx: int, poly_pts: List[np.ndarray]):
-        if len(poly_pts) < 3:
-            return
-        vmap = slice_vertex_map[slice_idx]
-        vlist = slice_vertices_param[slice_idx]
-        flist = slice_faces[slice_idx]
-
-        idxs = []
-        for P in poly_pts:
-            key = (float(P[0]), float(P[1]), float(P[2]))
-            if key in vmap:
-                idx = vmap[key]
-            else:
-                idx = len(vlist)
-                vmap[key] = idx
-                vlist.append(np.array(P, dtype=float))
-            idxs.append(idx)
-
-        for i in range(1, len(idxs) - 1):
-            flist.append((idxs[0], idxs[i], idxs[i + 1]))
-
-    # ----------------- Process each triangle, clip into slices -----------------
-    for f_id in range(n_faces):
-        idx0, idx1, idx2 = faces_healed[f_id]
-        p0 = verts_param_healed[idx0]
-        p1 = verts_param_healed[idx1]
-        p2 = verts_param_healed[idx2]
-
-        w0, w1, w2 = p0[2], p1[2], p2[2]
-        tri_w_min = min(w0, w1, w2)
-        tri_w_max = max(w0, w1, w2)
-
-        if tri_w_max < w_boundaries[0] or tri_w_min > w_boundaries[-1]:
-            continue
-
-        first_slice = max(
-            0,
-            int(math.floor((tri_w_min - w_boundaries[0]) / heal_pitch)),
-        )
-        last_slice = min(
-            n_slices - 1,
-            int(math.floor((tri_w_max - w_boundaries[0]) / heal_pitch)),
-        )
-
-        first_slice = max(first_slice, 0)
-        last_slice = min(last_slice, n_slices - 1)
-
-        for k in range(first_slice, last_slice + 1):
-            w_min_k = w_boundaries[k]
-            w_max_k = w_boundaries[k + 1]
-
-            poly = [p0.copy(), p1.copy(), p2.copy()]
-            poly = clip_poly_against_w_min(poly, w_min_k)
-            if not poly:
-                continue
-            poly = clip_poly_against_w_max(poly, w_max_k)
-            if not poly:
-                continue
-
-            add_polygon_to_slice(k, poly)
-
-    # ----------------- Convert per-slice PARAM verts -> WORLD -----------------
-    slice_meshes: List[Tuple[np.ndarray, np.ndarray]] = []
-
-    cx_cyl, cz_cyl, R0, v_offset, y_offset = cyl_params
-
-    for k in range(n_slices):
-        vlist_param = slice_vertices_param[k]
-        flist = slice_faces[k]
-        if not vlist_param or not flist:
-            slice_meshes.append((np.zeros((0, 3)), np.zeros((0, 3), dtype=int)))
-            continue
-
-        v_param_arr = np.array(vlist_param, dtype=float)
-        n_vk = v_param_arr.shape[0]
-        verts_world_k = np.zeros((n_vk, 3), dtype=float)
-
-        for i in range(n_vk):
-            u, v, w = v_param_arr[i]
-            v_world_param = v - v_offset  # undo tangential offset
-            x, y, z = param_to_world_cyl((u, v_world_param, w), cx_cyl, cz_cyl, R0)
-            y -= y_offset  # undo Y shift
-            verts_world_k[i] = (x, y, z)
-
-        faces_k = np.array(flist, dtype=int)
-        slice_meshes.append((verts_world_k, faces_k))
-
-    log(
-        f"[RADIAL] Built split radial slices (param-healed): "
-        f"{n_slices} slices (some may be empty)."
-    )
-
-    return slice_meshes, w_slices, cyl_params
-
-
 # ============================================================
 #  Voxel mesh -> CalculiX job (cylindrical only, rewritten
 #  around gen_grid.py voxelization pipeline)
@@ -530,6 +138,10 @@ def generate_global_cubic_hex_mesh(
           inward_offset = sagitta so that midpoint of a 1-voxel chord lies on R0.
     - We rotate the mesh in param space so that the lowest point ends up at angle 0
       (v=0), then undo this rotation when mapping voxels back to world.
+
+    Additionally:
+    - Build a marching-cubes surface from the voxel grid in param space,
+      map it back to world space on the cylinder and return it as mc_mesh_world.
     """
 
     mesh = trimesh.load(input_stl)
@@ -719,41 +331,6 @@ def generate_global_cubic_hex_mesh(
 
     mesh.vertices = verts_param
 
-    # ----------------------------------------------------------
-    # Create bounding-box mesh of the transformed STL in param space
-    # ----------------------------------------------------------
-    bounds_param = mesh.bounds  # [[xmin, ymin, zmin], [xmax, ymax, zmax]]
-    min_x, min_y, min_w = bounds_param[0]
-    max_x, max_y, max_w = bounds_param[1]
-
-    bbox_corners = np.array([
-        [min_x, min_y, min_w],
-        [max_x, min_y, min_w],
-        [max_x, max_y, min_w],
-        [min_x, max_y, min_w],
-        [min_x, min_y, max_w],
-        [max_x, min_y, max_w],
-        [max_x, max_y, max_w],
-        [min_x, max_y, max_w],
-    ])
-
-    bbox_faces = np.array([
-        [0, 1, 2], [0, 2, 3],  # bottom
-        [4, 5, 6], [4, 6, 7],  # top
-        [0, 1, 5], [0, 5, 4],  # side
-        [1, 2, 6], [1, 6, 5],  # side
-        [2, 3, 7], [2, 7, 6],  # side
-        [3, 0, 4], [3, 4, 7],  # side
-    ])
-
-    bbox_mesh_param = trimesh.Trimesh(
-        vertices=bbox_corners,
-        faces=bbox_faces,
-        process=False
-    )
-
-    log(f"[VOXEL] Created param-space bounding box mesh: {bbox_mesh_param.bounds}")
-
     # --- Tangential (v) extents of the STL in param space -------------
     v_min_mesh = float(verts_param[:, 1].min())
     v_max_mesh = float(verts_param[:, 1].max())
@@ -774,17 +351,6 @@ def generate_global_cubic_hex_mesh(
     order = np.lexsort((indices[:, 0], indices[:, 1], indices[:, 2]))
     indices_sorted = indices[order]
 
-    # --- Voxelization in param coordinates (BBOX) ---
-    log(f"[VOXEL] Voxelizing bounding-box with cube size = {cube_size} ...")
-    vox_bbox = bbox_mesh_param.voxelized(pitch=cube_size)
-    vox_bbox.fill()
-
-    indices_bbox = vox_bbox.sparse_indices
-    log(f"[VOXEL] Total filled bbox voxels: {indices_bbox.shape[0]}")
-
-    order_bbox = np.lexsort((indices_bbox[:, 0], indices_bbox[:, 1], indices_bbox[:, 2]))
-    indices_bbox_sorted = indices_bbox[order_bbox]
-
     # --- Map iz -> slice "position" in param space: w_center (STL) ---
     unique_iz = np.unique(indices_sorted[:, 2])
     layer_info: List[Tuple[int, float]] = []
@@ -802,23 +368,6 @@ def generate_global_cubic_hex_mesh(
         iz_to_slice[int(iz)] = slice_idx
         z_slices.append(pos)
 
-    # --- Map iz -> slice "position" in param space: w_center (BBOX) ---
-    unique_iz_bbox = np.unique(indices_bbox_sorted[:, 2])
-    layer_info_bbox: List[Tuple[int, float]] = []
-    for iz in unique_iz_bbox:
-        idx_arr = np.array([[0, 0, iz]], dtype=float)
-        pt = vox_bbox.indices_to_points(idx_arr)[0]
-        slice_coord = float(pt[2])
-        layer_info_bbox.append((int(iz), slice_coord))
-
-    layer_info_bbox.sort(key=lambda x: x[1], reverse=True)
-
-    iz_to_slice_bbox: Dict[int, int] = {}
-    z_slices_bbox: List[float] = []
-    for slice_idx, (iz, pos) in enumerate(layer_info_bbox):
-        iz_to_slice_bbox[int(iz)] = slice_idx
-        z_slices_bbox.append(pos)
-
     # --- Prepare lattice structures (STL) ---
     vertex_index_map: Dict[Tuple[int, int, int], int] = {}
     vertices: List[Tuple[float, float, float]] = []
@@ -834,25 +383,6 @@ def generate_global_cubic_hex_mesh(
         idx = len(vertices) + 1
         vertex_index_map[key] = idx
         vertices.append(coord)
-        return idx
-
-    # --- Prepare lattice structures (BBOX) ---
-    vertex_index_map_bbox: Dict[Tuple[int, int, int], int] = {}
-    vertices_bbox: List[Tuple[float, float, float]] = []
-    hexes_bbox: List[Tuple[int, int, int, int, int, int, int, int]] = []
-    slice_to_eids_bbox: Dict[int, List[int]] = {
-        i: [] for i in range(len(z_slices_bbox))
-    }
-
-    def get_vertex_index_bbox(
-        key: Tuple[int, int, int],
-        coord: Tuple[float, float, float],
-    ) -> int:
-        if key in vertex_index_map_bbox:
-            return vertex_index_map_bbox[key]
-        idx = len(vertices_bbox) + 1
-        vertex_index_map_bbox[key] = idx
-        vertices_bbox.append(coord)
         return idx
 
     # --- Build voxel-node lattice & hex connectivity (STL) ---
@@ -905,55 +435,45 @@ def generate_global_cubic_hex_mesh(
         slice_idx = iz_to_slice[int(iz)]
         slice_to_eids[slice_idx].append(eid)
 
-    # --- Build voxel-node lattice & hex connectivity (BBOX) ---
-    log("[VOXEL] Building voxel-node lattice (curved hexa nodes) for BBOX ...")
+    # -------------------------------------------------
+    # Marching-cubes surface from voxel grid
+    #   (index space -> param space -> world)
+    # -------------------------------------------------
+    log("[VOXEL] Running marching cubes via vox.marching_cubes ...")
 
-    for (ix, iy, iz) in indices_bbox_sorted:
-        center_param = vox_bbox.indices_to_points(
-            np.array([[ix, iy, iz]], dtype=float)
-        )[0]
-        u_c, v_c, w_c = center_param
+    # 1) marching_cubes returns vertices in *index* space (like [ix+0.5, iy, iz+0.25])
+    mc_param = vox.marching_cubes  # Trimesh in voxel index coords
 
-        # Undo the tangential rotation before mapping back to world
-        v_c -= v_offset
+    # 2) convert those index coords to param-space (u, v, w)
+    #    using the same transform as for voxel centers
+    mc_vertices_param = vox.indices_to_points(mc_param.vertices)  # (N, 3) in param coords
+    mc_faces = mc_param.faces
 
-        u0, u1 = u_c - half, u_c + half
-        v0, v1 = v_c - half, v_c + half
-        w0, w1 = w_c - half, w_c + half
+    # 3) map param-space vertices to world on cylinder,
+    #    applying the same v_offset and y_offset logic as for hexes
+    mc_vertices_world = np.zeros_like(mc_vertices_param)
+    for i, (u, v, w) in enumerate(mc_vertices_param):
+        # undo tangential rotation we added before voxelization
+        v_adj = v - v_offset
 
-        p0 = (u0, v0, w0)
-        p1 = (u1, v0, w0)
-        p2 = (u1, v1, w0)
-        p3 = (u0, v1, w0)
-        p4 = (u0, v0, w1)
-        p5 = (u1, v0, w1)
-        p6 = (u1, v1, w1)
-        p7 = (u0, v1, w1)
+        # param -> world on cylinder
+        x, y, z = param_to_world_cyl((u, v_adj, w), cx_cyl, cz_cyl, R0)
 
-        x0, y0, z0 = param_to_world_cyl(p0, cx_cyl, cz_cyl, R0)
-        x1, y1, z1 = param_to_world_cyl(p1, cx_cyl, cz_cyl, R0)
-        x2, y2, z2 = param_to_world_cyl(p2, cx_cyl, cz_cyl, R0)
-        x3, y3, z3 = param_to_world_cyl(p3, cx_cyl, cz_cyl, R0)
-        x4, y4, z4 = param_to_world_cyl(p4, cx_cyl, cz_cyl, R0)
-        x5, y5, z5 = param_to_world_cyl(p5, cx_cyl, cz_cyl, R0)
-        x6, y6, z6 = param_to_world_cyl(p6, cx_cyl, cz_cyl, R0)
-        x7, y7, z7 = param_to_world_cyl(p7, cx_cyl, cz_cyl, R0)
+        # undo initial Y shift so it matches original STL frame
+        y -= y_offset
 
-        v0_idx = get_vertex_index_bbox((ix,   iy,   iz),   (x0, y0, z0))
-        v1_idx = get_vertex_index_bbox((ix+1, iy,   iz),   (x1, y1, z1))
-        v2_idx = get_vertex_index_bbox((ix+1, iy+1, iz),   (x2, y2, z2))
-        v3_idx = get_vertex_index_bbox((ix,   iy+1, iz),   (x3, y3, z3))
-        v4_idx = get_vertex_index_bbox((ix,   iy,   iz+1), (x4, y4, z4))
-        v5_idx = get_vertex_index_bbox((ix+1, iy,   iz+1), (x5, y5, z5))
-        v6_idx = get_vertex_index_bbox((ix+1, iy+1, iz+1), (x6, y6, z6))
-        v7_idx = get_vertex_index_bbox((ix,   iy+1, iz+1), (x7, y7, z7))
+        mc_vertices_world[i] = (x, y, z)
 
-        hexes_bbox.append((v0_idx, v1_idx, v2_idx, v3_idx,
-                           v4_idx, v5_idx, v6_idx, v7_idx))
+    mc_mesh_world = trimesh.Trimesh(
+        vertices=mc_vertices_world,
+        faces=mc_faces,
+        process=False,
+    )
 
-        eid = len(hexes_bbox)
-        slice_idx = iz_to_slice_bbox[int(iz)]
-        slice_to_eids_bbox[slice_idx].append(eid)
+    log(
+        f"[VOXEL] Marching-cubes surface (world): "
+        f"{len(mc_vertices_world)} verts, {len(mc_faces)} faces"
+    )
 
     # Store cylindrical parameters + v_offset + y_offset
     cyl_params = (cx_cyl, cz_cyl, R0, v_offset, y_offset)
@@ -962,14 +482,9 @@ def generate_global_cubic_hex_mesh(
         f"[VOXEL] Built STL mesh (voxelization frame): {len(vertices)} nodes, "
         f"{len(hexes)} hex elements, {len(z_slices)} radial slices."
     )
-    log(
-        f"[VOXEL] Built BBOX mesh (voxelization frame): {len(vertices_bbox)} nodes, "
-        f"{len(hexes_bbox)} hex elements, {len(z_slices_bbox)} radial slices."
-    )
 
-    # --- Undo Y-shift for returned data so voxels sit back where STL was ---
+    # --- Undo Y-shift for returned marker points so they sit back where STL was ---
     vertices = [(x, y - y_offset, z) for (x, y, z) in vertices]
-    vertices_bbox = [(x, y - y_offset, z) for (x, y, z) in vertices_bbox]
 
     if lowest_point_world is not None:
         lx, ly, lz = lowest_point_world
@@ -992,17 +507,6 @@ def generate_global_cubic_hex_mesh(
         "(original STL frame)"
     )
 
-    indices_bbox_sorted = indices_bbox_sorted[:, [1, 0, 2]]
-    # indices_bbox_sorted = indices_bbox_sorted[::-1]
-    vertex_index_map_bbox = {
-        (iy, ix, iz): idx
-        for (ix, iy, iz), idx in vertex_index_map_bbox.items()
-    }
-    # vertex_index_map_bbox = {
-    #     k: vertex_index_map_bbox[k]
-    #     for k in reversed(list(vertex_index_map_bbox.keys()))
-    # }
-
     return (
         # STL mesh results
         vertices,
@@ -1016,15 +520,7 @@ def generate_global_cubic_hex_mesh(
         edge_right_world,
         indices_sorted,      # for STL debug export
         vox,                 # for STL debug export
-
-        # BBOX mesh results
-        vertices_bbox,
-        hexes_bbox,
-        slice_to_eids_bbox,
-        z_slices_bbox,
-        indices_bbox_sorted, # for BBOX debug export
-        vox_bbox,            # for BBOX debug export
-        vertex_index_map_bbox,
+        mc_mesh_world,       # marching-cubes surface in world coords
     )
 
 
@@ -1361,6 +857,82 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
 import os
 import json
 import numpy as np
+from pathlib import Path
+import numpy as np
+import trimesh
+
+
+def export_slices_as_stl(args, vertices, slice_to_eids, hexes):
+    # -----------------------------
+    # Export each slice as a STL
+    # -----------------------------
+    out_dir = Path(getattr(args, "output_dir", "OUTPUT_SLICES"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    verts_np = np.asarray(vertices, dtype=float)
+
+    # hexes are 1-based node indices
+    def hex_to_faces(hex_nodes):
+        v0, v1, v2, v3, v4, v5, v6, v7 = hex_nodes
+        # 6 quad faces of a hex (consistent ordering)
+        return [
+            (v0, v1, v2, v3),  # bottom
+            (v4, v5, v6, v7),  # top
+            (v0, v1, v5, v4),  # side
+            (v1, v2, v6, v5),  # side
+            (v2, v3, v7, v6),  # side
+            (v3, v0, v4, v7),  # side
+        ]
+
+    base_name = Path(args.input_stl).stem
+
+    for slice_idx in sorted(slice_to_eids.keys()):
+        eids = slice_to_eids[slice_idx]
+        if not eids:
+            continue
+
+        # Count faces: internal faces appear twice, boundary faces once
+        face_counter = {}
+        face_oriented = {}
+
+        for eid in eids:
+            h = hexes[eid - 1]  # hexes are 1-based in this list
+            for f in hex_to_faces(h):
+                key = tuple(sorted(f))  # key without orientation
+                face_counter[key] = face_counter.get(key, 0) + 1
+                # store one oriented version for triangulation
+                if key not in face_oriented:
+                    face_oriented[key] = f
+
+        tri_faces = []
+        for key, count in face_counter.items():
+            if count != 1:
+                # internal face, shared by two hexes -> skip
+                continue
+            v0, v1, v2, v3 = face_oriented[key]
+            # convert to 0-based indices
+            v0 -= 1
+            v1 -= 1
+            v2 -= 1
+            v3 -= 1
+            # split quad into two triangles
+            tri_faces.append([v0, v1, v2])
+            tri_faces.append([v0, v2, v3])
+
+        if not tri_faces:
+            continue
+
+        tri_faces_np = np.asarray(tri_faces, dtype=int)
+
+        slice_mesh = trimesh.Trimesh(
+            vertices=verts_np,
+            faces=tri_faces_np,
+            process=False,
+        )
+
+        out_path = out_dir / f"{base_name}_slice_{slice_idx:03d}.stl"
+        slice_mesh.export(out_path.as_posix())
+        log(f"[SLICES] Wrote slice {slice_idx} STL to: {out_path}")
 
 
 # ============================================================
@@ -1370,8 +942,11 @@ import numpy as np
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Radially slice an STL in cylindrical coordinates. "
-            "Triangles are split on radial layer boundaries."
+            "Voxelize an STL in cylindrical coordinates and generate an "
+            "uncoupled thermo-mechanical CalculiX job with C3D8R hexahedra "
+            "and layer-by-layer *UNCOUPLED TEMPERATURE-DISPLACEMENT steps, "
+            "then deform the input STL using PyGeM FFD (forward + pre-deformed) "
+            "and optionally export the lattice as separate PLY point clouds."
         )
     )
     parser.add_argument("input_stl", help="Path to input STL file")
@@ -1386,14 +961,47 @@ def main():
         "-s",
         type=float,
         required=True,
-        help="Radial layer thickness (same units as STL, e.g. mm)",
+        help="Edge length of each voxel cube (same units as STL, e.g. mm)",
     )
+    parser.add_argument(
+        "--run-ccx",
+        action="store_true",
+        help="If set, run CalculiX on the generated job.",
+    )
+    parser.add_argument(
+        "--ccx-cmd",
+        default="ccx",
+        help="CalculiX executable (default 'ccx'). Example: "
+             "'ccx', 'ccx_static', 'C:\\path\\to\\ccx.exe'",
+    )
+    parser.add_argument(
+        "--output-stride",
+        type=int,
+        default=1,
+        help=(
+            "Request nodal outputs only every Nth curing step (>=1). "
+            "The very last curing step always produces output."
+        ),
+    )
+    parser.add_argument(
+        "--export-lattice",
+        action="store_true",
+        help=(
+            "Export FFD lattice as '<base_name>_lattice_orig.ply' and "
+            "'<base_name>_lattice_def.ply' point clouds, where <base_name> is "
+            "derived from the input STL filename."
+        ),
+    )
+    # Cylindrical options
     parser.add_argument(
         "--cyl-radius",
         type=float,
-        required=True,
-        help="Base cylinder radius R0 for param mapping (mm).",
+        help=(
+            "Base cylinder radius R0 for param mapping. "
+            "If omitted, estimated from STL geometry."
+        ),
     )
+
     args = parser.parse_args()
 
     if not os.path.isfile(args.input_stl):
@@ -1406,32 +1014,52 @@ def main():
     job_base = os.path.splitext(os.path.basename(args.input_stl))[0]
     basepath = os.path.join(out_dir, job_base)
 
-    slice_meshes, w_slices, cyl_params = build_radial_slices_from_stl(
+    # 1) Mesh (cylindrical curved voxels only)
+    (
+        vertices,
+        hexes,
+        slice_to_eids,
+        z_slices,
+        cyl_params,
+        lowest_point,
+        axis_point,
+        edge_left_point,
+        edge_right_point,
+        indices_sorted,
+        vox,
+        mc_mesh_world,   # NEW
+    ) = generate_global_cubic_hex_mesh(
         args.input_stl,
-        cube_size=args.cube_size,
+        args.cube_size,
         cyl_radius=args.cyl_radius,
     )
+    export_slices_as_stl(args, vertices, slice_to_eids, hexes)
+    mc_out = Path(args.out_dir) / f"{Path(args.input_stl).stem}_mc_surface.stl"
+    mc_mesh_world.export(mc_out.as_posix())
+    log(f"[MC] Exported marching-cubes surface to {mc_out}")
 
-    log(f"[RADIAL] Got {len(w_slices)} radial slices")
 
-    for k, (verts_k, faces_k) in enumerate(slice_meshes):
-        if verts_k.shape[0] == 0 or faces_k.shape[0] == 0:
-            continue
-        sub_mesh = trimesh.Trimesh(
-            vertices=verts_k,
-            faces=faces_k,
-            process=False,
-        )
-        out_stl = f"{basepath}_slice_{k:03d}.stl"
-        sub_mesh.export(out_stl)
-        log(
-            f"[RADIAL] Slice {k:03d}: "
-            f"{faces_k.shape[0]} faces, {verts_k.shape[0]} verts, "
-            f"w_center={w_slices[k]:.6f} -> {out_stl}"
-        )
+    # 2) Single uncoupled thermo-mechanical job
+    utd_job = basepath + "_utd"
+    utd_inp = utd_job + ".inp"
 
-    log("[RADIAL] Done.")
+    write_calculix_job(
+        utd_inp,
+        vertices,
+        hexes,
+        slice_to_eids,
+        z_slices,
+        shrinkage_curve=[5, 4, 3, 2, 1],
+        cure_shrink_per_unit=0.003,  # 3%
+        output_stride=args.output_stride,
+    )
 
+    # 3) Optional run + PyGeM FFD deformation + lattice export
+    if args.run_ccx:
+        ok = run_calculix(utd_job, ccx_cmd=args.ccx_cmd)
+        if not ok:
+            log("[RUN] UTD job failed, skipping FFD.")
+            return
 
 if __name__ == "__main__":
     main()
