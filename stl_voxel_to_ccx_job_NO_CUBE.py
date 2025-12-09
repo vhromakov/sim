@@ -28,6 +28,7 @@ Pipeline (cylindrical workflow only):
 import argparse
 import os
 from typing import List, Tuple, Dict, Set, Optional
+import triangle as tr
 
 import math
 import numpy as np
@@ -939,71 +940,303 @@ def export_slices_as_stl(args, vertices, slice_to_eids, hexes):
         log(f"[SLICES] Wrote slice {slice_idx} STL to: {out_path}")
 
 
-def export_mc_slices(args, cyl_params, mc_mesh_world, z_slices):
-    from pathlib import Path
-    import numpy as np
-    import trimesh
+def build_bottom_cap_faces_from_loops(
+    verts_idx_slice: np.ndarray,
+    faces_local: np.ndarray,
+    z_band: float = 0.5,
+) -> np.ndarray:
+    """
+    Build a radial bottom cap for one MC slice using boundary contour loops.
 
-    # Unpack cylindrical parameters
-    cx_cyl, cz_cyl, R0, v_offset, y_offset = cyl_params
+    Parameters
+    ----------
+    verts_idx_slice : (N, 3)
+        Slice vertices in index coords (ix, iy, iz), local indexing [0..N-1].
+    faces_local : (F, 3)
+        Slice faces in terms of local vertex indices [0..N-1].
+        (All faces of the slice, not pre-filtered by plane.)
+    z_band : float
+        Max allowed |mean_z(loop) - max_mean_z| in index units for loops
+        to be considered "bottom" loops.
 
-    base_name = Path(args.input_stl).stem
-    out_dir = Path(getattr(args, "output_dir", "OUTPUT_SLICES"))
-    out_dir.mkdir(parents=True, exist_ok=True)
+    Returns
+    -------
+    faces_cap_local : (K, 3) int
+        Triangle faces (local vertex indices) forming the bottom cap.
+        May be empty if no suitable loops are found.
+    """
 
-    # ---- Marching-cubes slicing: MC slices aligned with voxel slices ----
-    mc_verts_world = np.asarray(mc_mesh_world.vertices, dtype=float)
-    mc_faces = np.asarray(mc_mesh_world.faces, dtype=int)
+    if verts_idx_slice.shape[0] < 3 or faces_local.shape[0] == 0:
+        return np.zeros((0, 3), dtype=int)
 
-    z_slices_arr = np.asarray(z_slices, dtype=float)  # param-space w centers, one per slice
+    # --- 1) Find boundary edges (edges used exactly once in this slice) ---
+    edge_count: dict[tuple[int, int], int] = {}
+    for (i0, i1, i2) in faces_local:
+        for a, b in ((i0, i1), (i1, i2), (i2, i0)):
+            e = (min(a, b), max(a, b))
+            edge_count[e] = edge_count.get(e, 0) + 1
 
-    # slice_idx -> list of face indices (into mc_faces)
-    slice_to_mc_faces: dict[int, list[int]] = {i: [] for i in range(len(z_slices))}
+    boundary_edges = [e for e, c in edge_count.items() if c == 1]
+    if not boundary_edges:
+        return np.zeros((0, 3), dtype=int)
 
-    for f_idx, (i0, i1, i2) in enumerate(mc_faces):
-        # world-space triangle vertices
-        v0 = mc_verts_world[i0]
-        v1 = mc_verts_world[i1]
-        v2 = mc_verts_world[i2]
+    # --- 2) Build adjacency on boundary edges and extract loops ---
+    from collections import defaultdict
 
-        # centroid in world coords
-        centroid_world = (v0 + v1 + v2) / 3.0
-        x_c, y_c, z_c = centroid_world
+    adj: dict[int, set[int]] = defaultdict(set)
+    for a, b in boundary_edges:
+        adj[a].add(b)
+        adj[b].add(a)
 
-        # go back to the voxelization frame: re-apply Y-shift
-        y_c_vox = y_c + y_offset
+    loops: list[list[int]] = []
+    visited_edges: set[tuple[int, int]] = set()
 
-        # world -> param (u, v, w); w is our "radial layer" coordinate
-        u_c, v_c, w_c = world_to_param_cyl((x_c, y_c_vox, z_c), cx_cyl, cz_cyl, R0)
+    def edge_key(a: int, b: int) -> tuple[int, int]:
+        return (min(a, b), max(a, b))
 
-        # assign this face to the nearest voxel slice by w
-        slice_idx = int(np.argmin(np.abs(z_slices_arr - w_c)))
-        slice_to_mc_faces[slice_idx].append(f_idx)
-
-    # ---- Export one STL per MC slice ----
-    mc_out_dir = out_dir / "mc_slices"
-    mc_out_dir.mkdir(parents=True, exist_ok=True)
-
-    for slice_idx, f_indices in slice_to_mc_faces.items():
-        if not f_indices:
+    for a, b in boundary_edges:
+        if edge_key(a, b) in visited_edges:
             continue
 
-        sub_faces = mc_faces[np.asarray(f_indices, dtype=int)]
+        # start a new loop following edges
+        loop: list[int] = [a]
+        prev = None
+        cur = a
 
-        # collect used vertices and remap indices to a compact range [0..N-1]
-        unique_verts, inverse = np.unique(sub_faces.flatten(), return_inverse=True)
-        sub_verts = mc_verts_world[unique_verts]
-        sub_faces_remap = inverse.reshape((-1, 3))
+        for _ in range(len(boundary_edges) * 4):  # safety cap
+            neigh = adj[cur]
+            if prev is None:
+                candidates = [b]
+            else:
+                candidates = [n for n in neigh if n != prev]
 
-        slice_mesh = trimesh.Trimesh(
-            vertices=sub_verts,
-            faces=sub_faces_remap,
-            process=False,
+            if not candidates:
+                break
+
+            nxt = candidates[0]
+            visited_edges.add(edge_key(cur, nxt))
+            loop.append(nxt)
+
+            prev, cur = cur, nxt
+            if cur == a:
+                break
+
+        if len(loop) > 2 and loop[0] == loop[-1]:
+            loops.append(loop[:-1])  # drop duplicate last
+
+    if not loops:
+        return np.zeros((0, 3), dtype=int)
+
+    # --- 3) Compute mean z and area per loop to detect "bottom" loops ---
+    loop_stats = []  # (loop_idx, mean_z, signed_area)
+    for li, loop in enumerate(loops):
+        if len(loop) < 3:
+            continue
+        zs = verts_idx_slice[loop, 2]
+        mean_z = float(zs.mean())
+
+        poly2d = verts_idx_slice[loop, :2].astype(float)
+        area = 0.0
+        for i in range(len(poly2d)):
+            x0, y0 = poly2d[i]
+            x1, y1 = poly2d[(i + 1) % len(poly2d)]
+            area += x0 * y1 - x1 * y0
+        area *= 0.5
+
+        loop_stats.append((li, mean_z, area))
+
+    if not loop_stats:
+        return np.zeros((0, 3), dtype=int)
+
+    max_mean_z = max(s[1] for s in loop_stats)
+    bottom_loop_ids = [
+        li for (li, mean_z, _area) in loop_stats
+        if abs(mean_z - max_mean_z) <= z_band
+    ]
+    if not bottom_loop_ids:
+        return np.zeros((0, 3), dtype=int)
+
+    # ================== 4) DEPTH (how many loops fully contain it) =====
+    poly2d_by_loop: dict[int, np.ndarray] = {}
+    for li in bottom_loop_ids:
+        loop = loops[li]
+        poly2d_by_loop[li] = verts_idx_slice[loop, :2].astype(float)
+
+    def _point_in_poly(pt: np.ndarray, poly: np.ndarray) -> bool:
+        """Ray casting point-in-polygon test in 2D."""
+        x, y = float(pt[0]), float(pt[1])
+        inside = False
+        n = poly.shape[0]
+        for i in range(n):
+            x0, y0 = poly[i]
+            x1, y1 = poly[(i + 1) % n]
+            cond = ((y0 > y) != (y1 > y))
+            if cond:
+                x_int = x0 + (y - y0) * (x1 - x0) / (y1 - y0 + 1e-16)
+                if x_int > x:
+                    inside = not inside
+        return inside
+
+    def _poly_fully_inside(inner: np.ndarray, outer: np.ndarray) -> bool:
+        """Return True if **all points** of `inner` lie inside `outer`."""
+        for pt in inner:
+            if not _point_in_poly(pt, outer):
+                return False
+        return True
+
+    depth: dict[int, int] = {li: 0 for li in bottom_loop_ids}
+    for li in bottom_loop_ids:
+        inner_poly = poly2d_by_loop[li]
+        d = 0
+        for lj in bottom_loop_ids:
+            if lj == li:
+                continue
+            outer_poly = poly2d_by_loop[lj]
+            if _poly_fully_inside(inner_poly, outer_poly):
+                d += 1
+        depth[li] = d
+
+    # ============ 5) Helper: interior point for a polygon (no centroids) ==
+    def _find_interior_point(poly: np.ndarray) -> np.ndarray:
+        """
+        Find a point strictly inside `poly` using grid search over its bbox.
+        Does NOT use polygon area centroid.
+        """
+        poly = np.asarray(poly, dtype=float)
+        xmin, ymin = poly.min(axis=0)
+        xmax, ymax = poly.max(axis=0)
+
+        if xmax == xmin and ymax == ymin:
+            return poly[0].copy()
+
+        # Coarse grid search inside bbox
+        steps = 10
+        for i in range(steps):
+            for j in range(steps):
+                x = xmin + (i + 0.5) / steps * (xmax - xmin)
+                y = ymin + (j + 0.5) / steps * (ymax - ymin)
+                p = np.array([x, y], dtype=float)
+                if _point_in_poly(p, poly):
+                    return p
+
+        # Fallback: nudge vertices toward bbox center
+        cx = 0.5 * (xmin + xmax)
+        cy = 0.5 * (ymin + ymax)
+        center = np.array([cx, cy], dtype=float)
+        for v in poly:
+            cand = v + 0.25 * (center - v)
+            if _point_in_poly(cand, poly):
+                return cand
+
+        # Last resort: bbox center (may still be outside, but extremely rare)
+        return center
+
+    # ================== 6) TRIANGULATE FOR ALL EVEN DEPTHS ==============
+    # For each loop with even depth d: it's an "outer" region; all loops
+    # with depth d+1 fully inside it are holes for that region.
+    faces_cap_local: list[list[int]] = []
+    tri_call_idx = 0
+
+    for outer_li in bottom_loop_ids:
+        d_outer = depth[outer_li]
+        if d_outer % 2 != 0:
+            continue  # only even-depth loops define solid regions
+
+        outer_poly = poly2d_by_loop[outer_li]
+
+        # find all depth-(d_outer+1) loops fully inside this outer
+        hole_lis: list[int] = []
+        for li in bottom_loop_ids:
+            if li == outer_li or depth[li] != d_outer + 1:
+                continue
+            inner_poly = poly2d_by_loop[li]
+            if _poly_fully_inside(inner_poly, outer_poly):
+                hole_lis.append(li)
+
+        # Collect all vertex ids used by outer + its holes
+        vert_ids_set: set[int] = set(loops[outer_li])
+        for li in hole_lis:
+            vert_ids_set.update(loops[li])
+        if len(vert_ids_set) < 3:
+            continue
+
+        vert_ids_sorted = sorted(vert_ids_set)
+        local_to_pslg: dict[int, int] = {
+            v: i for i, v in enumerate(vert_ids_sorted)
+        }
+
+        pts2d = np.array(
+            [verts_idx_slice[v, :2] for v in vert_ids_sorted],
+            dtype=float,
         )
 
-        out_path = mc_out_dir / f"{base_name}_mc_slice_{slice_idx:03d}.stl"
-        slice_mesh.export(out_path.as_posix())
-        log(f"[MC-SLICES] Wrote MC slice {slice_idx} STL to: {out_path}")
+        segments: list[tuple[int, int]] = []
+
+        # segments for outer loop
+        outer_loop = loops[outer_li]
+        L_out = len(outer_loop)
+        for i in range(L_out):
+            v0 = outer_loop[i]
+            v1 = outer_loop[(i + 1) % L_out]
+            s0 = local_to_pslg[v0]
+            s1 = local_to_pslg[v1]
+            segments.append((s0, s1))
+
+        # segments for each hole loop
+        for li in hole_lis:
+            loop = loops[li]
+            L = len(loop)
+            if L < 2:
+                continue
+            for i in range(L):
+                v0 = loop[i]
+                v1 = loop[(i + 1) % L]
+                s0 = local_to_pslg[v0]
+                s1 = local_to_pslg[v1]
+                segments.append((s0, s1))
+
+        if not segments:
+            continue
+
+        # Hole points: robust interior points for each hole polygon
+        holes_pts: list[list[float]] = []
+        for li in hole_lis:
+            poly_hole = poly2d_by_loop[li]
+            p_in = _find_interior_point(poly_hole)
+            holes_pts.append([float(p_in[0]), float(p_in[1])])
+
+        data = {
+            "vertices": pts2d,
+            "segments": np.array(segments, dtype=int),
+        }
+        if holes_pts:
+            data["holes"] = np.array(holes_pts, dtype=float)
+
+        # --- DEBUG Triangle input for this outer+holes -----------------
+        tri_call_idx += 1
+        pts3d = np.column_stack(
+            [pts2d, np.zeros((pts2d.shape[0],), dtype=float)]
+        )
+
+        tri_out = tr.triangulate(data, "pQ")
+        if "triangles" not in tri_out:
+            continue
+
+        tris_pslg = tri_out["triangles"]
+        if tris_pslg.shape[0] == 0:
+            continue
+
+        # Map PSLG indices back to original local vertex indices
+        for a, b, c in tris_pslg:
+            ga = vert_ids_sorted[a]
+            gb = vert_ids_sorted[b]
+            gc = vert_ids_sorted[c]
+            faces_cap_local.append([ga, gb, gc])
+
+    if not faces_cap_local:
+        return np.zeros((0, 3), dtype=int)
+
+    return np.asarray(faces_cap_local, dtype=int)
 
 
 def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
@@ -1067,6 +1300,8 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
     mc_out_dir = out_dir / "mc_slices"
     mc_out_dir.mkdir(parents=True, exist_ok=True)
 
+    z_tol = 1e-3  # still used for removing original bottom ONLY for slice 0
+
     for slice_idx, f_indices in slice_to_mc_faces.items():
         if not f_indices:
             continue
@@ -1076,17 +1311,62 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
         # Collect vertices actually used and remap to [0..N-1]
         unique_v, inverse = np.unique(sub_faces_idx.flatten(), return_inverse=True)
         sub_verts_world = mc_verts_world[unique_v]
-        sub_faces_remap = inverse.reshape((-1, 3))
+        sub_faces_remap = inverse.reshape((-1, 3))  # faces in local [0..N-1]
+
+        # Index-space coords for same vertices
+        sub_verts_idx = mc_verts_idx[unique_v]
+
+        # ---------- 1) Remove original bottom only on slice 0 ----------
+        if slice_idx == 0:
+            z_vals_local = sub_verts_idx[:, 2]
+            z_bottom = float(z_vals_local.max())
+            on_bottom = np.abs(z_vals_local - z_bottom) < z_tol
+
+            bottom_face_mask = np.array(
+                [on_bottom[tri].all() for tri in sub_faces_remap],
+                dtype=bool,
+            )
+
+            kept_faces = sub_faces_remap[~bottom_face_mask]
+            faces_for_loops = sub_faces_remap  # loops see full shell
+            removed_count = int(bottom_face_mask.sum())
+        else:
+            kept_faces = sub_faces_remap
+            faces_for_loops = sub_faces_remap
+            removed_count = 0
+
+        # ---------- 2) Generate new bottom cap from contour loops ----------
+        cap_faces_local = build_bottom_cap_faces_from_loops(
+            sub_verts_idx,
+            faces_for_loops,
+            z_band=0.5,  # roughly half a voxel in index space
+        )
+
+        if cap_faces_local.size > 0:
+            all_faces_local = np.vstack([kept_faces, cap_faces_local])
+            log(
+                f"[MC-SLICES] Slice {slice_idx}: "
+                f"removed {removed_count} old bottom triangles, "
+                f"added {cap_faces_local.shape[0]} loop-based bottom-cap triangles"
+            )
+        else:
+            all_faces_local = kept_faces
+            log(
+                f"[MC-SLICES] Slice {slice_idx}: "
+                f"removed {removed_count} old bottom triangles, "
+                f"no new bottom-cap triangles generated from loops"
+            )
 
         slice_mesh = trimesh.Trimesh(
             vertices=sub_verts_world,
-            faces=sub_faces_remap,
+            faces=all_faces_local,
             process=False,
         )
 
         out_path = mc_out_dir / f"{base_name}_mc_slice_{slice_idx:03d}.stl"
         slice_mesh.export(out_path.as_posix())
         log(f"[MC-SLICES] Wrote MC slice {slice_idx} STL to: {out_path}")
+
 
 
 # ============================================================
