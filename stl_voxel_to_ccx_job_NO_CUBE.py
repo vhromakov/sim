@@ -963,7 +963,7 @@ def build_bottom_cap_faces_from_loops(
     verts_idx_slice: np.ndarray,
     faces_local: np.ndarray,
     z_band: float = 0.5,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Build a radial bottom cap for one MC slice using boundary contour loops.
 
@@ -980,13 +980,17 @@ def build_bottom_cap_faces_from_loops(
 
     Returns
     -------
+    new_verts_idx : (M, 3) float
+        Newly created vertices in index coords (will be appended to the slice).
+        May be empty if Triangle did not create any Steiner points.
     faces_cap_local : (K, 3) int
         Triangle faces (local vertex indices) forming the bottom cap.
-        May be empty if no suitable loops are found.
+        These indices are in the *extended* local space [0..N+M-1].
     """
-
     if verts_idx_slice.shape[0] < 3 or faces_local.shape[0] == 0:
-        return np.zeros((0, 3), dtype=int)
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=int)
+
+    N0 = verts_idx_slice.shape[0]
 
     # --- 1) Find boundary edges (edges used exactly once in this slice) ---
     edge_count: dict[tuple[int, int], int] = {}
@@ -997,7 +1001,7 @@ def build_bottom_cap_faces_from_loops(
 
     boundary_edges = [e for e, c in edge_count.items() if c == 1]
     if not boundary_edges:
-        return np.zeros((0, 3), dtype=int)
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=int)
 
     # --- 2) Build adjacency on boundary edges and extract loops ---
     from collections import defaultdict
@@ -1017,7 +1021,6 @@ def build_bottom_cap_faces_from_loops(
         if edge_key(a, b) in visited_edges:
             continue
 
-        # start a new loop following edges
         loop: list[int] = [a]
         prev = None
         cur = a
@@ -1044,7 +1047,7 @@ def build_bottom_cap_faces_from_loops(
             loops.append(loop[:-1])  # drop duplicate last
 
     if not loops:
-        return np.zeros((0, 3), dtype=int)
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=int)
 
     # --- 3) Compute mean z and area per loop to detect "bottom" loops ---
     loop_stats = []  # (loop_idx, mean_z, signed_area)
@@ -1065,7 +1068,7 @@ def build_bottom_cap_faces_from_loops(
         loop_stats.append((li, mean_z, area))
 
     if not loop_stats:
-        return np.zeros((0, 3), dtype=int)
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=int)
 
     max_mean_z = max(s[1] for s in loop_stats)
     bottom_loop_ids = [
@@ -1073,7 +1076,10 @@ def build_bottom_cap_faces_from_loops(
         if abs(mean_z - max_mean_z) <= z_band
     ]
     if not bottom_loop_ids:
-        return np.zeros((0, 3), dtype=int)
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=int)
+
+    # store mean_z for each loop (used for z of new points)
+    loop_mean_z = {li: mean_z for (li, mean_z, _area) in loop_stats}
 
     # ================== 4) DEPTH (how many loops fully contain it) =====
     poly2d_by_loop: dict[int, np.ndarray] = {}
@@ -1115,24 +1121,21 @@ def build_bottom_cap_faces_from_loops(
                 d += 1
         depth[li] = d
 
-    # ============ 5) Helper: interior point for a polygon (no centroids) ==
+    # ============ 5) Helpers for triangulation & interior point ==========
     def _polygon_signed_area(poly: np.ndarray) -> float:
-        """Signed area of a simple polygon (positive if CCW)."""
         x = poly[:, 0]
         y = poly[:, 1]
         return 0.5 * np.sum(x * np.roll(y, -1) - y * np.roll(x, -1))
-
 
     def _tri_area2(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
         """Twice the signed area of triangle abc (positive if CCW)."""
         return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
-
     def _point_in_triangle(p: np.ndarray,
-                        a: np.ndarray,
-                        b: np.ndarray,
-                        c: np.ndarray,
-                        eps: float = 1e-12) -> bool:
+                           a: np.ndarray,
+                           b: np.ndarray,
+                           c: np.ndarray,
+                           eps: float = 1e-12) -> bool:
         """Check if p is inside triangle abc (including edges)."""
         v0 = c - a
         v1 = b - a
@@ -1148,7 +1151,6 @@ def build_bottom_cap_faces_from_loops(
         w = 1.0 - u - v
 
         return (u >= -eps) and (v >= -eps) and (w >= -eps)
-
 
     def _triangulate_polygon_ear_clip(poly: np.ndarray):
         """
@@ -1221,17 +1223,13 @@ def build_bottom_cap_faces_from_loops(
 
         return triangles, poly_ccw
 
-
     def _find_interior_point(poly: np.ndarray) -> np.ndarray:
         """
         Find a point strictly inside `poly`.
-        Does NOT use polygon area centroid.
-
-        Strategy:
+        Uses your original strategy:
         - Ear-clip triangulate the polygon.
         - Take the largest-area triangle.
-        - Return its centroid (guaranteed inside that triangle).
-        - If triangulation fails, fall back to bbox-based heuristics.
+        - Return its centroid (inside that triangle).
         """
         poly = np.asarray(poly, dtype=float)
         if poly.ndim != 2 or poly.shape[1] != 2:
@@ -1243,10 +1241,8 @@ def build_bottom_cap_faces_from_loops(
         if n == 1:
             return poly[0].copy()
         if n == 2:
-            # Segment: return midpoint
             return 0.5 * (poly[0] + poly[1])
 
-        # ---- Main method: triangulation + largest triangle centroid ----
         tris, poly_ccw = _triangulate_polygon_ear_clip(poly)
 
         best_centroid = None
@@ -1264,11 +1260,10 @@ def build_bottom_cap_faces_from_loops(
                 best_centroid = (a + b + c) / 3.0
 
         if best_centroid is not None:
-            # Extra safety: verify with your point-in-poly (in original vertex order)
             if _point_in_poly(best_centroid, poly):
                 return best_centroid
 
-        # ---- Fallback 1: bbox center ----
+        # Fallbacks should almost never be hit in your case:
         xmin, ymin = poly.min(axis=0)
         xmax, ymax = poly.max(axis=0)
         if xmax == xmin and ymax == ymin:
@@ -1281,21 +1276,22 @@ def build_bottom_cap_faces_from_loops(
         if _point_in_poly(center, poly):
             return center
 
-        # ---- Fallback 2: nudge vertices toward bbox center ----
         for v in poly:
             cand = v + 0.25 * (center - v)
             if _point_in_poly(cand, poly):
                 return cand
 
-        # Last resort: just return center (if your _point_in_poly is very strict,
-        # this might rarely be outside; but realistically this should almost never happen)
         return center
 
-    # ================== 6) TRIANGULATE FOR ALL EVEN DEPTHS ==============
-    # For each loop with even depth d: it's an "outer" region; all loops
-    # with depth d+1 fully inside it are holes for that region.
+    # ================== 6) TRIANGULATE FOR ALL EVEN DEPTHS =============
+    new_verts_list: list[np.ndarray] = []
     faces_cap_local: list[list[int]] = []
-    tri_call_idx = 0
+
+    def _alloc_new_vertex(x: float, y: float, z: float) -> int:
+        """Create a new vertex in index space and return its local index."""
+        idx = N0 + len(new_verts_list)
+        new_verts_list.append(np.array([x, y, z], dtype=float))
+        return idx
 
     for outer_li in bottom_loop_ids:
         d_outer = depth[outer_li]
@@ -1303,6 +1299,9 @@ def build_bottom_cap_faces_from_loops(
             continue  # only even-depth loops define solid regions
 
         outer_poly = poly2d_by_loop[outer_li]
+        poly_area = abs(_polygon_signed_area(outer_poly))
+        if poly_area < 1e-12:
+            continue
 
         # find all depth-(d_outer+1) loops fully inside this outer
         hole_lis: list[int] = []
@@ -1321,14 +1320,19 @@ def build_bottom_cap_faces_from_loops(
             continue
 
         vert_ids_sorted = sorted(vert_ids_set)
-        local_to_pslg: dict[int, int] = {
-            v: i for i, v in enumerate(vert_ids_sorted)
-        }
 
+        # 2D coordinates for the PSLG
         pts2d = np.array(
             [verts_idx_slice[v, :2] for v in vert_ids_sorted],
             dtype=float,
         )
+
+        # Map from rounded (x, y) -> existing local vertex index
+        existing_xy_to_local: dict[tuple[float, float], int] = {}
+        for v_local in vert_ids_sorted:
+            x, y = verts_idx_slice[v_local, 0], verts_idx_slice[v_local, 1]
+            key = (round(float(x), 6), round(float(y), 6))
+            existing_xy_to_local[key] = v_local
 
         segments: list[tuple[int, int]] = []
 
@@ -1338,8 +1342,8 @@ def build_bottom_cap_faces_from_loops(
         for i in range(L_out):
             v0 = outer_loop[i]
             v1 = outer_loop[(i + 1) % L_out]
-            s0 = local_to_pslg[v0]
-            s1 = local_to_pslg[v1]
+            s0 = vert_ids_sorted.index(v0)
+            s1 = vert_ids_sorted.index(v1)
             segments.append((s0, s1))
 
         # segments for each hole loop
@@ -1351,14 +1355,14 @@ def build_bottom_cap_faces_from_loops(
             for i in range(L):
                 v0 = loop[i]
                 v1 = loop[(i + 1) % L]
-                s0 = local_to_pslg[v0]
-                s1 = local_to_pslg[v1]
+                s0 = vert_ids_sorted.index(v0)
+                s1 = vert_ids_sorted.index(v1)
                 segments.append((s0, s1))
 
         if not segments:
             continue
 
-        # Hole points: robust interior points for each hole polygon
+        # Hole points: use _find_interior_point (your robust implementation)
         holes_pts: list[list[float]] = []
         for li in hole_lis:
             poly_hole = poly2d_by_loop[li]
@@ -1372,34 +1376,50 @@ def build_bottom_cap_faces_from_loops(
         if holes_pts:
             data["holes"] = np.array(holes_pts, dtype=float)
 
-        # --- DEBUG Triangle input for this outer+holes -----------------
-        tri_call_idx += 1
-        pts3d = np.column_stack(
-            [pts2d, np.zeros((pts2d.shape[0],), dtype=float)]
-        )
+        # --- Quality Triangle call (adds Steiner points) -----------------
+        min_angle = 25.0  # degrees
+        flags = f"pq{min_angle}"
 
-        tri_out = tr.triangulate(data, "pQ")
-        if "triangles" not in tri_out:
+        tri_out = tr.triangulate(data, flags)
+        if "triangles" not in tri_out or "vertices" not in tri_out:
             continue
 
-        tris_pslg = tri_out["triangles"]
-        if tris_pslg.shape[0] == 0:
+        tri_verts2d = np.asarray(tri_out["vertices"], dtype=float)
+        tris_pslg = np.asarray(tri_out["triangles"], dtype=int)
+        if tris_pslg.size == 0:
             continue
 
-        # Map PSLG indices back to original local vertex indices
+        # Map Triangle vertex indices -> local vertex indices (old or new)
+        tri_to_local: dict[int, int] = {}
+        z_plane = loop_mean_z.get(outer_li, max_mean_z)
+
+        for vid_pslg, (x2d, y2d) in enumerate(tri_verts2d):
+            key = (round(float(x2d), 6), round(float(y2d), 6))
+
+            if key in existing_xy_to_local:
+                tri_to_local[vid_pslg] = existing_xy_to_local[key]
+            else:
+                local_idx = _alloc_new_vertex(x2d, y2d, z_plane)
+                tri_to_local[vid_pslg] = local_idx
+                existing_xy_to_local[key] = local_idx
+
+        # Map all Triangle triangles to local indices
         for a, b, c in tris_pslg:
-            ga = vert_ids_sorted[a]
-            gb = vert_ids_sorted[b]
-            gc = vert_ids_sorted[c]
+            ga = tri_to_local[int(a)]
+            gb = tri_to_local[int(b)]
+            gc = tri_to_local[int(c)]
             faces_cap_local.append([ga, gb, gc])
 
     if not faces_cap_local:
-        return np.zeros((0, 3), dtype=int)
+        return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=int)
 
-    return np.asarray(faces_cap_local, dtype=int)
+    new_verts_idx = (
+        np.vstack(new_verts_list).astype(float) if new_verts_list else np.zeros((0, 3), dtype=float)
+    )
+    return new_verts_idx, np.asarray(faces_cap_local, dtype=int)
 
 
-def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
+def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world, cyl_params):
     base_name = Path(args.input_stl).stem
     out_dir = Path(getattr(args, "output_dir", "OUTPUT_SLICES"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1430,6 +1450,8 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
     mc_faces_idx = np.asarray(mc_idx.faces, dtype=int)
 
     mc_verts_world = np.asarray(mc_mesh_world.vertices, dtype=float)
+
+    cx_cyl, cz_cyl, R0, v_offset, y_offset = cyl_params
 
     min_iz = int(unique_iz.min())
     max_iz = int(unique_iz.max())
@@ -1481,44 +1503,49 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
         sub_verts_idx = mc_verts_idx[unique_v]
         sub_faces_local = inverse.reshape((-1, 3))  # faces in local [0..Nv-1]
 
-        # ------------ Remove original "bottom" (max Z) triangles ------------
-        # z_vals_local = sub_verts_idx[:, 2]
-        # z_bottom = float(z_vals_local.max())
-        # on_bottom = np.abs(z_vals_local - z_bottom) < z_tol
-
-        # bottom_face_mask = np.array(
-        #     [on_bottom[tri].all() for tri in sub_faces_local],
-        #     dtype=bool,
-        # )
-
-        kept_faces = sub_faces_local#[~bottom_face_mask]
+        kept_faces = sub_faces_local
         faces_for_loops = sub_faces_local  # loops see full shell
 
-        # removed_count = int(bottom_face_mask.sum())
-
-        # ------------ Generate bottom cap from contour loops -----------------
-        cap_faces_local = build_bottom_cap_faces_from_loops(
+        # ------------ Generate bottom cap from contour loops (with new verts) ----
+        new_idx_verts, cap_faces_local = build_bottom_cap_faces_from_loops(
             sub_verts_idx,
             faces_for_loops,
             z_band=0.5,  # roughly half a voxel in index space
         )
 
+        if new_idx_verts.shape[0] > 0:
+            # Map new index-space verts -> param space -> world space
+            new_param = vox.indices_to_points(new_idx_verts.astype(float))
+            new_world = np.zeros_like(new_param)
+
+            for i, (u, v, w) in enumerate(new_param):
+                # undo tangential rotation we added before voxelization
+                v_adj = v - v_offset
+                x, y, z = param_to_world_cyl((u, v_adj, w), cx_cyl, cz_cyl, R0)
+                # undo initial Y shift so it matches original STL frame
+                y -= y_offset
+                new_world[i] = (x, y, z)
+
+            # Append new vertices to this slice
+            old_count = sub_verts_idx.shape[0]
+            sub_verts_idx = np.vstack([sub_verts_idx, new_idx_verts])
+            sub_verts_world = np.vstack([sub_verts_world, new_world])
+
         if cap_faces_local.size > 0:
             all_faces_local = np.vstack([kept_faces, cap_faces_local])
             log(
                 f"[MC-SLICES] Slice {slice_idx}: "
-                # f"removed {removed_count} old bottom triangles, "
-                f"added {cap_faces_local.shape[0]} loop-based bottom-cap triangles"
+                f"added {cap_faces_local.shape[0]} bottom-cap triangles "
+                f"({new_idx_verts.shape[0]} new vertices)"
             )
         else:
             all_faces_local = kept_faces
             log(
                 f"[MC-SLICES] Slice {slice_idx}: "
-                # f"removed {removed_count} old bottom triangles, "
                 f"no new bottom-cap triangles generated from loops"
             )
 
-        # Debug STL of capped MC slice (as before)
+        # Debug STL of capped MC slice (now including new world verts)
         slice_mesh_debug = trimesh.Trimesh(
             vertices=sub_verts_world,
             faces=all_faces_local,
@@ -1811,6 +1838,7 @@ def main():
         indices_sorted,
         vox,
         mc_mesh_world,
+        cyl_params,  # <-- NEW
     )
 
     # 2) Single uncoupled thermo-mechanical job (TETS instead of HEXES)
@@ -1824,7 +1852,7 @@ def main():
         tet_slice_to_eids,
         z_slices,
         shrinkage_curve=[5, 4, 3, 2, 1],
-        cure_shrink_per_unit=0.003,  # 3%
+        cure_shrink_per_unit=0.05,  # 3%
         cyl_params=cyl_params,
         cube_size=args.cube_size,
         output_stride=args.output_stride,
