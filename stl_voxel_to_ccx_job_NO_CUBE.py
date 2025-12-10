@@ -1482,19 +1482,19 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
         sub_faces_local = inverse.reshape((-1, 3))  # faces in local [0..Nv-1]
 
         # ------------ Remove original "bottom" (max Z) triangles ------------
-        z_vals_local = sub_verts_idx[:, 2]
-        z_bottom = float(z_vals_local.max())
-        on_bottom = np.abs(z_vals_local - z_bottom) < z_tol
+        # z_vals_local = sub_verts_idx[:, 2]
+        # z_bottom = float(z_vals_local.max())
+        # on_bottom = np.abs(z_vals_local - z_bottom) < z_tol
 
-        bottom_face_mask = np.array(
-            [on_bottom[tri].all() for tri in sub_faces_local],
-            dtype=bool,
-        )
+        # bottom_face_mask = np.array(
+        #     [on_bottom[tri].all() for tri in sub_faces_local],
+        #     dtype=bool,
+        # )
 
-        kept_faces = sub_faces_local[~bottom_face_mask]
+        kept_faces = sub_faces_local#[~bottom_face_mask]
         faces_for_loops = sub_faces_local  # loops see full shell
 
-        removed_count = int(bottom_face_mask.sum())
+        # removed_count = int(bottom_face_mask.sum())
 
         # ------------ Generate bottom cap from contour loops -----------------
         cap_faces_local = build_bottom_cap_faces_from_loops(
@@ -1507,14 +1507,14 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
             all_faces_local = np.vstack([kept_faces, cap_faces_local])
             log(
                 f"[MC-SLICES] Slice {slice_idx}: "
-                f"removed {removed_count} old bottom triangles, "
+                # f"removed {removed_count} old bottom triangles, "
                 f"added {cap_faces_local.shape[0]} loop-based bottom-cap triangles"
             )
         else:
             all_faces_local = kept_faces
             log(
                 f"[MC-SLICES] Slice {slice_idx}: "
-                f"removed {removed_count} old bottom triangles, "
+                # f"removed {removed_count} old bottom triangles, "
                 f"no new bottom-cap triangles generated from loops"
             )
 
@@ -1646,11 +1646,12 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world):
         try:
             tet = tetgen.TetGen(vol_mesh.vertices, vol_mesh.faces)
             tet_out = tet.tetrahedralize(
-                order=1,
-                mindihedral=10,
-                minratio=1.5,
-                steinerleft=-1,
-                quality=True,
+                # order=2,
+                # mindihedral=10,
+                # minratio=1.5,
+                # steinerleft=-1,
+                quality=False,
+                nobisect=True,
             )
             tet_points = np.asarray(tet_out[0], dtype=float)
             tet_elements = np.asarray(tet_out[1], dtype=int)
