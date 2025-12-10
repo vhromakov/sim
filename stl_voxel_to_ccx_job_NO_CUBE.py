@@ -1116,38 +1116,179 @@ def build_bottom_cap_faces_from_loops(
         depth[li] = d
 
     # ============ 5) Helper: interior point for a polygon (no centroids) ==
-    def _find_interior_point(poly: np.ndarray) -> np.ndarray:
+    def _polygon_signed_area(poly: np.ndarray) -> float:
+        """Signed area of a simple polygon (positive if CCW)."""
+        x = poly[:, 0]
+        y = poly[:, 1]
+        return 0.5 * np.sum(x * np.roll(y, -1) - y * np.roll(x, -1))
+
+
+    def _tri_area2(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+        """Twice the signed area of triangle abc (positive if CCW)."""
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+    def _point_in_triangle(p: np.ndarray,
+                        a: np.ndarray,
+                        b: np.ndarray,
+                        c: np.ndarray,
+                        eps: float = 1e-12) -> bool:
+        """Check if p is inside triangle abc (including edges)."""
+        v0 = c - a
+        v1 = b - a
+        v2 = p - a
+
+        den = v0[0] * v1[1] - v1[0] * v0[1]
+        if abs(den) < eps:
+            return False  # degenerate
+
+        # barycentric coordinates
+        u = (v2[0] * v1[1] - v1[0] * v2[1]) / den
+        v = (v0[0] * v2[1] - v2[0] * v0[1]) / den
+        w = 1.0 - u - v
+
+        return (u >= -eps) and (v >= -eps) and (w >= -eps)
+
+
+    def _triangulate_polygon_ear_clip(poly: np.ndarray):
         """
-        Find a point strictly inside `poly` using grid search over its bbox.
-        Does NOT use polygon area centroid.
+        Ear-clipping triangulation for a simple polygon (no self-intersections, no holes).
+        Returns a list of triangles as triplets of vertex indices (into `poly_ccw`).
         """
         poly = np.asarray(poly, dtype=float)
+        n = len(poly)
+        if n < 3:
+            return [], poly
+
+        # Use a CCW copy for triangulation; keep the original intact for _point_in_poly.
+        poly_ccw = poly.copy()
+        area = _polygon_signed_area(poly_ccw)
+        if abs(area) < 1e-14:
+            return [], poly  # degenerate polygon
+
+        if area < 0.0:
+            poly_ccw = poly_ccw[::-1].copy()
+
+        indices = list(range(n))
+        triangles = []
+
+        max_iters = 10_000
+        iters = 0
+
+        while len(indices) > 3 and iters < max_iters:
+            ear_found = False
+
+            for k in range(len(indices)):
+                i_prev = indices[k - 1]
+                i = indices[k]
+                i_next = indices[(k + 1) % len(indices)]
+
+                a = poly_ccw[i_prev]
+                b = poly_ccw[i]
+                c = poly_ccw[i_next]
+
+                area2 = _tri_area2(a, b, c)
+                if area2 <= 1e-14:
+                    # Not a strictly convex corner; skip
+                    continue
+
+                # Check that no other vertex lies inside this candidate ear
+                is_ear = True
+                for j in indices:
+                    if j in (i_prev, i, i_next):
+                        continue
+                    if _point_in_triangle(poly_ccw[j], a, b, c):
+                        is_ear = False
+                        break
+
+                if not is_ear:
+                    continue
+
+                # Found an ear
+                triangles.append((i_prev, i, i_next))
+                del indices[k]
+                ear_found = True
+                break
+
+            if not ear_found:
+                # Probably non-simple or numerically tricky polygon
+                break
+
+            iters += 1
+
+        if len(indices) == 3:
+            triangles.append(tuple(indices))
+
+        return triangles, poly_ccw
+
+
+    def _find_interior_point(poly: np.ndarray) -> np.ndarray:
+        """
+        Find a point strictly inside `poly`.
+        Does NOT use polygon area centroid.
+
+        Strategy:
+        - Ear-clip triangulate the polygon.
+        - Take the largest-area triangle.
+        - Return its centroid (guaranteed inside that triangle).
+        - If triangulation fails, fall back to bbox-based heuristics.
+        """
+        poly = np.asarray(poly, dtype=float)
+        if poly.ndim != 2 or poly.shape[1] != 2:
+            raise ValueError("poly must be (N, 2)")
+
+        n = len(poly)
+        if n == 0:
+            raise ValueError("Empty polygon")
+        if n == 1:
+            return poly[0].copy()
+        if n == 2:
+            # Segment: return midpoint
+            return 0.5 * (poly[0] + poly[1])
+
+        # ---- Main method: triangulation + largest triangle centroid ----
+        tris, poly_ccw = _triangulate_polygon_ear_clip(poly)
+
+        best_centroid = None
+        best_area2 = 0.0
+
+        for (i, j, k) in tris:
+            a = poly_ccw[i]
+            b = poly_ccw[j]
+            c = poly_ccw[k]
+            area2 = abs(_tri_area2(a, b, c))
+            if area2 <= 1e-16:
+                continue
+            if area2 > best_area2:
+                best_area2 = area2
+                best_centroid = (a + b + c) / 3.0
+
+        if best_centroid is not None:
+            # Extra safety: verify with your point-in-poly (in original vertex order)
+            if _point_in_poly(best_centroid, poly):
+                return best_centroid
+
+        # ---- Fallback 1: bbox center ----
         xmin, ymin = poly.min(axis=0)
         xmax, ymax = poly.max(axis=0)
-
         if xmax == xmin and ymax == ymin:
             return poly[0].copy()
 
-        # Coarse grid search inside bbox
-        steps = 10
-        for i in range(steps):
-            for j in range(steps):
-                x = xmin + (i + 0.5) / steps * (xmax - xmin)
-                y = ymin + (j + 0.5) / steps * (ymax - ymin)
-                p = np.array([x, y], dtype=float)
-                if _point_in_poly(p, poly):
-                    return p
-
-        # Fallback: nudge vertices toward bbox center
         cx = 0.5 * (xmin + xmax)
         cy = 0.5 * (ymin + ymax)
         center = np.array([cx, cy], dtype=float)
+
+        if _point_in_poly(center, poly):
+            return center
+
+        # ---- Fallback 2: nudge vertices toward bbox center ----
         for v in poly:
             cand = v + 0.25 * (center - v)
             if _point_in_poly(cand, poly):
                 return cand
 
-        # Last resort: bbox center (may still be outside, but extremely rare)
+        # Last resort: just return center (if your _point_in_poly is very strict,
+        # this might rarely be outside; but realistically this should almost never happen)
         return center
 
     # ================== 6) TRIANGULATE FOR ALL EVEN DEPTHS ==============
