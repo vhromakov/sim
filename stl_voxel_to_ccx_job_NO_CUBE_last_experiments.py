@@ -157,123 +157,185 @@ import numpy as np
 import trimesh
 
 
-def slice_param_mesh_along_w(
-    verts_param: np.ndarray,
-    faces: np.ndarray,
+def slice_tet_volume_along_w(
+    nodes_param: np.ndarray,          # (N,3) float
+    elems_0based: np.ndarray,         # (M,4) int, TetGen t.elem (0-based)
     w_step: float,
     w_min: float | None = None,
     w_max: float | None = None,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[float]]:
-    verts_param = np.asarray(verts_param, dtype=float)
-    faces = np.asarray(faces, dtype=int)
+    """
+    Slice a tetrahedral VOLUME mesh (param space) into slabs along +w (axis = z).
 
-    if verts_param.size == 0 or faces.size == 0:
+    Returns:
+      tet_slices_param : list[(nodes_param_slice, elems_local_1based)]
+        nodes_param_slice : (Ni,3)
+        elems_local_1based : (Mi,4) 1-based indices into nodes_param_slice
+      z_slices : slice center values in w
+    """
+    nodes_param = np.asarray(nodes_param, dtype=np.float64)
+    elems_0based = np.asarray(elems_0based, dtype=np.int64)
+
+    if nodes_param.size == 0 or elems_0based.size == 0:
         return [], []
 
-    w_all = verts_param[:, 2]
+    w_all = nodes_param[:, 2]
     if w_min is None:
         w_min = float(w_all.min())
     if w_max is None:
         w_max = float(w_all.max())
 
     if w_max <= w_min:
-        return [(verts_param.copy(), faces.copy())], [0.5 * (w_min + w_max)]
+        # single slice, everything
+        elems_1based = (elems_0based + 1).astype(np.int32)
+        return [(nodes_param.copy(), elems_1based)], [0.5 * (w_min + w_max)]
 
     eps = 1e-9
     w_min_eps = w_min - eps
     w_max_eps = w_max + eps
-
     num_slices = int(math.ceil((w_max_eps - w_min_eps) / w_step))
 
-    mesh0 = trimesh.Trimesh(vertices=verts_param, faces=faces, process=False)
+    # Prefer robust cutting via VTK/PyVista (creates new vertices on cut planes)
+    try:
+        import pyvista as pv
 
-    slice_meshes: list[tuple[np.ndarray, np.ndarray]] = []
-    z_slices: list[float] = []
-    cap = True
+        # Build a VTK UnstructuredGrid with tetra cells
+        # VTK cell array format: [4, a,b,c,d, 4, a,b,c,d, ...]
+        cells = np.empty((elems_0based.shape[0], 5), dtype=np.int64)
+        cells[:, 0] = 4
+        cells[:, 1:] = elems_0based
+        cells_vtk = cells.ravel()
 
-    for si in range(num_slices):
-        w0 = w_min_eps + si * w_step
-        w1 = w0 + w_step
-        z_slices.append(0.5 * (w0 + w1))
+        celltypes = np.full(elems_0based.shape[0], pv.CellType.TETRA, dtype=np.uint8)
+        grid0 = pv.UnstructuredGrid(cells_vtk, celltypes, nodes_param)
 
-        # bottom-most slice (in this loop order) touches w_min: keep w <= w1
-        if si == 0:
-            m = trimesh.intersections.slice_mesh_plane(
-                mesh0,
-                plane_origin=[0.0, 0.0, w1],
-                plane_normal=[0.0, 0.0, -1.0],  # keep w <= w1
-                cap=cap,
-            )
+        slices: list[tuple[np.ndarray, np.ndarray]] = []
+        z_slices: list[float] = []
 
-        # top-most slice touches w_max: keep w >= w0
-        elif si == num_slices - 1:
-            m = trimesh.intersections.slice_mesh_plane(
-                mesh0,
-                plane_origin=[0.0, 0.0, w0],
-                plane_normal=[0.0, 0.0, 1.0],  # keep w >= w0
-                cap=cap,
-            )
+        for si in range(num_slices):
+            w0 = w_min_eps + si * w_step
+            w1 = w0 + w_step
+            z_slices.append(0.5 * (w0 + w1))
 
-        # middle slices: keep w >= w0 then w <= w1
-        else:
-            m = trimesh.intersections.slice_mesh_plane(
-                mesh0,
-                plane_origin=[0.0, 0.0, w0],
-                plane_normal=[0.0, 0.0, 1.0],  # keep w >= w0
-                cap=cap,
-            )
-            if m.faces.size != 0:
-                m = trimesh.intersections.slice_mesh_plane(
-                    m,
-                    plane_origin=[0.0, 0.0, w1],
-                    plane_normal=[0.0, 0.0, -1.0],  # keep w <= w1
-                    cap=cap,
-                )
+            g = grid0
 
-        if m is None or m.faces.size == 0:
-            slice_meshes.append((np.zeros((0, 3), float), np.zeros((0, 3), int)))
-        else:
-            slice_meshes.append((m.vertices.astype(float), m.faces.astype(int)))
+            # Keep w >= w0
+            # (If your result comes out inverted, flip invert=True here.)
+            g = g.clip(normal=(0.0, 0.0, 1.0), origin=(0.0, 0.0, w0), invert=False)
 
-    # Your convention: slice 0 is bottom
-    slice_meshes.reverse()
-    z_slices.reverse()
+            if g.n_cells == 0:
+                slices.append((np.zeros((0, 3), np.float64), np.zeros((0, 4), np.int32)))
+                continue
 
-    return slice_meshes, z_slices
+            # Keep w <= w1
+            g = g.clip(normal=(0.0, 0.0, -1.0), origin=(0.0, 0.0, w1), invert=False)
+
+            if g.n_cells == 0:
+                slices.append((np.zeros((0, 3), np.float64), np.zeros((0, 4), np.int32)))
+                continue
+
+            pts = np.asarray(g.points, dtype=np.float64)
+
+            # Extract only tetra cells from the clipped result.
+            # g.cells is a flat array: [npts, id0, id1, ..., npts, id0, ...]
+            flat = np.asarray(g.cells, dtype=np.int64)
+            ctypes = np.asarray(g.celltypes, dtype=np.uint8)
+
+            tets_local_0 = []
+            idx = 0
+            dropped = 0
+
+            for ct in ctypes:
+                n = int(flat[idx]); idx += 1
+                conn = flat[idx:idx + n]; idx += n
+
+                if ct == pv.CellType.TETRA and n == 4:
+                    tets_local_0.append(conn.astype(np.int64))
+                else:
+                    dropped += 1
+
+            if len(tets_local_0) == 0:
+                if dropped > 0:
+                    log(f"[SLICE-TET] Slice {si}: no tets after clipping (dropped {dropped} non-tet cells)")
+                slices.append((np.zeros((0, 3), np.float64), np.zeros((0, 4), np.int32)))
+                continue
+
+            tets_local_0 = np.vstack(tets_local_0)
+            elems_local_1 = (tets_local_0 + 1).astype(np.int32)
+
+            if dropped > 0:
+                log(f"[SLICE-TET] Slice {si}: kept {elems_local_1.shape[0]} tets, dropped {dropped} non-tet cells")
+
+            slices.append((pts, elems_local_1))
+
+        # Your convention: slice 0 is bottom
+        slices.reverse()
+        z_slices.reverse()
+        return slices, z_slices
+
+    except Exception as e:
+        # Fallback (no cutting): assign whole tets by centroid w.
+        # This DOES NOT create cut cells, but gives you per-slice groups quickly.
+        log(f"[SLICE-TET] PyVista slicing unavailable, fallback to centroid binning: {e}")
+
+        cent_w = nodes_param[elems_0based].mean(axis=1)[:, 2]  # (M,)
+        slices: list[tuple[np.ndarray, np.ndarray]] = []
+        z_slices: list[float] = []
+
+        for si in range(num_slices):
+            w0 = w_min_eps + si * w_step
+            w1 = w0 + w_step
+            z_slices.append(0.5 * (w0 + w1))
+
+            mask = (cent_w >= w0) & (cent_w <= w1)
+            elems_here = elems_0based[mask]
+            if elems_here.size == 0:
+                slices.append((np.zeros((0, 3), np.float64), np.zeros((0, 4), np.int32)))
+                continue
+
+            # Build compacted node list for this slice
+            used = np.unique(elems_here.ravel())
+            map_old_to_new = {int(old): i for i, old in enumerate(used)}
+            nodes_slice = nodes_param[used]
+
+            elems_new0 = np.vectorize(lambda x: map_old_to_new[int(x)])(elems_here).astype(np.int64)
+            elems_new1 = (elems_new0 + 1).astype(np.int32)
+            slices.append((nodes_slice, elems_new1))
+
+        slices.reverse()
+        z_slices.reverse()
+        return slices, z_slices
 
 
 def tet_edges_from_elems_1based(elems_1based: np.ndarray) -> list[tuple[int, int]]:
     """
-    elems_1based: (M,4) int, 1-based node indices (per-slice local, CCX-style).
+    elems_1based: (M,K) int, 1-based node indices (per-slice local).
     Returns edges as 0-based pairs (i, j) for write_ply_edges.
+    Works for K>=4. (If K>4, uses all node pairs.)
     """
     elems = np.asarray(elems_1based, dtype=np.int64)
     if elems.size == 0:
         return []
 
     edges: set[tuple[int, int]] = set()
-    for a, b, c, d in elems:
-        # convert to 0-based
-        a -= 1; b -= 1; c -= 1; d -= 1
-        for i, j in ((a, b), (a, c), (a, d), (b, c), (b, d), (c, d)):
-            if i == j:
-                continue
-            if i < j:
-                edges.add((int(i), int(j)))
-            else:
-                edges.add((int(j), int(i)))
+    for row in elems:
+        ids = [int(x) - 1 for x in row.tolist() if int(x) > 0]
+        L = len(ids)
+        for i in range(L):
+            for j in range(i + 1, L):
+                a, b = ids[i], ids[j]
+                if a == b:
+                    continue
+                if a < b:
+                    edges.add((a, b))
+                else:
+                    edges.add((b, a))
     return sorted(edges)
 
 
 def build_global_tet_from_slices(
     tet_slices: list[tuple[np.ndarray, np.ndarray]],
 ) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int, int]], dict[int, list[int]]]:
-    """
-    Convert per-slice (nodes, elems_local_1based) into:
-      - global vertices list (1-based node ids in writer)
-      - global tet element list (1-based node ids)
-      - slice_to_eids mapping (slice_idx -> list of global element IDs, 1-based)
-    """
     vertices: list[tuple[float, float, float]] = []
     elements: list[tuple[int, int, int, int]] = []
     slice_to_eids: dict[int, list[int]] = {}
@@ -289,29 +351,26 @@ def build_global_tet_from_slices(
             slice_to_eids[si] = []
             continue
 
-        # append vertices
         for p in nodes:
             vertices.append((float(p[0]), float(p[1]), float(p[2])))
 
-        # append elements with node id offset
         eids_here: list[int] = []
         for k in range(elems_local_1based.shape[0]):
             a, b, c, d = elems_local_1based[k]
-            ga = int(a) + node_offset
-            gb = int(b) + node_offset
-            gc = int(c) + node_offset
-            gd = int(d) + node_offset
-            elements.append((ga, gb, gc, gd))
-
-            eid_global = elem_offset + k + 1  # 1-based
-            eids_here.append(eid_global)
+            elements.append((
+                int(a) + node_offset,
+                int(b) + node_offset,
+                int(c) + node_offset,
+                int(d) + node_offset,
+            ))
+            eids_here.append(elem_offset + k + 1)
 
         slice_to_eids[si] = eids_here
-
         node_offset += nodes.shape[0]
         elem_offset += elems_local_1based.shape[0]
 
     return vertices, elements, slice_to_eids
+
 
 def generate_global_tet_mesh(
     input_stl: str,
@@ -319,21 +378,10 @@ def generate_global_tet_mesh(
     cyl_radius: float,
     out_dir: str,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[float], tuple[float, float, float, float, float]]:
-    """
-    Returns
-    -------
-    tet_slices : list[(nodes_world, elems_local_1based)]
-        nodes_world : (Ni, 3) float64  -- WORLD coordinates
-        elems_local_1based : (Mi, 4) int32 -- 1-based indices into nodes_world (per-slice local)
-    z_slices : list[float]
-        Slice centers in w (param space).
-    cyl_params : (cx, cz, R0, v_offset, y_off)
-        v_offset and y_off are kept for compatibility (set to 0.0 here).
-    """
     mesh = trimesh.load(input_stl)
     verts_world = mesh.vertices.copy()
 
-    # --- cylinder center logic (same as your current code) ---
+    # --- cylinder center logic (unchanged) ---
     bounds = mesh.bounds
     z_min_w, z_max_w = bounds[0, 2], bounds[1, 2]
 
@@ -359,7 +407,7 @@ def generate_global_tet_mesh(
 
     mesh_param = trimesh.Trimesh(vertices=verts_param, faces=mesh.faces, process=False)
 
-    # --- watertight in param space (same as your code) ---
+    # --- watertight + repair in param space ---
     try:
         v_param = mesh_param.vertices.astype(np.float64)
         f_param = mesh_param.faces.astype(np.int64)
@@ -368,160 +416,80 @@ def generate_global_tet_mesh(
         tin = pfix.MeshFix(vw, fw)
         tin.repair()
         mesh_param = trimesh.Trimesh(vertices=tin.v, faces=tin.f, process=False)
-    except Exception:
-        pass
+        log(f"[WT] repaired param mesh: verts={len(mesh_param.vertices)} faces={len(mesh_param.faces)}")
+    except Exception as e:
+        log(f"[WT] repair skipped/failed: {e}")
 
-    verts_param = mesh_param.vertices
-    faces_param = mesh_param.faces
+    verts_param = np.asarray(mesh_param.vertices, dtype=np.float64)
+    faces_param = np.asarray(mesh_param.faces, dtype=np.int32)
 
-    # --- slice along w ---
-    w_all = verts_param[:, 2]
+    # --- TetGen ONCE (param space volume) ---
+    if verts_param.size == 0 or faces_param.size == 0:
+        return [], [], cyl_params
+
+    try:
+        t = tetgen.TetGen(verts_param, faces_param)
+        t.tetrahedralize(
+            switches="pq1.2Y",
+            verbose=1,
+        )
+
+        nodes_param = np.asarray(t.node, dtype=np.float64)
+        elems = np.asarray(t.elem, dtype=np.int64)
+
+        if elems.size == 0 or nodes_param.size == 0:
+            log("[TET] TetGen produced empty volume")
+            return [], [], cyl_params
+
+        # keep linear tets only
+        if elems.shape[1] > 4:
+            elems = elems[:, :4]
+
+        log(f"[TET] full volume: nodes={nodes_param.shape[0]}, tets={elems.shape[0]}")
+
+    except Exception as e:
+        log(f"[TET] TetGen failed (full volume): {e}")
+        return [], [], cyl_params
+
+    # --- slice the TET VOLUME along w in param space (no caps!) ---
+    w_all = nodes_param[:, 2]
     w_min = float(w_all.min())
     w_max = float(w_all.max())
 
-    slice_meshes_param, z_slices = slice_param_mesh_along_w(
-        verts_param,
-        faces_param,
+    tet_slices_param, z_slices = slice_tet_volume_along_w(
+        nodes_param=nodes_param,
+        elems_0based=elems,
         w_step=cube_size,
         w_min=w_min,
         w_max=w_max,
     )
-    log(f"[SLICE] Generated {len(slice_meshes_param)} radial slices in param space.")
+    log(f"[SLICE-TET] Generated {len(tet_slices_param)} tet slices in param space.")
 
-    # --- build caps (your existing logic, unchanged) ---
-    slice_meshes_with_caps: list[trimesh.Trimesh] = []
-    num_slices = len(slice_meshes_param)
-
-    next_cap_verts: np.ndarray | None = None
-    next_cap_faces: np.ndarray | None = None
-
-    for rev_idx in range(num_slices - 1, -1, -1):
-        slice_idx = rev_idx
-        v_param_slice, f_slice = slice_meshes_param[slice_idx]
-
-        is_bottom_slice = (slice_idx == 0)
-        is_top_slice = (slice_idx == num_slices - 1)
-
-        verts_chunks = [v_param_slice]
-        faces_chunks = [f_slice]
-
-        # debug export of WT slice (optional)
-        try:
-            debug_dir = Path(out_dir) / "SLICE_STL"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            debug_path = debug_dir / f"{Path(input_stl).stem}_wt_slice_{slice_idx:03d}.stl"
-            trimesh.Trimesh(vertices=v_param_slice, faces=f_slice, process=False).export(debug_path.as_posix())
-            log(f"[WT-SLICES] Wrote WT slice {slice_idx} STL to: {debug_path}")
-        except Exception:
-            pass
-
-        new_idx_verts = None
-        cap_faces_local = None
-
-        # bottom cap (skip slice 0)
-        if not is_bottom_slice:
-            new_idx_verts, cap_faces_local = build_bottom_cap_faces_from_loops(
-                verts_idx_slice=v_param_slice,
-                faces_local=f_slice,
-                z_band=0.5,
-                debug_dir=Path(out_dir) / "CAP_DEBUG",
-                slice_idx=slice_idx,
-            )
-            if new_idx_verts.size > 0 and cap_faces_local.size > 0:
-                verts_chunks.append(new_idx_verts)
-                faces_chunks.append(cap_faces_local)
-
-        # top cap from above slice's bottom cap
-        if (not is_top_slice) and (next_cap_verts is not None) and (next_cap_faces is not None):
-            offset = sum(chunk.shape[0] for chunk in verts_chunks)
-            verts_chunks.append(next_cap_verts)
-            top_faces = next_cap_faces + offset
-            top_faces = top_faces[:, ::-1]
-            faces_chunks.append(top_faces)
-
-        v_param_slice_cap = np.vstack(verts_chunks)
-        f_slice_cap = np.vstack(faces_chunks)
-
-        slice_mesh_with_caps = trimesh.Trimesh(vertices=v_param_slice_cap, faces=f_slice_cap, process=False)
-        slice_meshes_with_caps.insert(0, slice_mesh_with_caps)
-
-        # prepare cap for slice below
-        if (not is_bottom_slice) and (new_idx_verts is not None) and (cap_faces_local is not None) \
-                and new_idx_verts.size > 0 and cap_faces_local.size > 0:
-            next_cap_verts = np.vstack([v_param_slice, new_idx_verts])
-            next_cap_faces = cap_faces_local.copy()
-        else:
-            if not is_bottom_slice:
-                next_cap_verts = None
-                next_cap_faces = None
-
-    # debug export capped slices (optional)
-    for slice_idx, slice_mesh in enumerate(slice_meshes_with_caps):
-        try:
-            debug_dir = Path(out_dir) / "SLICE_STL"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            debug_path = debug_dir / f"{Path(input_stl).stem}_wt_slice_cap_{slice_idx:03d}.stl"
-            slice_mesh.export(debug_path.as_posix())
-            log(f"[WT-SLICES] Wrote WT slice cap {slice_idx} STL to: {debug_path}")
-        except Exception:
-            pass
-
-    # --- TetGen per slice; output WORLD nodes + local (1-based) elems ---
-    tet_slices: list[tuple[np.ndarray, np.ndarray]] = []
-
-    for slice_idx, slice_mesh in enumerate(slice_meshes_with_caps):
-        verts_p = np.asarray(slice_mesh.vertices, dtype=np.float64)
-        faces = np.asarray(slice_mesh.faces, dtype=np.int32)
-
-        if verts_p.size == 0 or faces.size == 0:
-            log(f"[TET] Slice {slice_idx}: empty slice, skipping TetGen")
-            tet_slices.append((np.zeros((0, 3), np.float64), np.zeros((0, 4), np.int32)))
+    # --- map per-slice nodes to WORLD space ---
+    tet_slices_world: list[tuple[np.ndarray, np.ndarray]] = []
+    for si, (nodes_p, elems_1based) in enumerate(tet_slices_param):
+        if nodes_p.size == 0 or elems_1based.size == 0:
+            tet_slices_world.append((np.zeros((0, 3), np.float64), np.zeros((0, 4), np.int32)))
             continue
 
+        nodes_world = np.zeros_like(nodes_p)
+        for i in range(nodes_p.shape[0]):
+            nodes_world[i] = param_to_world_cyl(nodes_p[i], cx_cyl, cz_cyl, R0)
+
+        tet_slices_world.append((nodes_world, elems_1based.astype(np.int32)))
+        log(f"[SLICE-TET] Slice {si}: nodes={nodes_world.shape[0]}, tets={elems_1based.shape[0]}")
+
+        # --- optional debug wireframe ---
         try:
-            t = tetgen.TetGen(verts_p, faces)
-            t.tetrahedralize(
-                switches="pq1.2Y",  # IMPORTANT
-                verbose=1,
-                # quality=False, nobisect=True
-            )
+            dbg_dir = Path(out_dir) / "TET_DEBUG"
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            edges0 = tet_edges_from_elems_1based(elems_1based)
+            dbg_path = dbg_dir / f"{Path(input_stl).stem}_tet_slice_{si:03d}.ply"
+            write_ply_edges(dbg_path, nodes_world, edges0)
+        except Exception as e_dbg:
+            log(f"[TET-DBG] Slice {si}: failed debug PLY: {e_dbg}")
 
-            nodes_param = np.asarray(t.node, dtype=np.float64)
-            elems = np.asarray(t.elem, dtype=np.int32)
-
-            # keep linear tets
-            if elems.shape[1] > 4:
-                elems = elems[:, :4].astype(np.int32)
-
-            # TetGen uses 0-based indices -> convert to 1-based for CCX (per-slice local)
-            elems_1based = elems + 1
-
-            # map nodes to WORLD space
-            nodes_world = np.zeros_like(nodes_param)
-            for i in range(nodes_param.shape[0]):
-                nodes_world[i] = param_to_world_cyl(nodes_param[i], cx_cyl, cz_cyl, R0)
-
-            tet_slices.append((nodes_world, elems_1based))
-            log(f"[TET] Slice {slice_idx}: nodes={nodes_world.shape[0]}, tets={elems_1based.shape[0]}")
-
-            # --- DEBUG: export tet wireframe as PLY edges ---
-            try:
-                dbg_dir = Path(out_dir) / "TET_DEBUG"
-                dbg_dir.mkdir(parents=True, exist_ok=True)
-
-                edges0 = tet_edges_from_elems_1based(elems_1based)
-                dbg_path = dbg_dir / f"{Path(input_stl).stem}_tet_slice_{slice_idx:03d}.ply"
-                write_ply_edges(dbg_path, nodes_world, edges0)
-
-                log(f"[TET-DBG] Wrote tet wireframe PLY: {dbg_path} (edges={len(edges0)})")
-            except Exception as e_dbg:
-                log(f"[TET-DBG] Failed to write debug PLY for slice {slice_idx}: {e_dbg}")
-
-        except Exception as e:
-            log(f"[TET] TetGen failed on slice {slice_idx}: {e}")
-            tet_slices.append((np.zeros((0, 3), np.float64), np.zeros((0, 4), np.int32)))
-
-    return tet_slices, z_slices, cyl_params
+    return tet_slices_world, z_slices, cyl_params
 
 
 from typing import Dict, Tuple, List, Iterable

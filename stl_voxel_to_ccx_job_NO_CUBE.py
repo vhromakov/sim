@@ -24,7 +24,7 @@ Pipeline (cylindrical workflow only):
         * <job_name>_lattice_orig.ply  (original lattice nodes)
         * <job_name>_lattice_def.ply   (deformed lattice nodes)
 """
-
+from scipy.spatial import cKDTree
 import triangle as tr
 import tetgen  # <--- ADD THIS
 
@@ -149,6 +149,135 @@ def write_ply_edges(path: Path, points: np.ndarray, edges: list[tuple[int, int]]
         for (i0, i1) in edges:
             f.write(f"{i0} {i1}\n")
 
+def write_surface_nodes_ply(path: Path, points: np.ndarray, node_ids: np.ndarray) -> None:
+    points = np.asarray(points, dtype=float)
+    node_ids = np.asarray(node_ids, dtype=int)
+    assert points.shape[0] == node_ids.shape[0]
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {points.shape[0]}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property int node_id\n")
+        f.write("end_header\n")
+        for (x, y, z), nid in zip(points, node_ids):
+            f.write(f"{x} {y} {z} {int(nid)}\n")
+
+
+def map_surface_to_ccx_nodes(
+    mc_mesh_world: trimesh.Trimesh,
+    tet_vertices: list[tuple[float, float, float]],
+    cube_size: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns (surf_xyz, ccx_node_ids, dist)
+      - surf_xyz: (Ns,3) surface points (world)
+      - ccx_node_ids: (Ns,) 1-based CCX node ids
+      - dist: (Ns,) nearest-node distance
+    """
+    surf_xyz = np.asarray(mc_mesh_world.vertices, dtype=float)
+    tet_np = np.asarray(tet_vertices, dtype=float)
+
+    tree = cKDTree(tet_np)
+    dist, idx0 = tree.query(surf_xyz, k=1)   # idx0 is 0-based into tet_vertices
+    ccx_node_ids = idx0.astype(int) + 1      # CCX nodes are 1-based
+
+    # Optional: drop bad matches
+    tol = float(cube_size) * 0.75
+    mask = dist <= tol
+    return surf_xyz[mask], ccx_node_ids[mask], dist[mask]
+
+import re
+import numpy as np
+
+_FLOAT_RE = re.compile(r'[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[Ee][+-]?\d+)?')
+
+def read_frd_displacements(frd_path: str) -> dict[int, np.ndarray]:
+    """
+    Robust CalculiX FRD displacement reader.
+
+    Reads the *last* DISP block in the file (final step output).
+    Parses numbers with regex (works even when '-' is glued to previous field).
+    Returns dict[node_id] = np.array([ux, uy, uz])
+    """
+    last_disp: dict[int, np.ndarray] = {}
+    cur_disp: dict[int, np.ndarray] | None = None
+    in_disp = False
+
+    with open(frd_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            # Start of a result block
+            if line.startswith(" -4"):
+                if "DISP" in line:
+                    in_disp = True
+                    cur_disp = {}
+                else:
+                    # leaving DISP block if we hit another -4 header
+                    if in_disp and cur_disp is not None:
+                        last_disp = cur_disp
+                    in_disp = False
+                    cur_disp = None
+                continue
+
+            if not in_disp:
+                continue
+
+            # End of block
+            if line.startswith(" -3") or line.startswith(" -4"):
+                if cur_disp is not None:
+                    last_disp = cur_disp
+                in_disp = False
+                cur_disp = None
+                continue
+
+            # Node line
+            if line.startswith(" -1"):
+                nums = _FLOAT_RE.findall(line)
+                # expected: -1, node_id, ux, uy, uz
+                if len(nums) >= 5:
+                    nid = int(float(nums[1]))
+                    ux, uy, uz = map(float, nums[2:5])
+                    cur_disp[nid] = np.array([ux, uy, uz], dtype=float)
+
+    # If file ended inside DISP
+    if in_disp and cur_disp is not None:
+        last_disp = cur_disp
+
+    return last_disp
+
+
+def write_surface_displacement_ply(
+    path: Path,
+    tet_vertices: list[tuple[float, float, float]],
+    node_ids_1based: np.ndarray,
+    displacements: dict[int, np.ndarray],
+    scale: float = 1.0,
+) -> None:
+    """
+    Creates a PLY with:
+      - vertex 2*i: original node position
+      - vertex 2*i+1: displaced node position
+      - edge (2*i, 2*i+1)
+    """
+    tet_np = np.asarray(tet_vertices, dtype=float)
+    node_ids_1based = np.asarray(node_ids_1based, dtype=int)
+
+    points: list[tuple[float, float, float]] = []
+    edges: list[tuple[int, int]] = []
+
+    for i, nid in enumerate(node_ids_1based):
+        p0 = tet_np[nid - 1]  # back to 0-based
+        u = displacements.get(int(nid), np.zeros(3, dtype=float))
+        p1 = p0 + scale * u
+
+        points.append((float(p0[0]), float(p0[1]), float(p0[2])))
+        points.append((float(p1[0]), float(p1[1]), float(p1[2])))
+        edges.append((2 * i, 2 * i + 1))
+
+    write_ply_edges(path, np.asarray(points, dtype=float), edges)
 
 # ============================================================
 #  Voxel mesh -> CalculiX job (cylindrical only, rewritten
@@ -1487,6 +1616,7 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world, cyl_params
     #   "side_faces":  (Fs,3) local indices (no original "bottom plane")
     #   "bottom_cap":  (Fc,3) local indices (cap from loops)
     slice_data: dict[int, dict[str, np.ndarray]] = {}
+    slice_to_side_surface_points_world: dict[int, np.ndarray] = {}
 
     z_tol = 1e-3
 
@@ -1504,7 +1634,10 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world, cyl_params
         sub_faces_local = inverse.reshape((-1, 3))  # faces in local [0..Nv-1]
 
         kept_faces = sub_faces_local
-        faces_for_loops = sub_faces_local  # loops see full shell
+        faces_for_loops = sub_faces_local  # loops see full shell# --- SIDE SURFACE ONLY (no caps): collect vertices referenced by side faces
+        side_vids = np.unique(kept_faces.reshape(-1))
+        slice_to_side_surface_points_world[slice_idx] = sub_verts_world[side_vids]
+
 
         # ------------ Generate bottom cap from contour loops (with new verts) ----
         new_idx_verts, cap_faces_local = build_bottom_cap_faces_from_loops(
@@ -1728,7 +1861,8 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world, cyl_params
             eid = len(global_elements)
             slice_to_tet_eids[slice_idx].append(eid)
 
-    return global_vertices, global_elements, slice_to_tet_eids
+    return global_vertices, global_elements, slice_to_tet_eids, slice_to_side_surface_points_world
+
 
 
 
@@ -1833,13 +1967,22 @@ def main():
     )
     export_slices_as_stl(args, vertices, slice_to_eids, hexes)  # optional hex debug
 
-    tet_vertices, tet_elements, tet_slice_to_eids = export_mc_slices_as_stl(
-        args,
-        indices_sorted,
-        vox,
-        mc_mesh_world,
-        cyl_params,  # <-- NEW
+    tet_vertices, tet_elements, tet_slice_to_eids, slice_to_side_surface_pts = export_mc_slices_as_stl(
+        args, indices_sorted, vox, mc_mesh_world, cyl_params
     )
+
+
+    # --- Surface node tracking (pre-sim) -------------------------
+    surf_xyz, surf_node_ids, surf_dist = map_surface_to_ccx_nodes(
+        mc_mesh_world=mc_mesh_world,
+        tet_vertices=tet_vertices,
+        cube_size=args.cube_size,
+    )
+
+    surf_pre_path = Path(out_dir) / f"{job_base}_surface_pre.ply"
+    write_surface_nodes_ply(surf_pre_path, surf_xyz, surf_node_ids)
+    log(f"[SURFACE] Pre-sim surface PLY: {surf_pre_path} (N={len(surf_node_ids)})")
+
 
     # 2) Single uncoupled thermo-mechanical job (TETS instead of HEXES)
     utd_job = basepath + "_utd_tet"
@@ -1852,7 +1995,7 @@ def main():
         tet_slice_to_eids,
         z_slices,
         shrinkage_curve=[5, 4, 3, 2, 1],
-        cure_shrink_per_unit=0.05,  # 3%
+        cure_shrink_per_unit=0.5,  # 3%
         cyl_params=cyl_params,
         cube_size=args.cube_size,
         output_stride=args.output_stride,
@@ -1864,6 +2007,44 @@ def main():
         if not ok:
             log("[RUN] UTD job failed, skipping FFD.")
             return
+        
+        frd_path = utd_job + ".frd"
+        disp = read_frd_displacements(frd_path)
+
+        # Build KD-tree on ALL CCX tet nodes once
+        tet_np = np.asarray(tet_vertices, dtype=float)
+        tree = cKDTree(tet_np)
+
+        per_layer_dir = Path(out_dir) / "surface_displacement_layers"
+        per_layer_dir.mkdir(parents=True, exist_ok=True)
+
+        tol = float(args.cube_size) * 0.75  # same idea as before
+
+        for slice_idx, pts_world in sorted(slice_to_side_surface_pts.items()):
+            if pts_world.size == 0:
+                continue
+
+            dist, idx0 = tree.query(np.asarray(pts_world, dtype=float), k=1)
+            mask = dist <= tol
+            if not np.any(mask):
+                log(f"[SURFACE] Slice {slice_idx}: no matches within tol, skipping.")
+                continue
+
+            node_ids = (idx0[mask].astype(int) + 1)  # 1-based CCX node ids
+            node_ids = np.unique(node_ids)           # deduplicate
+
+            ply_path = per_layer_dir / f"{job_base}_slice_{slice_idx:03d}_surface_displacement.ply"
+            write_surface_displacement_ply(
+                ply_path,
+                tet_vertices=tet_vertices,
+                node_ids_1based=node_ids,
+                displacements=disp,
+                scale=1.0,   # bump to 10/50 if needed for visibility
+            )
+
+            log(f"[SURFACE] Slice {slice_idx}: wrote {len(node_ids)} surface nodes -> {ply_path}")
+
+
 
 if __name__ == "__main__":
     main()
