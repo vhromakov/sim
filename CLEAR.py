@@ -1,32 +1,27 @@
+from typing import Any, List, Dict, Set, Optional
+from typing import List, Any
+from vtk.util import numpy_support
+import math
+import numpy as np
 import os
-import subprocess
-import trimesh
 import point_cloud_utils as pcu
 import pymeshfix as pfix
-import numpy as np
+import re
+import subprocess
 import tetgen
-
-import math
-from typing import List, Any
-import numpy as np
-
-import math
-from typing import List, Any
-import numpy as np
+import trimesh
+import vtk
+import vtk
 
 
-import math
-import numpy as np
-from typing import Any, List, Dict, Tuple, Set, Optional
-
-LAYER_HEIGHT = 2
-RESOLUTION = 10_000
-
-
-def _wrap_0_2pi(a: float) -> float:
-    twopi = 2.0 * math.pi
-    a = a % twopi
-    return a if a >= 0.0 else a + twopi
+LAYER_HEIGHT = 5
+RESOLUTION = 1_000
+CYLINDER_RADIUS = 199.82
+SHRINKAGE = 0.2
+SHRINKAGE_CURVE = [5,4,3,2,1]
+INPUT_STL = "MODELS/CSC16_U00P_.stl"
+OUTPUT_DIR = "OUTPUT"
+SIMULATION = f"{OUTPUT_DIR}/simulation"
 
 
 def compute_cylinder_center_from_bottom_z(pts: np.ndarray, radius: float):
@@ -52,6 +47,7 @@ def compute_cylinder_center_from_bottom_z(pts: np.ndarray, radius: float):
     # reference angle at the contact point (start of printing)
     theta0 = math.atan2(z0 - cz, x0 - cx)  # usually ~ -pi/2
     return cx, cz, theta0
+
 
 def write_calculix_job_tet_layer_binned(
     path: str,
@@ -81,14 +77,7 @@ def write_calculix_job_tet_layer_binned(
         raise ValueError("layer_height must be > 0")
 
     # ---- extract pyvista grid ----
-    if hasattr(tg_or_grid, "points") and hasattr(tg_or_grid, "cells"):
-        grid = tg_or_grid
-    elif hasattr(tg_or_grid, "grid") and tg_or_grid.grid is not None:
-        grid = tg_or_grid.grid
-    elif hasattr(tg_or_grid, "tetrahedralize"):
-        grid = tg_or_grid.tetrahedralize()
-    else:
-        raise TypeError("Expected tetgen.TetGen or pyvista.UnstructuredGrid-like object")
+    grid = tg_or_grid.grid
 
     pts = np.asarray(grid.points, dtype=float)  # (N,3)
     n_nodes = int(pts.shape[0])
@@ -330,8 +319,6 @@ def write_calculix_job_tet_layer_binned(
 
                 # boundary + cure application
                 f.write("*BOUNDARY\n")
-                if base_nodes:
-                    f.write("BASE, 1, 3, 0.\n")
 
                 for j in existing_slice_idxs:
                     if not printed[j]:
@@ -360,8 +347,8 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
         # my_env["PASTIX_GPU"] = "1"
         my_env["OMP_NUM_THREADS"] = "6"
         my_env["OMP_DYNAMIC"] = "FALSE"
-        my_env["ЬЛД_NUM_THREADS"] = "6"
-        my_env["ЬЛД_DYNAMIC"] = "FALSE"
+        my_env["MKL_NUM_THREADS"] = "6"
+        my_env["MKL_DYNAMIC"] = "FALSE"
 
         with open(log_path, "w", encoding="utf-8") as logfile:
             proc = subprocess.Popen(
@@ -380,58 +367,6 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
     print(f"[RUN] Full output written to: {log_path}")
 
     return rc == 0
-
-
-repaired_mesh = trimesh.load("MODELS/CSC16_U00P_.stl")
-
-vw, fw = pcu.make_mesh_watertight(
-    repaired_mesh.vertices.astype(np.float64),
-    repaired_mesh.faces.astype(np.int64),
-    resolution=RESOLUTION
-)
-
-tin = pfix.MeshFix(vw, fw)
-tin.repair()
-
-repaired_mesh = trimesh.Trimesh(vertices=tin.v, faces=tin.f, process=False)
-repaired_mesh.export("CLEAN.stl")
-
-t = tetgen.TetGen(repaired_mesh.vertices, repaired_mesh.faces)
-t.tetrahedralize(
-    order=1,        # linear tets (C3D4)
-    quality=True,  # DO NOT enforce radius-edge ratio
-    # mindihedral=0,  # disable angle constraints
-    steinerleft=-1,  # allow NO Steiner points
-    verbose=1
-)
-
-write_calculix_job_tet_layer_binned(
-    path="OUTPUT/shrink_test.inp",
-    tg_or_grid=t,
-    layer_height=LAYER_HEIGHT,   # radial step inward
-    cyl_radius=199.82,
-    shrinkage_curve=[5,4,3,2,1],
-    cure_shrink_per_unit=0.2,
-)
-
-run_calculix(
-    "OUTPUT/shrink_test",
-    "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe"
-)
-
-import re
-import numpy as np
-import vtk
-from vtk.util import numpy_support
-
-
-
-# =========================
-# 1) Build a VTK tet grid + locator from TetGen/PyVista grid
-# =========================
-import os
-import numpy as np
-import vtk
 
 
 def _ensure_dir(path: str) -> None:
@@ -539,6 +474,7 @@ def export_tet_displacement_debug(
     print(f"[DBG] Exported vectors: {len(idx)}")
     print(f"[DBG] Export bbox (pre): min={mn}, max={mx}")
 
+
 def vtk_grid_from_tetgen(tg_or_grid):
     """
     Accepts:
@@ -547,14 +483,7 @@ def vtk_grid_from_tetgen(tg_or_grid):
 
     Returns: vtk.vtkUnstructuredGrid with VTKTETRA cells
     """
-    if hasattr(tg_or_grid, "points") and hasattr(tg_or_grid, "cells"):
-        grid = tg_or_grid
-    elif hasattr(tg_or_grid, "grid") and tg_or_grid.grid is not None:
-        grid = tg_or_grid.grid
-    elif hasattr(tg_or_grid, "tetrahedralize"):
-        grid = tg_or_grid.tetrahedralize()
-    else:
-        raise TypeError("Expected tetgen.TetGen or pyvista.UnstructuredGrid-like object")
+    grid = tg_or_grid.grid
 
     pts = np.asarray(grid.points, dtype=float)
     cells = np.asarray(grid.cells, dtype=np.int64)
@@ -601,21 +530,6 @@ def build_cell_locator(ug: vtk.vtkUnstructuredGrid):
     loc.BuildLocator()
     return loc
 
-
-# =========================
-# 2) Read nodal displacements from CalculiX FRD
-# =========================
-
-import re
-import numpy as np
-
-
-import re
-import numpy as np
-
-
-import re
-import numpy as np
 
 def read_ccx_frd_displacements(frd_path: str):
     """
@@ -667,12 +581,18 @@ def read_ccx_frd_displacements(frd_path: str):
     if not disp_last:
         raise RuntimeError(f"No DISP block parsed from FRD: {frd_path}")
 
+    print("[CHK] ug points:", vtk_grid.GetNumberOfPoints())
+    print("[CHK] disp entries:", len(disp_last))
+    print("[CHK] disp id range:", min(disp_last), max(disp_last))
+    # how many nodes are missing?
+    missing = 0
+    for pid in range(vtk_grid.GetNumberOfPoints()):
+        if (pid+1) not in disp_last:
+            missing += 1
+    print("[CHK] missing disp for nodes:", missing)
+
     return disp_last
 
-
-# =========================
-# 3) FEM shape function interpolation (C3D4) using VTK weights
-# =========================
 
 def interpolate_displacement_at_point(
     ug: vtk.vtkUnstructuredGrid,
@@ -729,10 +649,6 @@ def interpolate_displacement_at_point(
 
     return u
 
-
-# =========================
-# 4) Read STL, deform vertices, write STL (VTK)
-# =========================
 
 def deform_stl_by_tet_field(
     stl_in: str,
@@ -824,47 +740,59 @@ def deform_stl_by_tet_field(
     print(f"[DEFORM] wrote: {stl_out}")
 
 
-# =========================
-# 5) Convenience wrapper: from TetGen + FRD + STL -> deformed STL
-# =========================
+repaired_mesh = trimesh.load(INPUT_STL)
 
-def apply_ccx_deformation_to_stl(
-    tetgen_or_grid,
-    frd_path: str,
-    stl_in: str,
-    stl_out: str,
-    scale: float = 1.0,
-    outside_mode: str = "keep",
-):
-    ug = vtk_grid_from_tetgen(tetgen_or_grid)
-    disp = read_ccx_frd_displacements(frd_path)
-    print("[CHK] ug points:", ug.GetNumberOfPoints())
-    print("[CHK] disp entries:", len(disp))
-    print("[CHK] disp id range:", min(disp), max(disp))
+vw, fw = pcu.make_mesh_watertight(
+    repaired_mesh.vertices.astype(np.float64),
+    repaired_mesh.faces.astype(np.int64),
+    resolution=RESOLUTION
+)
 
-    # how many nodes are missing?
-    missing = 0
-    for pid in range(ug.GetNumberOfPoints()):
-        if (pid+1) not in disp:
-            missing += 1
-    print("[CHK] missing disp for nodes:", missing)
-    # DEBUG: export tet node displacement vectors
-    export_tet_displacement_debug(
-        ug,
-        disp,
-        out_prefix="DEBUG/tet",
-        scale=scale,
-        stride=1,
-    )
+meshfix_mesh = pfix.MeshFix(vw, fw)
+meshfix_mesh.repair()
 
-    deform_stl_by_tet_field(stl_in, stl_out, ug, disp, scale=scale, outside_mode=outside_mode)
+repaired_mesh = trimesh.Trimesh(vertices=meshfix_mesh.v, faces=meshfix_mesh.f, process=False)
+repaired_mesh.export(f"{OUTPUT_DIR}/repaired_mesh.stl")
 
+tetgen_mesh = tetgen.TetGen(repaired_mesh.vertices, repaired_mesh.faces)
+tetgen_mesh.tetrahedralize(
+    order=1,        # linear tets (C3D4)
+    quality=True,  # DO NOT enforce radius-edge ratio
+    # mindihedral=0,  # disable angle constraints
+    steinerleft=-1,  # allow NO Steiner points
+    verbose=1
+)
 
-apply_ccx_deformation_to_stl(
-    tetgen_or_grid=t,                # or grid
-    frd_path="OUTPUT/shrink_test.frd",
-    stl_in="MODELS/CSC16_U00P_.stl",
-    stl_out="original_high_detail_deformed.stl",
+write_calculix_job_tet_layer_binned(
+    path=f"{SIMULATION}.inp",
+    tg_or_grid=tetgen_mesh,
+    layer_height=LAYER_HEIGHT,
+    cyl_radius=CYLINDER_RADIUS,
+    shrinkage_curve=SHRINKAGE_CURVE,
+    cure_shrink_per_unit=SHRINKAGE,
+)
+
+run_calculix(
+    SIMULATION,
+    "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe"
+)
+
+vtk_grid = vtk_grid_from_tetgen(tetgen_mesh)
+displacements = read_ccx_frd_displacements(f"{SIMULATION}.frd")
+
+export_tet_displacement_debug(
+    vtk_grid,
+    displacements,
+    out_prefix="DEBUG/tet",
     scale=1.0,
-    outside_mode="keep",
+    stride=1,
+)
+
+deform_stl_by_tet_field(
+    INPUT_STL,
+    f"{OUTPUT_DIR}/deformed_stl.stl",
+    vtk_grid,
+    displacements,
+    scale=1.0,
+    outside_mode="keep"
 )
