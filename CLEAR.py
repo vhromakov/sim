@@ -1005,6 +1005,9 @@ def slice_mesh_plane(
     if "process" not in kwargs:
         kwargs["process"] = False
 
+    # NEW: collect caps (one per plane)
+    caps_out = []
+
     # slice away specified planes
     for origin, normal in zip(
         plane_origin.reshape((-1, 3)), plane_normal.reshape((-1, 3))
@@ -1048,8 +1051,10 @@ def slice_mesh_plane(
             if len(unique) < 3:
                 continue
 
-            # collect new faces
-            faces = [f]
+            # NEW: per-plane cap accumulation
+            cap_vertices = []
+            cap_faces = []
+            faces_accum = [f]
             for p in polygons.edges_to_polygons(edges[unique_edge], vertices_2D[:, :2]):
                 # triangulate cap and raise an error if any new vertices were inserted
                 vn, fn = triangulate_polygon(p, engine=engine, triangle_args=triangle_args)
@@ -1057,26 +1062,73 @@ def slice_mesh_plane(
                 vn3 = tf.transform_points(util.stack_3D(vn), to_3D)
 
                 # Append new vertices to mesh (ALL vn3 returned, including boundary).
-                base = len(vertices)
+                base_mesh = len(vertices)
                 vertices = np.vstack([vertices, vn3])
 
                 if uv is not None:
                     # Cap vertices have no meaningful UV; fill zeros (or change as needed)
                     uv = np.vstack([uv, np.zeros((len(vn3), 2), dtype=uv.dtype)])
 
-                nf = fn + base
+                nf = fn + base_mesh
 
                 nf_ok = (nf[:, 1:] != nf[:, :1]).all(axis=1) & (nf[:, 1] != nf[:, 2])
-                faces.append(nf[nf_ok])
+                faces_accum.append(nf[nf_ok])
 
-            faces = np.vstack(faces)
+                # NEW: append to cap mesh (reindexed within cap)
+                base_cap = sum(len(v) for v in cap_vertices)
+                cap_vertices.append(vn3)
+                cap_faces.append(fn + base_cap)
+
+            faces = np.vstack(faces_accum)
+
+            if len(cap_vertices) == 0:
+                caps_out.append(None)
+            else:
+                cv = np.vstack(cap_vertices)
+                cf = np.vstack(cap_faces)
+                # keep normals consistent with your cap orientation
+                caps_out.append(Trimesh(vertices=cv, faces=cf, process=False))
 
     visual = (
         TextureVisuals(uv=uv, material=mesh.visual.material.copy()) if has_uv else None
     )
 
-    # return the sliced mesh
-    return Trimesh(vertices=vertices, faces=faces, visual=visual, **kwargs)
+    sliced = Trimesh(vertices=vertices, faces=faces, visual=visual, **kwargs)
+
+    # if user provided a single plane, return a single cap mesh instead of a list
+    single = (plane_origin.shape == (3,))
+    if single:
+        return sliced, (caps_out[0] if len(caps_out) else None)
+    return sliced, caps_out
+
+
+def _orient_cap(cap: trimesh.Trimesh | None, desired_normal: np.ndarray) -> trimesh.Trimesh | None:
+    """
+    Ensure cap face winding produces normals roughly aligned with desired_normal.
+    """
+    if cap is None or cap.faces is None or len(cap.faces) == 0:
+        return None
+
+    desired_normal = np.asarray(desired_normal, dtype=float)
+    desired_normal /= (np.linalg.norm(desired_normal) + 1e-30)
+
+    # mean normal (robust-ish)
+    n = cap.face_normals
+    if n is None or len(n) == 0:
+        return cap
+    mean_n = n.mean(axis=0)
+    if np.dot(mean_n, desired_normal) < 0.0:
+        # flip winding
+        cap = cap.copy()
+        cap.faces = cap.faces[:, [0, 2, 1]]
+    return cap
+
+
+def _add_cap(mesh: trimesh.Trimesh, cap: trimesh.Trimesh | None) -> trimesh.Trimesh:
+    if cap is None or len(cap.faces) == 0:
+        return mesh
+    # concatenate keeps things simple (duplicates verts are OK for STL export etc.)
+    return trimesh.util.concatenate([mesh, cap])
 
 
 def slice_mesh_into_z_slabs_by_height(
@@ -1084,30 +1136,29 @@ def slice_mesh_into_z_slabs_by_height(
     layer_height: float,
 ) -> list[trimesh.Trimesh]:
     """
-    Slice mesh into slabs along Z using trimesh.intersections.slice_mesh_plane.
+    Slice mesh into Z slabs of height layer_height, returning CLOSED slabs.
 
-    - Slabs are [z0, z0+H], [z0+H, z0+2H], ... where z0 = min Z of mesh bounds.
-    - Returns OPEN meshes (not capped). We'll cap later.
-
-    Returns: list of trimesh.Trimesh
+    Reuse rule:
+      top cap of slab i  == bottom cap of slab (i+1)
     """
     if layer_height <= 0:
         raise ValueError("layer_height must be > 0")
 
     bounds = np.asarray(mesh.bounds, dtype=float)
-    z0 = float(bounds[0, 2])  # min Z
-    z1 = float(bounds[1, 2])  # max Z
+    z0 = float(bounds[0, 2])
+    z1 = float(bounds[1, 2])
     if not np.isfinite(z0) or not np.isfinite(z1) or z1 <= z0:
         raise ValueError(f"Bad Z bounds: zmin={z0}, zmax={z1}")
 
     H = float(layer_height)
 
-    # planes are z=const
     n_pos = np.array([0.0, 0.0, 1.0], dtype=float)   # keep z >= plane
     n_neg = np.array([0.0, 0.0, -1.0], dtype=float)  # keep z <= plane
 
     n_layers = int(np.ceil((z1 - z0) / H))
     slabs: list[trimesh.Trimesh] = []
+
+    prev_slab: trimesh.Trimesh | None = None  # previous slab waiting for its TOP cap
 
     for i in range(n_layers):
         a0 = z0 + i * H
@@ -1119,29 +1170,64 @@ def slice_mesh_into_z_slabs_by_height(
         origin1 = mesh.centroid.copy()
         origin1[2] = float(a1)
 
-        # keep z >= a0
-        m1 = slice_mesh_plane(
+        # 1) Keep z >= a0, and generate the cap at z=a0 (this is the BOTTOM cap of current slab)
+        m1, bottom_cap = slice_mesh_plane(
             mesh,
             plane_normal=n_pos,
             plane_origin=origin0,
             cap=True,
+            return_cap=True,
             engine="triangle",
             triangle_args="pq15",
         )
         if m1 is None or len(m1.faces) == 0:
             continue
 
-        # keep z <= a1
-        m2 = slice_mesh_plane(
-            m1,
-            plane_normal=n_neg,
-            plane_origin=origin1,
-            cap=False,
-        )
+        # 2) Keep z <= a1. Only the LAST slab needs an actual top cap computed here.
+        is_last = (i == n_layers - 1)
+
+        if is_last:
+            m2, top_cap = slice_mesh_plane(
+                m1,
+                plane_normal=n_neg,
+                plane_origin=origin1,
+                cap=True,
+                return_cap=True,
+                engine="triangle",
+                triangle_args="pq15",
+            )
+        else:
+            m2, top_cap = slice_mesh_plane(
+                m1,
+                plane_normal=n_neg,
+                plane_origin=origin1,
+                cap=False,
+                return_cap=True,  # will be None from your implementation; harmless
+            )
+
         if m2 is None or len(m2.faces) == 0:
             continue
 
-        slabs.append(m2)
+        # ---- Reuse logic ----
+        # The bottom cap of *current* slab at a0 is the TOP cap of the *previous* slab.
+        if prev_slab is not None:
+            cap_for_prev_top = _orient_cap(bottom_cap, desired_normal=np.array([0.0, 0.0, 1.0]))
+            prev_closed = _add_cap(prev_slab, cap_for_prev_top)
+            slabs.append(prev_closed)
+
+        # Current slab: add its bottom cap now (normals should point DOWN)
+        bottom_cap_cur = _orient_cap(bottom_cap, desired_normal=np.array([0.0, 0.0, -1.0]))
+        cur = _add_cap(m2, bottom_cap_cur)
+
+        # If last slab: also add its top cap now (normals should point UP)
+        if is_last:
+            top_cap = _orient_cap(top_cap, desired_normal=np.array([0.0, 0.0, 1.0]))
+            cur = _add_cap(cur, top_cap)
+            slabs.append(cur)
+            prev_slab = None
+        else:
+            # hold it until next iteration gives us the reused top cap
+            prev_slab = cur
 
     return slabs
 
