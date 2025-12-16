@@ -24,6 +24,142 @@ OUTPUT_DIR = "OUTPUT"
 SIMULATION = f"{OUTPUT_DIR}/simulation"
 
 
+def find_bottom_contact_point(mesh: trimesh.Trimesh) -> np.ndarray:
+    """
+    Find the 'bottom' contact point as you used before:
+    the vertex with minimum Z in WORLD space.
+
+    Returns: np.ndarray shape (3,) = (x_low, y_low, z_low)
+    """
+    V = np.asarray(mesh.vertices, dtype=np.float64)
+    if V.size == 0:
+        raise ValueError("Mesh has no vertices.")
+    i0 = int(np.argmin(V[:, 2]))
+    return V[i0].copy()
+
+
+def transform_mesh_to_cylindrical_like_old(
+    mesh: trimesh.Trimesh,
+    cyl_radius: float,
+    bottom_point_world: np.ndarray,
+) -> trimesh.Trimesh:
+    """
+    Same principle as your old snippet, BUT the bottom contact point is provided manually.
+
+    - bottom_point_world = (x_low, y_low, z_low) in WORLD coords
+    - cx = x_low
+    - cz = z_low +/- R, choose the one closer to bbox z-center
+    - axis is +Y (so we unwrap in XZ plane)
+    - mapping:
+        u = R * wrap(theta - theta0)   (arc length)
+        v = y
+        w = R - r    (depth inward, clamped >= 0)
+    - seam fix: if mesh crosses u=0/2πR, shift high-u half back by 2πR
+    """
+    if cyl_radius <= 0:
+        raise ValueError("cyl_radius must be > 0")
+
+    Vw = np.asarray(mesh.vertices, dtype=np.float64)
+    if Vw.size == 0:
+        raise ValueError("Mesh has no vertices.")
+
+    bp = np.asarray(bottom_point_world, dtype=np.float64).reshape(3)
+    x_low, y_low, z_low = map(float, bp)
+
+    # bbox z center (same as your old code)
+    z_min_w = float(np.min(Vw[:, 2]))
+    z_max_w = float(np.max(Vw[:, 2]))
+    z_center_bbox = 0.5 * (z_min_w + z_max_w)
+
+    cx_cyl = float(x_low)
+    R0 = float(cyl_radius)
+
+    cz_plus = z_low + R0
+    cz_minus = z_low - R0
+    cz_cyl = cz_plus if abs(cz_plus - z_center_bbox) < abs(cz_minus - z_center_bbox) else cz_minus
+
+    # theta0 so that the provided bottom point maps to u=0
+    theta0 = math.atan2(z_low - cz_cyl, x_low - cx_cyl)
+
+    # vectorized mapping for all vertices
+    x = Vw[:, 0]
+    y = Vw[:, 1]
+    z = Vw[:, 2]
+
+    dx = x - cx_cyl
+    dz = z - cz_cyl
+
+    theta = np.arctan2(dz, dx)
+    dtheta = (theta - theta0) % (2.0 * math.pi)
+
+    u = dtheta * R0
+    v = y
+    r = np.sqrt(dx * dx + dz * dz)
+    w = R0 - r
+    w = np.maximum(w, 0.0)
+
+    Vp = np.column_stack([u, v, w]).astype(np.float64)
+
+    # ---- seam fix (global) ----
+    tw = 2.0 * math.pi * R0
+    uu = Vp[:, 0]
+    if (uu.max() - uu.min()) > 0.5 * tw:
+        uu = np.where(uu > 0.5 * tw, uu - tw, uu)
+        Vp[:, 0] = uu
+
+    print(f"[CYL-OLD] bottom={bp}, cx={cx_cyl:.6f}, cz={cz_cyl:.6f}, R0={R0:.6f}, theta0={theta0:.6f}")
+    return trimesh.Trimesh(vertices=Vp, faces=mesh.faces.copy(), process=False), (cx_cyl, cz_cyl, R0, theta0)
+
+
+def transform_mesh_from_cylindrical_like_old(
+    cyl_mesh: trimesh.Trimesh,
+    cx_cyl: float,
+    cz_cyl: float,
+    R0: float,
+    theta0: float,
+) -> trimesh.Trimesh:
+    """
+    Reverse of the old-style cylindrical param mapping.
+
+    Input mesh vertices are in (u, v, w):
+      u = arc length around cylinder (may be seam-shifted negative)
+      v = y (axis coordinate)
+      w = inward depth from surface (>=0)
+
+    Inverse mapping:
+      theta = theta0 + (u / R0)
+      r = R0 - w
+      x = cx + r*cos(theta)
+      z = cz + r*sin(theta)
+      y = v
+
+    Returns a new trimesh.Trimesh in WORLD space.
+    """
+    Vp = np.asarray(cyl_mesh.vertices, dtype=np.float64)
+    if Vp.size == 0:
+        raise ValueError("Mesh has no vertices.")
+    if R0 <= 0:
+        raise ValueError("R0 must be > 0")
+
+    u = Vp[:, 0].astype(np.float64)
+    v = Vp[:, 1].astype(np.float64)
+    w = Vp[:, 2].astype(np.float64)
+
+    # If seam-fix shifted some u negative, normalize back to [0, 2πR0)
+    tw = 2.0 * math.pi * float(R0)
+    u_norm = np.mod(u, tw)
+
+    theta = float(theta0) + (u_norm / float(R0))
+    r = float(R0) - w
+
+    x = float(cx_cyl) + r * np.cos(theta)
+    z = float(cz_cyl) + r * np.sin(theta)
+    y = v
+
+    Vw = np.column_stack([x, y, z]).astype(np.float64)
+    return trimesh.Trimesh(vertices=Vw, faces=cyl_mesh.faces.copy(), process=False)
+
+
 def compute_cylinder_center_from_bottom_z(pts: np.ndarray, radius: float):
     """
     Assumptions (your clarified convention):
@@ -740,20 +876,50 @@ def deform_stl_by_tet_field(
     print(f"[DEFORM] wrote: {stl_out}")
 
 
-repaired_mesh = trimesh.load(INPUT_STL)
+# Input
+input_mesh = trimesh.load(INPUT_STL)
+contact_point = find_bottom_contact_point(input_mesh)
 
 vw, fw = pcu.make_mesh_watertight(
-    repaired_mesh.vertices.astype(np.float64),
-    repaired_mesh.faces.astype(np.int64),
+    input_mesh.vertices.astype(np.float64),
+    input_mesh.faces.astype(np.int64),
     resolution=RESOLUTION
 )
 
-meshfix_mesh = pfix.MeshFix(vw, fw)
-meshfix_mesh.repair()
+# Water
+water_mesh = trimesh.Trimesh(
+    vertices=vw,
+    faces=fw,
+    process=False
+)
+water_mesh.export(f"{OUTPUT_DIR}/water_mesh.stl")
 
-repaired_mesh = trimesh.Trimesh(vertices=meshfix_mesh.v, faces=meshfix_mesh.f, process=False)
+# Cylinder
+cylinder_mesh, (cx, cz, R0, theta0) = transform_mesh_to_cylindrical_like_old(
+    water_mesh,
+    CYLINDER_RADIUS,
+    contact_point,
+)
+cylinder_mesh.export(f"{OUTPUT_DIR}/cyl_mesh.stl")
+
+# Repair
+repaired_mesh = pfix.MeshFix(
+    cylinder_mesh.vertices,
+    cylinder_mesh.faces
+)
+repaired_mesh.repair()
+
+repaired_mesh = trimesh.Trimesh(
+    vertices=repaired_mesh.v,
+    faces=repaired_mesh.f,
+    process=False
+)
 repaired_mesh.export(f"{OUTPUT_DIR}/repaired_mesh.stl")
 
+# world_mesh = transform_mesh_from_cylindrical_like_old(cylinder_mesh, cx, cz, R0, theta0)
+# world_mesh.export(f"{OUTPUT_DIR}/world_mesh.stl")
+
+# Tetrahedralize
 tetgen_mesh = tetgen.TetGen(repaired_mesh.vertices, repaired_mesh.faces)
 tetgen_mesh.tetrahedralize(
     order=1,        # linear tets (C3D4)
@@ -788,11 +954,11 @@ export_tet_displacement_debug(
     stride=1,
 )
 
-deform_stl_by_tet_field(
-    INPUT_STL,
-    f"{OUTPUT_DIR}/deformed_stl.stl",
-    vtk_grid,
-    displacements,
-    scale=1.0,
-    outside_mode="keep"
-)
+# deform_stl_by_tet_field(
+#     INPUT_STL,
+#     f"{OUTPUT_DIR}/deformed_stl.stl",
+#     vtk_grid,
+#     displacements,
+#     scale=1.0,
+#     outside_mode="keep"
+# )
