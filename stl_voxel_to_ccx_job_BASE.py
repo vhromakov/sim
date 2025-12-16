@@ -944,8 +944,8 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
         # my_env["PASTIX_GPU"] = "1"
         my_env["OMP_NUM_THREADS"] = "6"
         my_env["OMP_DYNAMIC"] = "FALSE"
-        my_env["ЬЛД_NUM_THREADS"] = "6"
-        my_env["ЬЛД_DYNAMIC"] = "FALSE"
+        my_env["MKL_NUM_THREADS"] = "6"
+        my_env["MKL_DYNAMIC"] = "FALSE"
 
         with open(log_path, "w", encoding="utf-8") as logfile:
             proc = subprocess.Popen(

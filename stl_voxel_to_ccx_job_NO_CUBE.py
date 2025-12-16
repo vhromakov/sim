@@ -985,8 +985,8 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
         # my_env["PASTIX_GPU"] = "1"
         my_env["OMP_NUM_THREADS"] = "6"
         my_env["OMP_DYNAMIC"] = "FALSE"
-        my_env["ЬЛД_NUM_THREADS"] = "6"
-        my_env["ЬЛД_DYNAMIC"] = "FALSE"
+        my_env["MKL_NUM_THREADS"] = "6"
+        my_env["MKL_DYNAMIC"] = "FALSE"
 
         with open(log_path, "w", encoding="utf-8") as logfile:
             proc = subprocess.Popen(
@@ -1864,6 +1864,41 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world, cyl_params
     return global_vertices, global_elements, slice_to_tet_eids, slice_to_side_surface_points_world
 
 
+def write_layer_displacements_json(
+    out_path: Path,
+    slice_to_node_ids: dict[int, np.ndarray],   # slice -> CCX node ids (1-based)
+    tet_vertices: list[tuple[float, float, float]],
+    displacements: dict[int, np.ndarray],
+):
+    tet_np = np.asarray(tet_vertices, dtype=float)
+
+    layers_json = []
+
+    for slice_idx in sorted(slice_to_node_ids.keys()):
+        node_ids = np.asarray(slice_to_node_ids[slice_idx], dtype=int)
+        if node_ids.size == 0:
+            continue
+
+        pts = []
+        for nid in node_ids:
+            p0 = tet_np[nid - 1]
+            u = displacements.get(int(nid), np.zeros(3, dtype=float))
+            p1 = p0 + u
+
+            pts.append({
+                "p0": [float(p0[0]), float(p0[1]), float(p0[2])],
+                "p1": [float(p1[0]), float(p1[1]), float(p1[2])],
+            })
+
+        layers_json.append({
+            "slice_idx": int(slice_idx),
+            "points": pts,
+        })
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"layers": layers_json}, f, indent=2)
+
+    log(f"[LAYER-DISP] Wrote JSON: {out_path} (layers={len(layers_json)})")
 
 
 
@@ -2019,6 +2054,8 @@ def main():
         per_layer_dir.mkdir(parents=True, exist_ok=True)
 
         tol = float(args.cube_size) * 0.75  # same idea as before
+        slice_to_surface_node_ids: dict[int, np.ndarray] = {}
+
 
         for slice_idx, pts_world in sorted(slice_to_side_surface_pts.items()):
             if pts_world.size == 0:
@@ -2032,6 +2069,7 @@ def main():
 
             node_ids = (idx0[mask].astype(int) + 1)  # 1-based CCX node ids
             node_ids = np.unique(node_ids)           # deduplicate
+            slice_to_surface_node_ids[slice_idx] = node_ids
 
             ply_path = per_layer_dir / f"{job_base}_slice_{slice_idx:03d}_surface_displacement.ply"
             write_surface_displacement_ply(
@@ -2043,6 +2081,15 @@ def main():
             )
 
             log(f"[SURFACE] Slice {slice_idx}: wrote {len(node_ids)} surface nodes -> {ply_path}")
+        
+        
+        json_path = Path(out_dir) / f"{job_base}_layer_surface_displacements.json"
+        write_layer_displacements_json(
+            json_path,
+            slice_to_surface_node_ids,
+            tet_vertices,
+            disp,
+        )
 
 
 

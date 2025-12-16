@@ -374,9 +374,7 @@ def build_global_tet_from_slices(
 
 def generate_global_tet_mesh(
     input_stl: str,
-    cube_size: float,
     cyl_radius: float,
-    out_dir: str,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[float], tuple[float, float, float, float, float]]:
     mesh = trimesh.load(input_stl)
     verts_world = mesh.vertices.copy()
@@ -430,8 +428,10 @@ def generate_global_tet_mesh(
     try:
         t = tetgen.TetGen(verts_param, faces_param)
         t.tetrahedralize(
-            switches="pq1.2Y",
+            # switches="pq1.2Y",
             verbose=1,
+            quality=False,
+            nobisect=True,
         )
 
         nodes_param = np.asarray(t.node, dtype=np.float64)
@@ -793,8 +793,8 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
         # my_env["PASTIX_GPU"] = "1"
         my_env["OMP_NUM_THREADS"] = "6"
         my_env["OMP_DYNAMIC"] = "FALSE"
-        my_env["ЬЛД_NUM_THREADS"] = "6"
-        my_env["ЬЛД_DYNAMIC"] = "FALSE"
+        my_env["MKL_NUM_THREADS"] = "6"
+        my_env["MKL_DYNAMIC"] = "FALSE"
 
         with open(log_path, "w", encoding="utf-8") as logfile:
             proc = subprocess.Popen(
