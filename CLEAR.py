@@ -11,17 +11,52 @@ import subprocess
 import tetgen
 import trimesh
 import vtk
-import vtk
+import pymeshlab as ml
 
-
-LAYER_HEIGHT = 5
-RESOLUTION = 1_000
+WATERTIGHT_RESOLUTION = 50_000
+DECIMATE_NUM_FACES = 50_000
 CYLINDER_RADIUS = 199.82
+LAYER_HEIGHT = 5
 SHRINKAGE = 0.2
 SHRINKAGE_CURVE = [5,4,3,2,1]
 INPUT_STL = "MODELS/CSC16_U00P_.stl"
 OUTPUT_DIR = "OUTPUT"
 SIMULATION = f"{OUTPUT_DIR}/simulation"
+
+
+def pymeshlab_decimate(
+    v: np.ndarray,
+    f: np.ndarray,
+    target_faces: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Quadric edge-collapse decimation using PyMeshLab.
+
+    target_faces: desired triangle count (approx).
+    Returns (v_out, f_out).
+    """
+    v = np.asarray(v, dtype=np.float64)
+    f = np.asarray(f, dtype=np.int64)
+
+    ms = ml.MeshSet()
+    ms.add_mesh(ml.Mesh(v, f), "watertight")
+
+    # Main decimation
+    ms.meshing_decimation_quadric_edge_collapse(
+        targetfacenum=int(target_faces),
+        preserveboundary=True,
+        boundaryweight=1.0,
+        preservenormal=True,
+        preservetopology=True,
+        optimalplacement=True,
+        planarquadric=True,
+        autoclean=True,
+    )
+
+    m2 = ms.current_mesh()
+    v2 = m2.vertex_matrix().astype(np.float64)
+    f2 = m2.face_matrix().astype(np.int64)
+    return v2, f2
 
 
 def find_bottom_contact_point(mesh: trimesh.Trimesh) -> np.ndarray:
@@ -883,7 +918,7 @@ contact_point = find_bottom_contact_point(input_mesh)
 vw, fw = pcu.make_mesh_watertight(
     input_mesh.vertices.astype(np.float64),
     input_mesh.faces.astype(np.int64),
-    resolution=RESOLUTION
+    resolution=WATERTIGHT_RESOLUTION
 )
 
 # Water
@@ -894,9 +929,23 @@ water_mesh = trimesh.Trimesh(
 )
 water_mesh.export(f"{OUTPUT_DIR}/water_mesh.stl")
 
+# Decimate
+vd, fd = pymeshlab_decimate(
+    water_mesh.vertices,
+    water_mesh.faces,
+    target_faces=DECIMATE_NUM_FACES
+)
+
+decimated_mesh = trimesh.Trimesh(
+    vertices=vd,
+    faces=fd,
+    process=False
+)
+decimated_mesh.export(f"{OUTPUT_DIR}/decimated_mesh.stl")
+
 # Cylinder
 cylinder_mesh, (cx, cz, R0, theta0) = transform_mesh_to_cylindrical_like_old(
-    water_mesh,
+    decimated_mesh,
     CYLINDER_RADIUS,
     contact_point,
 )
