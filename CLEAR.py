@@ -13,6 +13,7 @@ import trimesh
 import vtk
 import pymeshlab as ml
 
+
 WATERTIGHT_RESOLUTION = 50_000
 DECIMATE_NUM_FACES = 50_000
 CYLINDER_RADIUS = 199.82
@@ -911,6 +912,71 @@ def deform_stl_by_tet_field(
     print(f"[DEFORM] wrote: {stl_out}")
 
 
+def slice_mesh_into_z_slabs_by_height(
+    mesh: trimesh.Trimesh,
+    layer_height: float,
+) -> list[trimesh.Trimesh]:
+    """
+    Slice mesh into slabs along Z using trimesh.intersections.slice_mesh_plane.
+
+    - Slabs are [z0, z0+H], [z0+H, z0+2H], ... where z0 = min Z of mesh bounds.
+    - Returns OPEN meshes (not capped). We'll cap later.
+
+    Returns: list of trimesh.Trimesh
+    """
+    if layer_height <= 0:
+        raise ValueError("layer_height must be > 0")
+
+    bounds = np.asarray(mesh.bounds, dtype=float)
+    z0 = float(bounds[0, 2])  # min Z
+    z1 = float(bounds[1, 2])  # max Z
+    if not np.isfinite(z0) or not np.isfinite(z1) or z1 <= z0:
+        raise ValueError(f"Bad Z bounds: zmin={z0}, zmax={z1}")
+
+    H = float(layer_height)
+
+    # planes are z=const
+    n_pos = np.array([0.0, 0.0, 1.0], dtype=float)   # keep z >= plane
+    n_neg = np.array([0.0, 0.0, -1.0], dtype=float)  # keep z <= plane
+
+    n_layers = int(np.ceil((z1 - z0) / H))
+    slabs: list[trimesh.Trimesh] = []
+
+    for i in range(n_layers):
+        a0 = z0 + i * H
+        a1 = min(z1, z0 + (i + 1) * H)
+
+        origin0 = mesh.centroid.copy()
+        origin0[2] = float(a0)
+
+        origin1 = mesh.centroid.copy()
+        origin1[2] = float(a1)
+
+        # keep z >= a0
+        m1 = trimesh.intersections.slice_mesh_plane(
+            mesh,
+            plane_normal=n_pos,
+            plane_origin=origin0,
+            cap=False
+        )
+        if m1 is None or len(m1.faces) == 0:
+            continue
+
+        # keep z <= a1
+        m2 = trimesh.intersections.slice_mesh_plane(
+            m1,
+            plane_normal=n_neg,
+            plane_origin=origin1,
+            cap=False
+        )
+        if m2 is None or len(m2.faces) == 0:
+            continue
+
+        slabs.append(m2)
+
+    return slabs
+
+
 # Input
 input_mesh = trimesh.load(INPUT_STL)
 contact_point = find_bottom_contact_point(input_mesh)
@@ -965,43 +1031,52 @@ repaired_mesh = trimesh.Trimesh(
 )
 repaired_mesh.export(f"{OUTPUT_DIR}/repaired_mesh.stl")
 
+# Slice
+slabs = slice_mesh_into_z_slabs_by_height(
+    repaired_mesh,
+    layer_height=LAYER_HEIGHT
+)
+
+for i, slab in enumerate(slabs):
+    slab.export(f"{OUTPUT_DIR}/slices/slice_{i:03d}.stl")
+
 # world_mesh = transform_mesh_from_cylindrical_like_old(cylinder_mesh, cx, cz, R0, theta0)
 # world_mesh.export(f"{OUTPUT_DIR}/world_mesh.stl")
 
-# Tetrahedralize
-tetgen_mesh = tetgen.TetGen(repaired_mesh.vertices, repaired_mesh.faces)
-tetgen_mesh.tetrahedralize(
-    order=1,        # linear tets (C3D4)
-    quality=True,  # DO NOT enforce radius-edge ratio
-    # mindihedral=0,  # disable angle constraints
-    steinerleft=-1,  # allow NO Steiner points
-    verbose=1
-)
+# # Tetrahedralize
+# tetgen_mesh = tetgen.TetGen(repaired_mesh.vertices, repaired_mesh.faces)
+# tetgen_mesh.tetrahedralize(
+#     order=1,        # linear tets (C3D4)
+#     quality=True,  # DO NOT enforce radius-edge ratio
+#     # mindihedral=0,  # disable angle constraints
+#     steinerleft=-1,  # allow NO Steiner points
+#     verbose=1
+# )
 
-write_calculix_job_tet_layer_binned(
-    path=f"{SIMULATION}.inp",
-    tg_or_grid=tetgen_mesh,
-    layer_height=LAYER_HEIGHT,
-    cyl_radius=CYLINDER_RADIUS,
-    shrinkage_curve=SHRINKAGE_CURVE,
-    cure_shrink_per_unit=SHRINKAGE,
-)
+# write_calculix_job_tet_layer_binned(
+#     path=f"{SIMULATION}.inp",
+#     tg_or_grid=tetgen_mesh,
+#     layer_height=LAYER_HEIGHT,
+#     cyl_radius=CYLINDER_RADIUS,
+#     shrinkage_curve=SHRINKAGE_CURVE,
+#     cure_shrink_per_unit=SHRINKAGE,
+# )
 
-run_calculix(
-    SIMULATION,
-    "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe"
-)
+# run_calculix(
+#     SIMULATION,
+#     "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe"
+# )
 
-vtk_grid = vtk_grid_from_tetgen(tetgen_mesh)
-displacements = read_ccx_frd_displacements(f"{SIMULATION}.frd")
+# vtk_grid = vtk_grid_from_tetgen(tetgen_mesh)
+# displacements = read_ccx_frd_displacements(f"{SIMULATION}.frd")
 
-export_tet_displacement_debug(
-    vtk_grid,
-    displacements,
-    out_prefix="DEBUG/tet",
-    scale=1.0,
-    stride=1,
-)
+# export_tet_displacement_debug(
+#     vtk_grid,
+#     displacements,
+#     out_prefix="DEBUG/tet",
+#     scale=1.0,
+#     stride=1,
+# )
 
 # deform_stl_by_tet_field(
 #     INPUT_STL,
