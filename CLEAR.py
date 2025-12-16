@@ -12,6 +12,25 @@ import tetgen
 import trimesh
 import vtk
 import pymeshlab as ml
+import triangle as tr
+
+import numpy as np
+
+# scipy
+from scipy.spatial import cKDTree
+
+# trimesh core
+import trimesh
+from trimesh.base import Trimesh
+
+# trimesh helpers used internally
+from trimesh.intersections import slice_faces_plane
+from trimesh.creation import triangulate_polygon
+from trimesh.path import polygons
+from trimesh.visual import TextureVisuals
+
+# trimesh math / utils
+from trimesh import grouping, geometry, util, transformations as tf
 
 
 WATERTIGHT_RESOLUTION = 50_000
@@ -912,6 +931,154 @@ def deform_stl_by_tet_field(
     print(f"[DEFORM] wrote: {stl_out}")
 
 
+def slice_mesh_plane(
+    mesh,
+    plane_normal,
+    plane_origin,
+    face_index=None,
+    cap=False,
+    engine=None,
+    triangle_args=None,
+    **kwargs,
+):
+    """
+    Slice a mesh with a plane returning a new mesh that is the
+    portion of the original mesh to the positive normal side
+    of the plane.
+
+    Parameters
+    ---------
+    mesh : Trimesh object
+      Source mesh to slice
+    plane_normal : (3,) float
+      Normal vector of plane to intersect with mesh
+    plane_origin :  (3,) float
+      Point on plane to intersect with mesh
+    cap : bool
+      If True, cap the result with a triangulated polygon
+    face_index : ((m,) int)
+      Indexes of mesh.faces to slice. When no mask is provided, the
+      default is to slice all faces.
+    cached_dots : (n, 3) float
+      If an external function has stored dot
+      products pass them here to avoid recomputing
+    engine : None or str
+      Triangulation engine passed to `triangulate_polygon`
+    kwargs : dict
+      Passed to the newly created sliced mesh
+
+    Returns
+    ----------
+    new_mesh : Trimesh object
+      Sliced mesh
+    """
+    # check input for none
+    if mesh is None:
+        return None
+
+    # avoid circular import
+    from scipy.spatial import cKDTree
+
+    # check input plane
+    plane_normal = np.asanyarray(plane_normal, dtype=np.float64)
+    plane_origin = np.asanyarray(plane_origin, dtype=np.float64)
+
+    # check to make sure origins and normals have acceptable shape
+    shape_ok = (
+        (plane_origin.shape == (3,) or util.is_shape(plane_origin, (-1, 3)))
+        and (plane_normal.shape == (3,) or util.is_shape(plane_normal, (-1, 3)))
+        and plane_origin.shape == plane_normal.shape
+    )
+    if not shape_ok:
+        raise ValueError("plane origins and normals must be (n, 3)!")
+
+    # start with copy of original mesh, faces, and vertices
+    vertices = mesh.vertices.copy()
+    faces = mesh.faces.copy()
+
+    # We copy the UV coordinates if available
+    has_uv = (
+        hasattr(mesh.visual, "uv") and np.shape(mesh.visual.uv) == (len(mesh.vertices), 2)
+    ) and not cap
+    uv = mesh.visual.uv.copy() if has_uv else None
+
+    if "process" not in kwargs:
+        kwargs["process"] = False
+
+    # slice away specified planes
+    for origin, normal in zip(
+        plane_origin.reshape((-1, 3)), plane_normal.reshape((-1, 3))
+    ):
+        # save the new vertices and faces
+        vertices, faces, uv = slice_faces_plane(
+            vertices=vertices,
+            faces=faces,
+            uv=uv,
+            plane_normal=normal,
+            plane_origin=origin,
+            face_index=face_index,
+        )
+        # check if cap arg specified
+        if cap:
+            if face_index:
+                # This hasn't been implemented yet.
+                raise NotImplementedError("face_index and cap can't be used together")
+
+            # start by deduplicating vertices again
+            unique, inverse = grouping.unique_rows(vertices)
+            vertices = vertices[unique]
+            # will collect additional faces
+            f = inverse[faces]
+            # remove degenerate faces by checking to make sure
+            # that each face has three unique indices
+            f = f[(f[:, :1] != f[:, 1:]).all(axis=1)]
+            # transform to the cap plane
+            to_2D = geometry.plane_transform(origin=origin, normal=-normal)
+            to_3D = np.linalg.inv(to_2D)
+
+            vertices_2D = tf.transform_points(vertices, to_2D)
+            edges = geometry.faces_to_edges(f)
+            edges.sort(axis=1)
+
+            on_plane = np.abs(vertices_2D[:, 2]) < 1e-8
+            edges = edges[on_plane[edges].all(axis=1)]
+            edges = edges[edges[:, 0] != edges[:, 1]]
+
+            unique_edge = grouping.group_rows(edges, require_count=1)
+            if len(unique) < 3:
+                continue
+
+            # collect new faces
+            faces = [f]
+            for p in polygons.edges_to_polygons(edges[unique_edge], vertices_2D[:, :2]):
+                # triangulate cap and raise an error if any new vertices were inserted
+                vn, fn = triangulate_polygon(p, engine=engine, triangle_args=triangle_args)
+                # collect the original index for the new vertices
+                vn3 = tf.transform_points(util.stack_3D(vn), to_3D)
+
+                # Append new vertices to mesh (ALL vn3 returned, including boundary).
+                base = len(vertices)
+                vertices = np.vstack([vertices, vn3])
+
+                if uv is not None:
+                    # Cap vertices have no meaningful UV; fill zeros (or change as needed)
+                    uv = np.vstack([uv, np.zeros((len(vn3), 2), dtype=uv.dtype)])
+
+                nf = fn + base
+
+                nf_ok = (nf[:, 1:] != nf[:, :1]).all(axis=1) & (nf[:, 1] != nf[:, 2])
+                faces.append(nf[nf_ok])
+
+            faces = np.vstack(faces)
+
+    visual = (
+        TextureVisuals(uv=uv, material=mesh.visual.material.copy()) if has_uv else None
+    )
+
+    # return the sliced mesh
+    return Trimesh(vertices=vertices, faces=faces, visual=visual, **kwargs)
+
+
 def slice_mesh_into_z_slabs_by_height(
     mesh: trimesh.Trimesh,
     layer_height: float,
@@ -953,21 +1120,23 @@ def slice_mesh_into_z_slabs_by_height(
         origin1[2] = float(a1)
 
         # keep z >= a0
-        m1 = trimesh.intersections.slice_mesh_plane(
+        m1 = slice_mesh_plane(
             mesh,
             plane_normal=n_pos,
             plane_origin=origin0,
-            cap=False
+            cap=True,
+            engine="triangle",
+            triangle_args="pq15",
         )
         if m1 is None or len(m1.faces) == 0:
             continue
 
         # keep z <= a1
-        m2 = trimesh.intersections.slice_mesh_plane(
+        m2 = slice_mesh_plane(
             m1,
             plane_normal=n_neg,
             plane_origin=origin1,
-            cap=False
+            cap=False,
         )
         if m2 is None or len(m2.faces) == 0:
             continue
