@@ -31,7 +31,7 @@ from trimesh.intersections import slice_faces_plane
 WATERTIGHT_RESOLUTION = 50_000
 DECIMATE_NUM_FACES = 50_000
 CYLINDER_RADIUS = 199.82
-LAYER_HEIGHT = 0.5
+LAYER_HEIGHT = 2 # 1.1
 SHRINKAGE = 0.2
 SHRINKAGE_CURVE = [5,4,3,2,1]
 INPUT_STL = "MODELS/CSC16_U00P_.stl"
@@ -922,6 +922,132 @@ def deform_stl_by_tet_field(
     print(f"[DEFORM] wrote: {stl_out}")
 
 
+def add_verts_faces_dedup(
+    mesh: trimesh.Trimesh,
+    new_verts: np.ndarray[np.float64],
+    new_faces: np.ndarray[np.int64],
+    *,
+    tol: float = 1e-8,
+    rebuild: bool = True,
+) -> trimesh.Trimesh:
+    """
+    Add (new_verts, new_faces) into an existing mesh, reusing vertices already
+    present in mesh (within `tol`) and remapping faces accordingly.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Existing mesh.
+    new_verts : (M,3) float64
+        Vertices to add.
+    new_faces : (K,3) int64
+        Faces referencing indices in new_verts.
+    tol : float
+        Quantization tolerance for vertex matching (world units).
+    rebuild : bool
+        If True, runs process/re-zero checks on the returned mesh.
+
+    Returns
+    -------
+    out : trimesh.Trimesh
+        New mesh with faces added and vertices reused when possible.
+    """
+    if new_verts.size == 0 or new_faces.size == 0:
+        return mesh.copy()
+
+    v_old = np.asarray(mesh.vertices, dtype=np.float64)
+    f_old = np.asarray(mesh.faces, dtype=np.int64)
+
+    new_verts = np.asarray(new_verts, dtype=np.float64)
+    new_faces = np.asarray(new_faces, dtype=np.int64)
+
+    if new_verts.ndim != 2 or new_verts.shape[1] != 3:
+        raise ValueError("new_verts must be (M,3)")
+    if new_faces.ndim != 2 or new_faces.shape[1] != 3:
+        raise ValueError("new_faces must be (K,3)")
+    if new_faces.min() < 0 or new_faces.max() >= len(new_verts):
+        raise ValueError("new_faces indices out of range for new_verts")
+
+    # --- quantize to an integer grid so we can match by exact keys ---
+    inv = 1.0 / float(tol)
+
+    def qkey(v: np.ndarray[np.float64]) -> np.ndarray[np.int64]:
+        # round to nearest multiple of tol
+        return np.round(v * inv).astype(np.int64)
+
+    q_old = qkey(v_old)
+    q_new = qkey(new_verts)
+
+    # map quantized coordinate -> index in old mesh
+    # note: if old mesh already has duplicates within tol, we keep the first one
+    old_map: dict[tuple[int, int, int], int] = {}
+    for i, k in enumerate(map(tuple, q_old)):
+        old_map.setdefault(k, i)
+
+    # build remap: new vertex idx -> final vertex idx (old reused or appended)
+    remap = np.empty(len(new_verts), dtype=np.int64)
+
+    appended = []          # list of actual vertices to append
+    appended_keys = []     # quantized keys for the ones we append
+    appended_map: dict[tuple[int, int, int], int] = {}  # key -> appended local idx
+
+    base = len(v_old)
+
+    for i, k in enumerate(map(tuple, q_new)):
+        if k in old_map:
+            remap[i] = old_map[k]
+            continue
+
+        # if multiple new verts collapse to same key, reuse within the new batch too
+        if k in appended_map:
+            remap[i] = base + appended_map[k]
+            continue
+
+        appended_map[k] = len(appended)
+        remap[i] = base + len(appended)
+        appended.append(new_verts[i])
+        appended_keys.append(k)
+
+    if len(appended) == 0:
+        v_out = v_old
+    else:
+        v_out = np.vstack([v_old, np.asarray(appended, dtype=np.float64)])
+
+        # also extend old_map so future calls could reuse these (optional, but nice)
+        for local_idx, k in enumerate(appended_keys):
+            old_map[k] = base + local_idx
+
+    f_new_remapped = remap[new_faces]
+    f_out = np.vstack([f_old, f_new_remapped])
+
+    out = trimesh.Trimesh(vertices=v_out, faces=f_out, process=rebuild)
+    return out
+
+
+def weld_vertices_and_remap_faces(verts: np.ndarray, faces: np.ndarray, tol: float = 1e-8):
+    """
+    Deduplicate vertices within tol and remap faces to the new vertex indices.
+    Returns (verts_welded, faces_remapped).
+    """
+    verts = np.asarray(verts, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+
+    inv = 1.0 / float(tol)
+    keys = np.round(verts * inv).astype(np.int64)
+
+    # unique keys -> new vertex list
+    uniq_keys, uniq_idx, inv_map = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+
+    verts_welded = verts[uniq_idx]
+    faces_remapped = inv_map[faces]
+
+    # validate
+    if faces_remapped.min() < 0 or faces_remapped.max() >= len(verts_welded):
+        raise ValueError("Remap failed: faces out of range after welding")
+
+    return verts_welded, faces_remapped
+
+
 def slice_mesh_plane(
     mesh,
     plane_normal,
@@ -996,9 +1122,6 @@ def slice_mesh_plane(
     if "process" not in kwargs:
         kwargs["process"] = False
 
-    # NEW: collect caps (one per plane)
-    caps_out = []
-
     # slice away specified planes
     for origin, normal in zip(
         plane_origin.reshape((-1, 3)), plane_normal.reshape((-1, 3))
@@ -1042,55 +1165,47 @@ def slice_mesh_plane(
             if len(unique) < 3:
                 continue
 
-            # NEW: per-plane cap accumulation
-            cap_vertices = []
-            cap_faces = []
-            faces_accum = [f]
+            tree = cKDTree(vertices)
+            # collect new faces
+            faces = [f]
+            tol = 1e-8
+
             for p in polygons.edges_to_polygons(edges[unique_edge], vertices_2D[:, :2]):
-                # triangulate cap and raise an error if any new vertices were inserted
-                vn, fn = triangulate_polygon(p, engine=engine, triangle_args=triangle_args)
-                # collect the original index for the new vertices
+
+                # triangulate cap polygon (vn can include inserted vertices)
+                vn, fn = triangulate_polygon(p, engine=engine, force_vertices=False, triangle_args=triangle_args)
+
+                # vn is 2D -> lift to 3D cap plane, then to world 3D
                 vn3 = tf.transform_points(util.stack_3D(vn), to_3D)
 
-                # Append new vertices to mesh (ALL vn3 returned, including boundary).
-                base_mesh = len(vertices)
-                vertices = np.vstack([vertices, vn3])
+                # For each triangulation vertex: reuse existing vertex if close, else append
+                distance, vid = tree.query(vn3)  # vid are indices into current `vertices`
 
-                if uv is not None:
-                    # Cap vertices have no meaningful UV; fill zeros (or change as needed)
-                    uv = np.vstack([uv, np.zeros((len(vn3), 2), dtype=uv.dtype)])
+                # global indices for all vn vertices
+                vmap = vid.copy()
 
-                nf = fn + base_mesh
+                new_mask = distance > tol
+                if np.any(new_mask):
+                    # append new vertices
+                    start = len(vertices)
+                    vertices = np.vstack([vertices, vn3[new_mask]])
 
+                    # assign their new global indices
+                    vmap[new_mask] = np.arange(start, start + int(new_mask.sum()), dtype=np.int64)
+
+                    # rebuild tree so future polygons can reuse these appended vertices
+                    tree = cKDTree(vertices)
+
+                # remap triangulation faces to global vertex indices
+                nf = vmap[fn]
+
+                # remove degenerate faces (still can happen)
                 nf_ok = (nf[:, 1:] != nf[:, :1]).all(axis=1) & (nf[:, 1] != nf[:, 2])
-                faces_accum.append(nf[nf_ok])
+                faces.append(nf[nf_ok])
 
-                # NEW: append to cap mesh (reindexed within cap)
-                base_cap = sum(len(v) for v in cap_vertices)
-                cap_vertices.append(vn3)
-                cap_faces.append(fn + base_cap)
+            faces = np.vstack(faces)
 
-            faces = np.vstack(faces_accum)
-
-            if len(cap_vertices) == 0:
-                caps_out.append(None)
-            else:
-                cv = np.vstack(cap_vertices)
-                cf = np.vstack(cap_faces)
-                # keep normals consistent with your cap orientation
-                caps_out.append(Trimesh(vertices=cv, faces=cf, process=False))
-
-    visual = (
-        TextureVisuals(uv=uv, material=mesh.visual.material.copy()) if has_uv else None
-    )
-
-    sliced = Trimesh(vertices=vertices, faces=faces, visual=visual, **kwargs)
-
-    # if user provided a single plane, return a single cap mesh instead of a list
-    single = (plane_origin.shape == (3,))
-    if single:
-        return sliced, (caps_out[0] if len(caps_out) else None)
-    return sliced, caps_out
+    return Trimesh(vertices=vertices, faces=faces, **kwargs)
 
 
 def _orient_cap(cap: trimesh.Trimesh | None, desired_normal: np.ndarray) -> trimesh.Trimesh | None:
@@ -1163,14 +1278,14 @@ def slice_mesh_into_z_slabs_by_height(
 
         # 1) Keep z >= a0, and generate the cap at z=a0 (this is the BOTTOM cap of current slab)
         if i > 0:
-            m1, bottom_cap = slice_mesh_plane(
+            m1 = slice_mesh_plane(
                 mesh,
                 plane_normal=n_pos,
                 plane_origin=origin0,
                 cap=True,
                 return_cap=True,
                 engine="triangle",
-                # triangle_args="pq15",
+                triangle_args="pYq",
             )
             # m1 = trimesh.intersections.slice_mesh_plane(
             #     mesh,
@@ -1191,22 +1306,28 @@ def slice_mesh_into_z_slabs_by_height(
         if (is_last):
             m2 = m1
         else:
-            m2, _ = slice_mesh_plane(
+            m2 = slice_mesh_plane(
                 m1,
                 plane_normal=n_neg,
                 plane_origin=origin1,
-                cap=False,
+                cap=True,
                 return_cap=True,
+                engine="triangle",
+                triangle_args="pYq",
             )
             # m2 = trimesh.intersections.slice_mesh_plane(
             #     m1,
             #     plane_normal=n_neg,
             #     plane_origin=origin1,
-            #     cap=False,
+            #     cap=True,
+            #     engine="triangle",
             # )
 
         if m2 is None or len(m2.faces) == 0:
             continue
+
+        slabs.append(m2)
+        continue
 
         # ---- Reuse logic ----
         # The bottom cap of *current* slab at a0 is the TOP cap of the *previous* slab.
@@ -1216,6 +1337,7 @@ def slice_mesh_into_z_slabs_by_height(
             cap_for_prev_top.export(f"DEBUG/cap_{i}.stl")
             prev_closed = _add_cap(prev_slab, cap_for_prev_top)
             prev_closed.merge_vertices()
+            prev_closed.remove_degenerate_faces()
             slabs.append(prev_closed)
 
         # Current slab: add its bottom cap now (normals should point DOWN)
@@ -1225,6 +1347,7 @@ def slice_mesh_into_z_slabs_by_height(
         if is_last:
             prev_slab = None
             m1.merge_vertices()
+            m1.remove_degenerate_faces()
             slabs.append(m1)
         else:
             # hold it until next iteration gives us the reused top cap
@@ -1383,6 +1506,83 @@ def write_tetgen_wireframe_ply(
             f.write(f"{i0} {i1}\n")
 
 
+import numpy as np
+from typing import Iterable, Tuple, Dict
+
+def merge_tetgen_grids(
+    slab_tetgens: Iterable,
+    eps: float = 1e-7,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Merge many TetGen objects (where mesh is in tg.grid.points and tg.grid.cells)
+    into one global (points, cells) with NO duplicate vertices on shared interfaces.
+
+    Parameters
+    ----------
+    slab_tetgens : iterable of tetgen.TetGen objects
+        Each must have:
+          - tg.grid.points : (Ni,3) float
+          - tg.grid.cells  : (Mi,)  int, flat PyVista cell array:
+                [4, i0, i1, i2, i3, 4, i0, i1, i2, i3, ...]
+    eps : float
+        Vertex dedup tolerance. Vertices whose coordinates match within eps (via
+        quantization) are treated as identical and merged.
+
+    Returns
+    -------
+    merged_points : (N,3) float64
+    merged_cells  : (M,)  int64
+        Flat PyVista cell array of tetrahedra.
+    """
+    # global storage
+    key_to_gid: Dict[tuple, int] = {}
+    global_pts = []          # list of (3,) float
+    global_cells = []        # list of ints, flat [4, a,b,c,d, 4, ...]
+    gid_counter = 0
+
+    def key_of(p: np.ndarray) -> tuple:
+        # quantize to a grid of size eps to be robust to float noise
+        return (int(np.round(p[0] / eps)),
+                int(np.round(p[1] / eps)),
+                int(np.round(p[2] / eps)))
+
+    for tg in slab_tetgens:
+        pts = np.asarray(tg.grid.points, dtype=np.float64)
+        cells = np.asarray(tg.grid.cells, dtype=np.int64)
+
+        if pts.ndim != 2 or pts.shape[1] != 3:
+            raise ValueError("tg.grid.points must be (N,3)")
+        if cells.ndim != 1:
+            raise ValueError("tg.grid.cells must be a flat array")
+
+        # local->global vertex map
+        l2g = np.empty(len(pts), dtype=np.int64)
+        for li, p in enumerate(pts):
+            k = key_of(p)
+            gi = key_to_gid.get(k)
+            if gi is None:
+                gi = gid_counter
+                gid_counter += 1
+                key_to_gid[k] = gi
+                global_pts.append(p)
+            l2g[li] = gi
+
+        # remap cells (PyVista flat cell array)
+        i = 0
+        n = len(cells)
+        while i < n:
+            if cells[i] != 4:
+                raise ValueError(f"Expected tet (4), got {cells[i]} at index {i}")
+            a, b, c, d = cells[i + 1 : i + 5]
+            ga, gb, gc, gd = l2g[a], l2g[b], l2g[c], l2g[d]
+            global_cells.extend([4, int(ga), int(gb), int(gc), int(gd)])
+            i += 5
+
+    merged_points = np.asarray(global_pts, dtype=np.float64)
+    merged_cells = np.asarray(global_cells, dtype=np.int64)
+    return merged_points, merged_cells
+
+
 # Input
 input_mesh = trimesh.load(INPUT_STL)
 contact_point = find_bottom_contact_point(input_mesh)
@@ -1443,91 +1643,95 @@ slabs = slice_mesh_into_z_slabs_by_height(
     layer_height=LAYER_HEIGHT
 )
 
+tet_meshes = []
+
 for i, slab in enumerate(slabs):
     slab.export(f"{OUTPUT_DIR}/slices/slice_{i:03d}.stl")
 
-    # repaired_mesh = pfix.MeshFix(
-    #     slab.vertices,
-    #     slab.faces
-    # )
-    # repaired_mesh.repair()
+    slab = transform_mesh_from_cylindrical_like_old(
+        slab,
+        cx, cz, R0, theta0
+    )
+    slab.export(f"{OUTPUT_DIR}/slices/slice_world_{i:03d}.stl")
 
-    # slab = trimesh.Trimesh(
-    #     vertices=repaired_mesh.v,
-    #     faces=repaired_mesh.f,
-    #     process=False
-    # )
-    # slab.export(f"{OUTPUT_DIR}/slices/slice_repair_{i:03d}.stl")
-
-# world_mesh = transform_mesh_from_cylindrical_like_old(
-#     repaired_mesh,
-#     cx, cz, R0, theta0
-# )
-# world_mesh.export(f"{OUTPUT_DIR}/world_mesh.stl")
-
-    # Tetrahedralize (skip cilindrification if need to see deformed result)
     tetgen_mesh = tetgen.TetGen(slab.vertices, slab.faces)
     tetgen_mesh.tetrahedralize(
-        # switches="pq1.1a0.5"
         quality=False,
-        nobisect=True,
-        # minratio=1.1,
-        # order=1,        # linear tets (C3D4)
-        # quality=True,  # DO NOT enforce radius-edge ratio
-        # mindihedral=0,  # disable angle constraints
-        # steinerleft=-1,  # allow NO Steiner points
+        nobisect=False,
         verbose=1
     )
+
+
     tetgen_points = tetgen_mesh.grid.points
     tetgen_cells = tetgen_mesh.grid.cells
 
-    grid_cyl = tetgen_mesh.grid               # pyvista.UnstructuredGrid in (u,v,w)
-    grid_world = transform_tetgen_grid_from_cylindrical_like_old(
-        grid_cyl, cx, cz, R0, theta0
-    )
+    # grid_cyl = tetgen_mesh.grid               # pyvista.UnstructuredGrid in (u,v,w)
+    # grid_world = transform_tetgen_grid_from_cylindrical_like_old(
+    #     grid_cyl, cx, cz, R0, theta0
+    # )
 
-    # If you still want arrays:
-    tetgen_points_world = grid_world.points
-    tetgen_cells = grid_world.cells
-    tetgen_celltypes = grid_world.celltypes
+    # # If you still want arrays:
+    # tetgen_points_world = grid_world.points
+    # tetgen_cells = grid_world.cells
+    # tetgen_celltypes = grid_world.celltypes
 
     write_tetgen_wireframe_ply(
         f"{OUTPUT_DIR}/slices/slice_tet_{i:03d}.ply",
-        tetgen_points_world,
+        tetgen_points,
         tetgen_cells,
     )
 
-# write_calculix_job_tet_layer_binned(
-#     path=f"{SIMULATION}.inp",
-#     grid_points=tetgen_points_world,
-#     grid_cells=tetgen_cells,
-#     layer_height=LAYER_HEIGHT,
-#     cyl_radius=CYLINDER_RADIUS,
-#     shrinkage_curve=SHRINKAGE_CURVE,
-#     cure_shrink_per_unit=SHRINKAGE,
-# )
+    tet_meshes.append(tetgen_mesh)
 
-# run_calculix(
-#     SIMULATION,
-#     "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe"
-# )
+mega_points, mega_cells = merge_tetgen_grids(tet_meshes)
 
-# vtk_grid = vtk_grid_from_tetgen(tetgen_points_world, tetgen_cells)
-# displacements = read_ccx_frd_displacements(f"{SIMULATION}.frd")
+write_tetgen_wireframe_ply(
+    f"{OUTPUT_DIR}/slices/MEGA.ply",
+    mega_points,
+    mega_cells,
+)
 
-# export_tet_displacement_debug(
-#     vtk_grid,
-#     displacements,
-#     out_prefix="DEBUG/tet",
-#     scale=1.0,
-#     stride=1,
-# )
+pts_world = transform_points_from_cylindrical_like_old(
+    mega_points, cx, cz, R0, theta0
+)
 
-# deform_stl_by_tet_field(
-#     INPUT_STL,
-#     f"{OUTPUT_DIR}/deformed_stl.stl",
-#     vtk_grid,
-#     displacements,
-#     scale=1.0,
-#     outside_mode="keep"
-# )
+write_tetgen_wireframe_ply(
+    f"{OUTPUT_DIR}/slices/MEGA_tran.ply",
+    pts_world,
+    mega_cells,
+)
+
+write_calculix_job_tet_layer_binned(
+    path=f"{SIMULATION}.inp",
+    grid_points=mega_points,
+    grid_cells=mega_cells,
+    layer_height=LAYER_HEIGHT,
+    cyl_radius=CYLINDER_RADIUS,
+    shrinkage_curve=SHRINKAGE_CURVE,
+    cure_shrink_per_unit=SHRINKAGE,
+)
+
+run_calculix(
+    SIMULATION,
+    "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe"
+)
+
+vtk_grid = vtk_grid_from_tetgen(mega_points, tetgen_cells)
+displacements = read_ccx_frd_displacements(f"{SIMULATION}.frd")
+
+export_tet_displacement_debug(
+    vtk_grid,
+    displacements,
+    out_prefix="DEBUG/tet",
+    scale=1.0,
+    stride=1,
+)
+
+deform_stl_by_tet_field(
+    INPUT_STL,
+    f"{OUTPUT_DIR}/deformed_stl.stl",
+    vtk_grid,
+    displacements,
+    scale=1.0,
+    outside_mode="keep"
+)

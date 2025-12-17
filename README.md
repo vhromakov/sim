@@ -26,4 +26,7 @@ python -m ccx2paraview donut_job.frd vtu
 
 # View input file
 C:/Users/4y5t6/Downloads/CalculiX-2.23.0-win-x64/bin/cgx.exe -c donut_job.inp
+
+# Last best script
+python CLEAR-slicing-connect-tet-slices-simulate.py
 ```
