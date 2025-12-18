@@ -27,12 +27,14 @@ from trimesh import transformations as tf
 from trimesh.creation import triangulate_polygon
 from trimesh.intersections import slice_faces_plane
 
+from shapely.geometry.polygon import orient
+
 
 WATERTIGHT_RESOLUTION = 50_000
 DECIMATE_NUM_FACES = 50_000
 CYLINDER_RADIUS = 199.82
-LAYER_HEIGHT = 2 # 1.1
-SHRINKAGE = 0.2
+LAYER_HEIGHT = 1.1 # 1.1
+SHRINKAGE = 0.1
 SHRINKAGE_CURVE = [5,4,3,2,1]
 INPUT_STL = "MODELS/CSC16_U00P_.stl"
 OUTPUT_DIR = "OUTPUT"
@@ -235,40 +237,94 @@ def compute_cylinder_center_from_bottom_z(pts: np.ndarray, radius: float):
     return cx, cz, theta0
 
 
-def write_calculix_job_tet_layer_binned(
+import numpy as np
+import math
+from typing import List
+
+def compute_base_nodes_on_cylinder_surface(
+    pts_world: np.ndarray,
+    layer0_nids_1based: List[int],
+    cx: float,
+    cz: float,
+    R0: float,
+    tol_w: float = 1e-4,
+) -> List[int]:
+    """
+    Base nodes = nodes (from layer0) that lie on cylinder surface (w ~= 0),
+    where w = R0 - r and r = sqrt((x-cx)^2 + (z-cz)^2).
+
+    pts_world: (N,3) world coords for MERGED mesh nodes, 0-based indexing.
+    layer0_nids_1based: CCX node ids (1-based) for layer 0 node set.
+    """
+    pts_world = np.asarray(pts_world, dtype=np.float64)
+    if pts_world.ndim != 2 or pts_world.shape[1] != 3:
+        raise ValueError("pts_world must be (N,3)")
+    if R0 <= 0:
+        raise ValueError("R0 must be > 0")
+
+    base = []
+    for nid1 in layer0_nids_1based:
+        pid0 = int(nid1) - 1
+        x, y, z = pts_world[pid0]
+        r = math.sqrt((x - cx) ** 2 + (z - cz) ** 2)
+        w = float(R0) - r
+        if w <= tol_w:
+            base.append(int(nid1))
+
+    base = sorted(set(base))
+    return base
+
+
+from typing import Any, List, Dict, Optional
+import numpy as np
+import math
+
+def write_calculix_job_tet_layers(
     path: str,
-    grid_points: Any,
-    grid_cells: Any,
-    layer_height: float,     # radial thickness
-    cyl_radius: float,       # cylinder radius
+    merged_points: Any,
+    merged_cells: Any,
+    layer_to_eids: Dict[int, List[int]],
+    layer_to_nids: Dict[int, List[int]],
     shrinkage_curve: List[float],
     cure_shrink_per_unit: float,
     output_stride: int = 1,
+    *,
+    cx: float,
+    cz: float,
+    R0: float,
+    base_tol_w: float = 1e-8,
 ):
     """
-    C3D4 layered curing job using simple height binning after tet meshing.
+    C3D4 layered curing job using PREDEFINED layer sets.
 
-    - Creates layers by grouping elements based on tet centroid Y coordinate.
-    - Bottom layer is fixed (Ux,Uy,Uz = 0) via SLICE_000_NODES.
-    - Applies shrinkage curve by ramping "cure" via TEMP (DOF 11) per layer NSET.
-    - Uses MODEL CHANGE to add layers over time, like your previous implementation.
+    - Whole mesh is written once (nodes+elements).
+    - Each layer is an ELSET (and NSET) provided by caller (in merged numbering).
+    - Layers are connected because they share merged nodes.
+    - Uses MODEL CHANGE to add layers sequentially.
+    - Uses TEMP (DOF 11) ramp per layer nodes to drive *EXPANSION shrinkage.
+
+    Assumes:
+      - layer indices are 0..L-1 in print order (bottom->top or your order)
+      - base (fixed) is layer 0 nodes
     """
-
-    def log(msg: str) -> None:
-        print(msg)
 
     def _fmt(val: float) -> str:
         return f"{float(val):.12e}"
 
-    if layer_height <= 0:
-        raise ValueError("layer_height must be > 0")
+    def _write_id_list_lines(fh, ids: List[int], per_line: int = 16):
+        for k in range(0, len(ids), per_line):
+            chunk = ids[k:k + per_line]
+            fh.write(", ".join(str(x) for x in chunk) + "\n")
 
-    pts = np.asarray(grid_points, dtype=float)  # (N,3)
+    pts = np.asarray(merged_points, dtype=float)
     n_nodes = int(pts.shape[0])
+    if n_nodes == 0:
+        raise ValueError("No nodes")
 
-    # ---- parse tets from pyvista cell buffer [4,a,b,c,d, 4,a,b,c,d, ...] ----
-    cells = np.asarray(grid_cells, dtype=np.int64)
-    tets0 = []  # 0-based connectivity
+    cells = np.asarray(merged_cells, dtype=np.int64)
+
+    # parse tets from flat PyVista cell array
+    tets0 = []
     i = 0
     while i < len(cells):
         n = int(cells[i])
@@ -282,7 +338,7 @@ def write_calculix_job_tet_layer_binned(
     if n_elems == 0:
         raise ValueError("No tetrahedra found.")
 
-    # ---- normalize shrinkage curve ----
+    # normalize shrinkage curve to sum=1
     if not shrinkage_curve:
         shrinkage_curve = [1.0]
     total_w = float(sum(shrinkage_curve))
@@ -294,68 +350,34 @@ def write_calculix_job_tet_layer_binned(
     if output_stride < 1:
         output_stride = 1
 
-    # ---- CYLINDRICAL RADIAL slicing (axis = Y) ----
-    if layer_height <= 0:
-        raise ValueError("layer_height must be > 0")
+    # layer order (print order)
+    layer_idxs = sorted(layer_to_eids.keys())
+    if not layer_idxs:
+        raise ValueError("layer_to_eids is empty")
 
-    # find cylinder center from bottom-most Z
-    i0 = int(np.argmin(pts[:, 2]))   # min Z
-    x0 = float(pts[i0, 0])
-    z0 = float(pts[i0, 2])
+    # BASE = layer 0 (or first in your order)
+    base_layer = layer_idxs[0]
+    layer0_nodes = layer_to_nids.get(base_layer, [])
+    if not layer0_nodes:
+        raise ValueError("Layer 0 node set is empty")
 
-    cx = x0
-    cz = z0 + float(cyl_radius)
-
-    slice_to_eids: Dict[int, List[int]] = {}
-    slice_node_ids: Dict[int, Set[int]] = {}
-
-    for eid1, (a, b, c, d) in enumerate(tets0, start=1):
-        # centroid in XZ plane
-        xc = (pts[a, 0] + pts[b, 0] + pts[c, 0] + pts[d, 0]) * 0.25
-        zc = (pts[a, 2] + pts[b, 2] + pts[c, 2] + pts[d, 2]) * 0.25
-
-        r = math.sqrt((xc - cx)**2 + (zc - cz)**2)
-
-        # radial penetration from cylinder surface inward
-        depth = cyl_radius - r
-
-        # ignore elements outside cylinder (numerical safety)
-        if depth < 0:
-            depth = 0.0
-
-        sidx = int(math.floor(depth / layer_height))
-        if sidx < 0:
-            sidx = 0
-
-        slice_to_eids.setdefault(sidx, []).append(eid1)
-        ns = slice_node_ids.setdefault(sidx, set())
-        ns.update([a + 1, b + 1, c + 1, d + 1])
-
-    print(
-        f"[CYL-RADIAL] cx={cx:.6f}, cz={cz:.6f}, "
-        f"R={cyl_radius:.6f}, layers={len(slice_to_eids)}"
+    base_nodes = compute_base_nodes_on_cylinder_surface(
+        pts_world=pts,
+        layer0_nids_1based=layer0_nodes,
+        cx=cx, cz=cz, R0=R0,
+        tol_w=base_tol_w,
     )
+    if not base_nodes:
+        raise ValueError("BASE node set is empty after cylinder-surface filtering (increase base_tol_w?)")
 
-    existing_slice_idxs = sorted(slice_to_eids.keys())
-    n_slices = len(existing_slice_idxs)
-
-    # bottom layer nodes for fixation
-    bottom_idx = existing_slice_idxs[0] if existing_slice_idxs else 0
-    base_nodes = sorted(slice_node_ids.get(bottom_idx, set()))
-
-    def _write_id_list_lines(fh, ids: List[int], per_line: int = 16):
-        for k in range(0, len(ids), per_line):
-            chunk = ids[k:k + per_line]
-            fh.write(", ".join(str(x) for x in chunk) + "\n")
-
-    # ---- write INP ----
-    time_per_layer = 1.0
-    time_per_layer_step = 1.0
+    # write inp
+    time_per_step = 1.0
+    total_time = 1.0
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write("**\n** Auto-generated incremental-cure shrink job (C3D4 tets, binned layers)\n**\n")
+        f.write("**\n** Auto-generated incremental-cure shrink job (C3D4 tets, explicit layer sets)\n**\n")
         f.write("*HEADING\n")
-        f.write("Tet C3D4 UT-D (MODEL CHANGE + shrinkage curve), layers from CYL-ANGLE binning\n")
+        f.write("Tet C3D4 UT-D (MODEL CHANGE + shrinkage curve), layers from provided ELSETs\n")
 
         # NODES
         f.write("** Nodes +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
@@ -376,24 +398,24 @@ def write_calculix_job_tet_layer_binned(
         f.write("*NSET, NSET=ALLNODES, GENERATE\n")
         f.write(f"1, {n_nodes}, 1\n")
 
-        f.write("** Element + node sets (per layer bin) ++++++++++++++++++++++\n")
-        for sidx in existing_slice_idxs:
-            name = f"SLICE_{sidx:03d}"
-            eids = slice_to_eids[sidx]
-            nodes = sorted(slice_node_ids[sidx])
+        f.write("** Element + node sets (per provided layer) +++++++++++++++++\n")
+        for sidx in layer_idxs:
+            name = f"LAYER_{sidx:03d}"
+            eids = layer_to_eids.get(sidx, [])
+            nids = layer_to_nids.get(sidx, [])
+            if not eids:
+                continue
 
             f.write(f"*ELSET, ELSET={name}\n")
             _write_id_list_lines(f, eids)
 
-            f.write(f"*NSET, NSET={name}_NODES\n")
-            _write_id_list_lines(f, nodes)
+            if nids:
+                f.write(f"*NSET, NSET={name}_NODES\n")
+                _write_id_list_lines(f, nids)
 
-        if base_nodes:
-            f.write("** Base node set = bottom binned layer ++++++++++++++++++++++\n")
-            f.write("*NSET, NSET=BASE\n")
-            _write_id_list_lines(f, base_nodes)
-        else:
-            f.write("** Warning: BASE set empty (no bottom layer?)\n")
+        f.write("** Base node set (fixed) ++++++++++++++++++++++++++++++++++++\n")
+        f.write("*NSET, NSET=BASE\n")
+        _write_id_list_lines(f, base_nodes)
 
         # MATERIAL
         f.write("** Materials +++++++++++++++++++++++++++++++++++++++++++++++\n")
@@ -422,104 +444,102 @@ def write_calculix_job_tet_layer_binned(
 
         # STEPS
         f.write("** Steps +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
-        if n_slices == 0:
-            f.write("** No slices -> no steps.\n")
-        else:
-            # per-layer cure state
-            cure_state: Dict[int, float] = {idx: 0.0 for idx in existing_slice_idxs}
-            applied_count: Dict[int, int] = {idx: 0 for idx in existing_slice_idxs}
-            printed: Dict[int, bool] = {idx: False for idx in existing_slice_idxs}
 
-            step_counter = 1
+        cure_state: Dict[int, float] = {idx: 0.0 for idx in layer_idxs}
+        applied_count: Dict[int, int] = {idx: 0 for idx in layer_idxs}
+        printed: Dict[int, bool] = {idx: False for idx in layer_idxs}
 
-            # Step 1: dummy full model (then we will remove all but first layer at step 2)
+        step_counter = 1
+
+        # Step 1: dummy full model
+        f.write("** --------------------------------------------------------\n")
+        f.write("** Step 1: initial dummy step with full model (no curing)\n")
+        f.write("** --------------------------------------------------------\n")
+        f.write("*STEP\n")
+        f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT, SOLVER=PASTIX\n")
+        f.write(f"{time_per_step:.6f}, {total_time:.6f}\n")
+        f.write("*BOUNDARY\n")
+        f.write("BASE, 1, 3, 0.\n")
+        f.write("*END STEP\n")
+        step_counter += 1
+
+        total_cure_steps = len(layer_idxs) + curve_len - 1
+
+        for global_k in range(total_cure_steps):
+            layer_to_add: Optional[int] = None
+            if global_k < len(layer_idxs):
+                layer_to_add = layer_idxs[global_k]
+                printed[layer_to_add] = True
+
+            prev_cure_state = cure_state.copy()
+
+            # advance curve for all printed layers
+            for j in layer_idxs:
+                if not printed[j]:
+                    continue
+                k_applied = applied_count[j]
+                if k_applied >= curve_len:
+                    continue
+                inc = shrinkage_curve[k_applied]
+                if inc != 0.0:
+                    cure_state[j] = min(1.0, cure_state[j] + inc)
+                applied_count[j] = k_applied + 1
+
             f.write("** --------------------------------------------------------\n")
-            f.write("** Step 1: initial dummy step with full model (no curing)\n")
+            if layer_to_add is not None:
+                f.write(f"** Step {step_counter}: add LAYER_{layer_to_add:03d} and advance shrink curve\n")
+            else:
+                f.write(f"** Step {step_counter}: post-cure step (advance shrink curve)\n")
             f.write("** --------------------------------------------------------\n")
             f.write("*STEP\n")
             f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT, SOLVER=PASTIX\n")
-            f.write(f"{time_per_layer_step:.6f}, {time_per_layer:.6f}\n")
-            if base_nodes:
-                f.write("*BOUNDARY\n")
-                f.write("BASE, 1, 3, 0.\n")
+            f.write(f"{time_per_step:.6f}, {total_time:.6f}\n")
+
+            # model change logic
+            if layer_to_add is not None:
+                name = f"LAYER_{layer_to_add:03d}"
+                if layer_to_add == layer_idxs[0]:
+                    # keep only first layer active (remove all others once)
+                    remove = [f"LAYER_{other:03d}" for other in layer_idxs if other != layer_to_add]
+                    if remove:
+                        f.write("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n")
+                        for nm in remove:
+                            f.write(f"{nm}\n")
+                else:
+                    f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
+                    f.write(f"{name}\n")
+
+            # outputs
+            write_outputs = (
+                output_stride <= 1
+                or (global_k + 1) % output_stride == 0
+                or global_k == total_cure_steps - 1
+            )
+            f.write("*NODE FILE\n")
+            if write_outputs:
+                f.write("U\n")
+
+            # always keep base fixed
+            f.write("*BOUNDARY\n")
+            # f.write("BASE, 1, 3, 0.\n")
+
+            # apply cure increments (TEMP dof 11) only when value changes
+            for j in layer_idxs:
+                if not printed[j]:
+                    continue
+                cure_val = cure_state[j]
+                if cure_val == 0.0:
+                    continue
+                if cure_val == prev_cure_state.get(j, 0.0):
+                    continue
+                f.write(f"LAYER_{j:03d}_NODES, 11, 11, {cure_val:.6f}\n")
+
             f.write("*END STEP\n")
             step_counter += 1
 
-            total_cure_steps = len(existing_slice_idxs) + curve_len - 1
-
-            for global_k in range(total_cure_steps):
-                slice_to_add: Optional[int] = None
-                if global_k < len(existing_slice_idxs):
-                    slice_to_add = existing_slice_idxs[global_k]
-                    printed[slice_to_add] = True
-
-                prev_cure_state = cure_state.copy()
-
-                # advance curve for all printed slices
-                for j in existing_slice_idxs:
-                    if not printed[j]:
-                        continue
-                    k_applied = applied_count[j]
-                    if k_applied >= curve_len:
-                        continue
-                    inc = shrinkage_curve[k_applied]
-                    if inc != 0.0:
-                        cure_state[j] = min(1.0, cure_state[j] + inc)
-                    applied_count[j] = k_applied + 1
-
-                f.write("** --------------------------------------------------------\n")
-                if slice_to_add is not None:
-                    f.write(f"** Step {step_counter}: add layer SLICE_{slice_to_add:03d} and advance shrink curve\n")
-                else:
-                    f.write(f"** Step {step_counter}: post-cure step (advance shrink curve)\n")
-                f.write("** --------------------------------------------------------\n")
-                f.write("*STEP\n")
-                f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT, SOLVER=PASTIX\n")
-                f.write(f"{time_per_layer_step:.6f}, {time_per_layer:.6f}\n")
-
-                # model change logic
-                if slice_to_add is not None:
-                    name = f"SLICE_{slice_to_add:03d}"
-                    if slice_to_add == existing_slice_idxs[0]:
-                        # keep only first slice active
-                        remove = [f"SLICE_{other:03d}" for other in existing_slice_idxs if other != slice_to_add]
-                        if remove:
-                            f.write("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n")
-                            for nm in remove:
-                                f.write(f"{nm}\n")
-                    else:
-                        f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
-                        f.write(f"{name}\n")
-
-                # outputs
-                write_outputs = (
-                    output_stride <= 1
-                    or (global_k + 1) % output_stride == 0
-                    or global_k == total_cure_steps - 1
-                )
-                f.write("*NODE FILE\n")
-                if write_outputs:
-                    f.write("U\n")
-
-                # boundary + cure application
-                f.write("*BOUNDARY\n")
-
-                for j in existing_slice_idxs:
-                    if not printed[j]:
-                        continue
-                    cure_val = cure_state[j]
-                    if cure_val == 0.0:
-                        continue
-                    if cure_val == prev_cure_state.get(j, 0.0):
-                        continue
-                    f.write(f"SLICE_{j:03d}_NODES, 11, 11, {cure_val:.6f}\n")
-
-                f.write("*END STEP\n")
-                step_counter += 1
-
-    log(f"[CCX] Wrote binned-layer UT-D tet job to: {path}")
-    log(f"[CCX] Nodes: {n_nodes}, elems: {n_elems}, layers: {n_slices}, layer_height={layer_height}")
-    log(f"[CCX] Bottom layer index: {bottom_idx}, BASE nodes: {len(base_nodes)}")
+    print(f"[CCX] Wrote layered UT-D tet job to: {path}")
+    print(f"[CCX] Nodes: {n_nodes}, elems: {n_elems}, layers: {len(layer_idxs)}")
+    print(f"[CCX] BASE layer: {base_layer}, BASE nodes: {len(base_nodes)}")
 
 
 def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
@@ -1056,6 +1076,7 @@ def slice_mesh_plane(
     cap=False,
     engine=None,
     triangle_args=None,
+    prev_polys=None,
     **kwargs,
 ):
     """
@@ -1170,10 +1191,19 @@ def slice_mesh_plane(
             faces = [f]
             tol = 1e-8
 
-            for p in polygons.edges_to_polygons(edges[unique_edge], vertices_2D[:, :2]):
+            if prev_polys is not None:
+                vh_polygons = prev_polys
+            else:
+                vh_polygons = polygons.edges_to_polygons(edges[unique_edge], vertices_2D[:, :2])
+
+            for p in vh_polygons:
 
                 # triangulate cap polygon (vn can include inserted vertices)
                 vn, fn = triangulate_polygon(p, engine=engine, force_vertices=False, triangle_args=triangle_args)
+
+                if prev_polys:
+                    vn[:, 0] *= -1.0
+                    fn = fn[:, [0, 2, 1]]
 
                 # vn is 2D -> lift to 3D cap plane, then to world 3D
                 vn3 = tf.transform_points(util.stack_3D(vn), to_3D)
@@ -1205,7 +1235,7 @@ def slice_mesh_plane(
 
             faces = np.vstack(faces)
 
-    return Trimesh(vertices=vertices, faces=faces, **kwargs)
+    return Trimesh(vertices=vertices, faces=faces, **kwargs), vh_polygons
 
 
 def _orient_cap(cap: trimesh.Trimesh | None, desired_normal: np.ndarray) -> trimesh.Trimesh | None:
@@ -1265,6 +1295,7 @@ def slice_mesh_into_z_slabs_by_height(
     slabs: list[trimesh.Trimesh] = []
 
     prev_slab: trimesh.Trimesh | None = None  # previous slab waiting for its TOP cap
+    prev_top_polys = None
 
     for i in range(n_layers):
         a0 = z0 + i * H
@@ -1278,7 +1309,7 @@ def slice_mesh_into_z_slabs_by_height(
 
         # 1) Keep z >= a0, and generate the cap at z=a0 (this is the BOTTOM cap of current slab)
         if i > 0:
-            m1 = slice_mesh_plane(
+            m1, _ = slice_mesh_plane(
                 mesh,
                 plane_normal=n_pos,
                 plane_origin=origin0,
@@ -1286,6 +1317,7 @@ def slice_mesh_into_z_slabs_by_height(
                 return_cap=True,
                 engine="triangle",
                 triangle_args="pYq",
+                prev_polys=prev_top_polys,
             )
             # m1 = trimesh.intersections.slice_mesh_plane(
             #     mesh,
@@ -1306,7 +1338,7 @@ def slice_mesh_into_z_slabs_by_height(
         if (is_last):
             m2 = m1
         else:
-            m2 = slice_mesh_plane(
+            m2, vh_polygons = slice_mesh_plane(
                 m1,
                 plane_normal=n_neg,
                 plane_origin=origin1,
@@ -1315,6 +1347,7 @@ def slice_mesh_into_z_slabs_by_height(
                 engine="triangle",
                 triangle_args="pYq",
             )
+            prev_top_polys = vh_polygons
             # m2 = trimesh.intersections.slice_mesh_plane(
             #     m1,
             #     plane_normal=n_neg,
@@ -1506,47 +1539,42 @@ def write_tetgen_wireframe_ply(
             f.write(f"{i0} {i1}\n")
 
 
+from typing import Iterable, Tuple, Dict, List, Set
 import numpy as np
-from typing import Iterable, Tuple, Dict
 
-def merge_tetgen_grids(
+def merge_tetgen_grids_with_layer_sets(
     slab_tetgens: Iterable,
     eps: float = 1e-7,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Dict[int, List[int]], Dict[int, List[int]]]:
     """
-    Merge many TetGen objects (where mesh is in tg.grid.points and tg.grid.cells)
-    into one global (points, cells) with NO duplicate vertices on shared interfaces.
-
-    Parameters
-    ----------
-    slab_tetgens : iterable of tetgen.TetGen objects
-        Each must have:
-          - tg.grid.points : (Ni,3) float
-          - tg.grid.cells  : (Mi,)  int, flat PyVista cell array:
-                [4, i0, i1, i2, i3, 4, i0, i1, i2, i3, ...]
-    eps : float
-        Vertex dedup tolerance. Vertices whose coordinates match within eps (via
-        quantization) are treated as identical and merged.
+    Merge TetGen grids into one global (points, cells) WITHOUT duplicate vertices,
+    and also return per-layer element-sets and node-sets in the MERGED indexing.
 
     Returns
     -------
     merged_points : (N,3) float64
-    merged_cells  : (M,)  int64
-        Flat PyVista cell array of tetrahedra.
+    merged_cells  : (M,) int64  flat PyVista cell array [4,a,b,c,d, 4,...]
+    layer_to_eids : dict[layer_idx -> list of element ids (1-based)]
+    layer_to_nids : dict[layer_idx -> list of node ids (1-based)]
     """
-    # global storage
     key_to_gid: Dict[tuple, int] = {}
-    global_pts = []          # list of (3,) float
-    global_cells = []        # list of ints, flat [4, a,b,c,d, 4, ...]
+    global_pts: List[np.ndarray] = []
+    global_cells: List[int] = []
     gid_counter = 0
 
-    def key_of(p: np.ndarray) -> tuple:
-        # quantize to a grid of size eps to be robust to float noise
-        return (int(np.round(p[0] / eps)),
-                int(np.round(p[1] / eps)),
-                int(np.round(p[2] / eps)))
+    layer_to_eids: Dict[int, List[int]] = {}
+    layer_to_nids_set: Dict[int, Set[int]] = {}
 
-    for tg in slab_tetgens:
+    def key_of(p: np.ndarray) -> tuple:
+        return (
+            int(np.round(p[0] / eps)),
+            int(np.round(p[1] / eps)),
+            int(np.round(p[2] / eps)),
+        )
+
+    elem_id_1 = 0  # 1-based CCX element id counter
+
+    for layer_idx, tg in enumerate(slab_tetgens):
         pts = np.asarray(tg.grid.points, dtype=np.float64)
         cells = np.asarray(tg.grid.cells, dtype=np.int64)
 
@@ -1567,20 +1595,33 @@ def merge_tetgen_grids(
                 global_pts.append(p)
             l2g[li] = gi
 
-        # remap cells (PyVista flat cell array)
+        eids = layer_to_eids.setdefault(layer_idx, [])
+        nset = layer_to_nids_set.setdefault(layer_idx, set())
+
+        # remap cells
         i = 0
         n = len(cells)
         while i < n:
             if cells[i] != 4:
                 raise ValueError(f"Expected tet (4), got {cells[i]} at index {i}")
             a, b, c, d = cells[i + 1 : i + 5]
-            ga, gb, gc, gd = l2g[a], l2g[b], l2g[c], l2g[d]
-            global_cells.extend([4, int(ga), int(gb), int(gc), int(gd)])
+            ga, gb, gc, gd = int(l2g[a]), int(l2g[b]), int(l2g[c]), int(l2g[d])
+
+            global_cells.extend([4, ga, gb, gc, gd])
+
+            elem_id_1 += 1
+            eids.append(elem_id_1)
+
+            # CCX node ids are 1-based
+            nset.update([ga + 1, gb + 1, gc + 1, gd + 1])
+
             i += 5
 
     merged_points = np.asarray(global_pts, dtype=np.float64)
     merged_cells = np.asarray(global_cells, dtype=np.int64)
-    return merged_points, merged_cells
+
+    layer_to_nids = {k: sorted(list(v)) for k, v in layer_to_nids_set.items()}
+    return merged_points, merged_cells, layer_to_eids, layer_to_nids
 
 
 # Input
@@ -1683,7 +1724,7 @@ for i, slab in enumerate(slabs):
 
     tet_meshes.append(tetgen_mesh)
 
-mega_points, mega_cells = merge_tetgen_grids(tet_meshes)
+mega_points, mega_cells, layer_to_eids, layer_to_nids = merge_tetgen_grids_with_layer_sets(tet_meshes)
 
 write_tetgen_wireframe_ply(
     f"{OUTPUT_DIR}/slices/MEGA.ply",
@@ -1691,24 +1732,19 @@ write_tetgen_wireframe_ply(
     mega_cells,
 )
 
-pts_world = transform_points_from_cylindrical_like_old(
-    mega_points, cx, cz, R0, theta0
-)
-
-write_tetgen_wireframe_ply(
-    f"{OUTPUT_DIR}/slices/MEGA_tran.ply",
-    pts_world,
-    mega_cells,
-)
-
-write_calculix_job_tet_layer_binned(
+write_calculix_job_tet_layers(
     path=f"{SIMULATION}.inp",
-    grid_points=mega_points,
-    grid_cells=mega_cells,
-    layer_height=LAYER_HEIGHT,
-    cyl_radius=CYLINDER_RADIUS,
+    merged_points=mega_points,
+    merged_cells=mega_cells,
+    layer_to_eids=layer_to_eids,
+    layer_to_nids=layer_to_nids,
     shrinkage_curve=SHRINKAGE_CURVE,
     cure_shrink_per_unit=SHRINKAGE,
+    output_stride=1,
+    cx=cx,
+    cz=cz,
+    R0=R0,
+    base_tol_w=1e-8,   # adjust if needed
 )
 
 run_calculix(
@@ -1716,7 +1752,7 @@ run_calculix(
     "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe"
 )
 
-vtk_grid = vtk_grid_from_tetgen(mega_points, tetgen_cells)
+vtk_grid = vtk_grid_from_tetgen(mega_points, mega_cells)
 displacements = read_ccx_frd_displacements(f"{SIMULATION}.frd")
 
 export_tet_displacement_debug(
