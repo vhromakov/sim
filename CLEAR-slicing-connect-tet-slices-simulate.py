@@ -34,8 +34,8 @@ WATERTIGHT_RESOLUTION = 50_000
 DECIMATE_NUM_FACES = 50_000
 CYLINDER_RADIUS = 199.82
 LAYER_HEIGHT = 1.1 # 1.1
-SHRINKAGE = 0.1
-SHRINKAGE_CURVE = [5,4,3,2,1]
+SHRINKAGE = 0.05
+SHRINKAGE_CURVE = [5, 4, 3, 2, 1]
 INPUT_STL = "MODELS/CSC16_U00P_.stl"
 OUTPUT_DIR = "OUTPUT"
 SIMULATION = f"{OUTPUT_DIR}/simulation"
@@ -279,6 +279,7 @@ from typing import Any, List, Dict, Optional
 import numpy as np
 import math
 
+
 def write_calculix_job_tet_layers(
     path: str,
     merged_points: Any,
@@ -295,17 +296,18 @@ def write_calculix_job_tet_layers(
     base_tol_w: float = 1e-8,
 ):
     """
-    C3D4 layered curing job using PREDEFINED layer sets.
+    C3D4 layered curing job using PREDEFINED layer sets (merged mesh).
 
-    - Whole mesh is written once (nodes+elements).
-    - Each layer is an ELSET (and NSET) provided by caller (in merged numbering).
-    - Layers are connected because they share merged nodes.
-    - Uses MODEL CHANGE to add layers sequentially.
-    - Uses TEMP (DOF 11) ramp per layer nodes to drive *EXPANSION shrinkage.
+    UPDATED schedule (as requested):
+      Step A (first curing step): keep only L0+L1 active, freeze BASE and L1_TOP, shrink L0
+      Next steps: add Li (i>=2), unfreeze previous support TOP, freeze Li_TOP, shrink all layers below Li
+      After last layer is added: drop support (no TOP frozen) and continue post-cure until all layers finish curve
 
-    Assumes:
-      - layer indices are 0..L-1 in print order (bottom->top or your order)
-      - base (fixed) is layer 0 nodes
+    - Whole mesh written once (nodes+elements)
+    - Each layer is an ELSET and NSET provided by caller (merged numbering)
+    - Layers are connected via shared merged nodes
+    - MODEL CHANGE used to add layers sequentially
+    - TEMP (DOF 11) ramp per layer nodes drives *EXPANSION shrinkage
     """
 
     def _fmt(val: float) -> str:
@@ -316,15 +318,43 @@ def write_calculix_job_tet_layers(
             chunk = ids[k:k + per_line]
             fh.write(", ".join(str(x) for x in chunk) + "\n")
 
+    def compute_radial_surface_nodes(
+        pts_world: np.ndarray,
+        layer_nids_1based: List[int],
+        cx: float,
+        cz: float,
+        R0: float,
+        tol_w: float,
+    ) -> List[int]:
+        """
+        Nodes (subset of layer_nids_1based) that lie on cylinder surface (outer radial face),
+        using w = R0 - r and selecting w <= tol_w.
+        """
+        out = []
+        for nid1 in layer_nids_1based:
+            pid0 = int(nid1) - 1
+            x, _, z = pts_world[pid0]
+            r = math.sqrt((x - cx) ** 2 + (z - cz) ** 2)
+            w = float(R0) - r
+            if w <= tol_w:
+                out.append(int(nid1))
+        return sorted(set(out))
+
+    # ------------------------ validate + parse mesh ------------------------
     pts = np.asarray(merged_points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("merged_points must be (N,3)")
     n_nodes = int(pts.shape[0])
     if n_nodes == 0:
         raise ValueError("No nodes")
 
+    if R0 <= 0:
+        raise ValueError("R0 must be > 0")
+
     cells = np.asarray(merged_cells, dtype=np.int64)
 
     # parse tets from flat PyVista cell array
-    tets0 = []
+    tets0: List[tuple[int, int, int, int]] = []
     i = 0
     while i < len(cells):
         n = int(cells[i])
@@ -355,22 +385,39 @@ def write_calculix_job_tet_layers(
     if not layer_idxs:
         raise ValueError("layer_to_eids is empty")
 
-    # BASE = layer 0 (or first in your order)
+    if len(layer_idxs) < 2:
+        raise ValueError("This schedule requires at least 2 layers (L0 and L1).")
+
+    # BASE nodes = radial-surface nodes from layer0 nodes
     base_layer = layer_idxs[0]
     layer0_nodes = layer_to_nids.get(base_layer, [])
     if not layer0_nodes:
         raise ValueError("Layer 0 node set is empty")
 
-    base_nodes = compute_base_nodes_on_cylinder_surface(
+    base_nodes = compute_radial_surface_nodes(
         pts_world=pts,
-        layer0_nids_1based=layer0_nodes,
+        layer_nids_1based=layer0_nodes,
         cx=cx, cz=cz, R0=R0,
         tol_w=base_tol_w,
     )
     if not base_nodes:
         raise ValueError("BASE node set is empty after cylinder-surface filtering (increase base_tol_w?)")
 
-    # write inp
+    # TOP radial nodes per layer (used for support freezing)
+    layer_top_nodes: Dict[int, List[int]] = {}
+    for li in layer_idxs:
+        nids = layer_to_nids.get(li, [])
+        if not nids:
+            layer_top_nodes[li] = []
+            continue
+        layer_top_nodes[li] = compute_radial_surface_nodes(
+            pts_world=pts,
+            layer_nids_1based=nids,
+            cx=cx, cz=cz, R0=R0,
+            tol_w=base_tol_w,
+        )
+
+    # ------------------------ write inp ------------------------
     time_per_step = 1.0
     total_time = 1.0
 
@@ -413,6 +460,12 @@ def write_calculix_job_tet_layers(
                 f.write(f"*NSET, NSET={name}_NODES\n")
                 _write_id_list_lines(f, nids)
 
+            # TOP radial face nodes for support freezing
+            top_nodes = layer_top_nodes.get(sidx, [])
+            if top_nodes:
+                f.write(f"*NSET, NSET={name}_TOP\n")
+                _write_id_list_lines(f, top_nodes)
+
         f.write("** Base node set (fixed) ++++++++++++++++++++++++++++++++++++\n")
         f.write("*NSET, NSET=BASE\n")
         _write_id_list_lines(f, base_nodes)
@@ -445,12 +498,6 @@ def write_calculix_job_tet_layers(
         # STEPS
         f.write("** Steps +++++++++++++++++++++++++++++++++++++++++++++++++++\n")
 
-        cure_state: Dict[int, float] = {idx: 0.0 for idx in layer_idxs}
-        applied_count: Dict[int, int] = {idx: 0 for idx in layer_idxs}
-        printed: Dict[int, bool] = {idx: False for idx in layer_idxs}
-
-        step_counter = 1
-
         # Step 1: dummy full model
         f.write("** --------------------------------------------------------\n")
         f.write("** Step 1: initial dummy step with full model (no curing)\n")
@@ -461,81 +508,151 @@ def write_calculix_job_tet_layers(
         f.write("*BOUNDARY\n")
         f.write("BASE, 1, 3, 0.\n")
         f.write("*END STEP\n")
-        step_counter += 1
 
-        total_cure_steps = len(layer_idxs) + curve_len - 1
+        # Cure tracking
+        cure_state: Dict[int, float] = {idx: 0.0 for idx in layer_idxs}
+        applied_count: Dict[int, int] = {idx: 0 for idx in layer_idxs}
 
-        for global_k in range(total_cure_steps):
-            layer_to_add: Optional[int] = None
-            if global_k < len(layer_idxs):
-                layer_to_add = layer_idxs[global_k]
-                printed[layer_to_add] = True
+        # Support schedule state:
+        # active layers are positions 0..active_upto_pos
+        active_upto_pos = 1           # start with L0 + L1 active
+        support_pos: Optional[int] = 1  # L1 is support at first curing step
 
+        # We will:
+        #  - write (len(layer_idxs)-1) "front-advance" steps including the initial L0+L1 step,
+        #  - then add post-cure steps until all layers reach curve_len.
+        step_counter = 2  # next step index
+
+        def _all_done() -> bool:
+            return all(applied_count[li] >= curve_len for li in layer_idxs)
+
+        s = 0
+        while True:
             prev_cure_state = cure_state.copy()
 
-            # advance curve for all printed layers
-            for j in layer_idxs:
-                if not printed[j]:
-                    continue
-                k_applied = applied_count[j]
+            # Decide whether to add a new layer this step.
+            # s=0: keep only L0+L1 (REMOVE others)
+            # s>=1: add next layer if exists; else post-cure
+            if s == 0:
+                layer_to_add = None
+            else:
+                next_pos = active_upto_pos + 1
+                layer_to_add = layer_idxs[next_pos] if next_pos < len(layer_idxs) else None
+
+            # Update active_upto_pos and support_pos
+            if s == 0:
+                active_upto_pos = 1
+                support_pos = 1
+            else:
+                if layer_to_add is not None:
+                    active_upto_pos += 1
+                    support_pos = active_upto_pos
+                else:
+                    # after last layer added: no more support, shrink all active layers
+                    support_pos = None
+
+            # Advance shrink curve only for layers below support (or all if no support)
+            if support_pos is None:
+                curable_positions = range(0, active_upto_pos + 1)
+            else:
+                curable_positions = range(0, support_pos)
+
+            for pos in curable_positions:
+                li = layer_idxs[pos]
+                k_applied = applied_count[li]
                 if k_applied >= curve_len:
                     continue
                 inc = shrinkage_curve[k_applied]
                 if inc != 0.0:
-                    cure_state[j] = min(1.0, cure_state[j] + inc)
-                applied_count[j] = k_applied + 1
+                    cure_state[li] = min(1.0, cure_state[li] + inc)
+                applied_count[li] = k_applied + 1
 
+            # Write step header
             f.write("** --------------------------------------------------------\n")
-            if layer_to_add is not None:
-                f.write(f"** Step {step_counter}: add LAYER_{layer_to_add:03d} and advance shrink curve\n")
+            if s == 0:
+                f.write(f"** Step {step_counter}: keep L0+L1, freeze L1_TOP, shrink L0\n")
+            elif layer_to_add is not None:
+                f.write(f"** Step {step_counter}: add LAYER_{layer_to_add:03d}, freeze its TOP, shrink below\n")
             else:
-                f.write(f"** Step {step_counter}: post-cure step (advance shrink curve)\n")
+                f.write(f"** Step {step_counter}: post-cure (no add), shrink all active\n")
             f.write("** --------------------------------------------------------\n")
+
             f.write("*STEP\n")
             f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT, SOLVER=PASTIX\n")
             f.write(f"{time_per_step:.6f}, {total_time:.6f}\n")
 
-            # model change logic
-            if layer_to_add is not None:
-                name = f"LAYER_{layer_to_add:03d}"
-                if layer_to_add == layer_idxs[0]:
-                    # keep only first layer active (remove all others once)
-                    remove = [f"LAYER_{other:03d}" for other in layer_idxs if other != layer_to_add]
-                    if remove:
-                        f.write("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n")
-                        for nm in remove:
-                            f.write(f"{nm}\n")
-                else:
+            # MODEL CHANGE
+            if s == 0:
+                # remove everything except first two layers
+                keep0 = layer_idxs[0]
+                keep1 = layer_idxs[1]
+                remove = [f"LAYER_{other:03d}" for other in layer_idxs if other not in (keep0, keep1)]
+                if remove:
+                    f.write("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n")
+                    for nm in remove:
+                        f.write(f"{nm}\n")
+            else:
+                if layer_to_add is not None:
                     f.write("*MODEL CHANGE, TYPE=ELEMENT, ADD\n")
-                    f.write(f"{name}\n")
+                    f.write(f"LAYER_{layer_to_add:03d}\n")
 
-            # outputs
+            # OUTPUTS
             write_outputs = (
                 output_stride <= 1
-                or (global_k + 1) % output_stride == 0
-                or global_k == total_cure_steps - 1
+                or (s + 1) % output_stride == 0
+                or False
             )
+            # Ensure last step always outputs
+            # (we decide last step after loop condition; so handle at end too by forcing one more output step if needed)
             f.write("*NODE FILE\n")
             if write_outputs:
                 f.write("U\n")
 
-            # always keep base fixed
+            # BOUNDARY: BASE always frozen; freeze TOP of current support layer only
             f.write("*BOUNDARY\n")
-            # f.write("BASE, 1, 3, 0.\n")
+            f.write("BASE, 1, 3, 0.\n")
+            if support_pos is not None:
+                sup_li = layer_idxs[support_pos]
+                if layer_top_nodes.get(sup_li):
+                    f.write(f"LAYER_{sup_li:03d}_TOP, 1, 3, 0.\n")
 
-            # apply cure increments (TEMP dof 11) only when value changes
-            for j in layer_idxs:
-                if not printed[j]:
-                    continue
-                cure_val = cure_state[j]
+            # Apply updated cure values (TEMP DOF 11) for active layers whose value changed
+            for pos in range(0, active_upto_pos + 1):
+                li = layer_idxs[pos]
+                cure_val = cure_state[li]
                 if cure_val == 0.0:
                     continue
-                if cure_val == prev_cure_state.get(j, 0.0):
+                if cure_val == prev_cure_state.get(li, 0.0):
                     continue
-                f.write(f"LAYER_{j:03d}_NODES, 11, 11, {cure_val:.6f}\n")
+                f.write(f"LAYER_{li:03d}_NODES, 11, 11, {cure_val:.6f}\n")
 
             f.write("*END STEP\n")
             step_counter += 1
+
+            # stop condition:
+            # - after we have no more layers to add (support_pos=None) AND all layers finished curve
+            if support_pos is None and _all_done():
+                # Force one last output step if stride skipped it and user wants final displacement:
+                # (Optional: if you don't want this extra step, remove block)
+                break
+
+            s += 1
+
+        # Ensure last step outputs (if stride prevented U on final):
+        # We can’t retroactively modify previous step easily, so add a tiny final step with no changes but with U.
+        # This is optional; comment out if you don't want it.
+        if output_stride > 1:
+            f.write("** --------------------------------------------------------\n")
+            f.write(f"** Step {step_counter}: final output dump (no changes)\n")
+            f.write("** --------------------------------------------------------\n")
+            f.write("*STEP\n")
+            f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT, SOLVER=PASTIX\n")
+            f.write(f"{time_per_step:.6f}, {total_time:.6f}\n")
+            f.write("*NODE FILE\n")
+            f.write("U\n")
+            f.write("*BOUNDARY\n")
+            f.write("BASE, 1, 3, 0.\n")
+            f.write("*END STEP\n")
 
     print(f"[CCX] Wrote layered UT-D tet job to: {path}")
     print(f"[CCX] Nodes: {n_nodes}, elems: {n_elems}, layers: {len(layer_idxs)}")
@@ -1143,6 +1260,8 @@ def slice_mesh_plane(
     if "process" not in kwargs:
         kwargs["process"] = False
 
+    vh_polygons = None
+
     # slice away specified planes
     for origin, normal in zip(
         plane_origin.reshape((-1, 3)), plane_normal.reshape((-1, 3))
@@ -1316,8 +1435,8 @@ def slice_mesh_into_z_slabs_by_height(
                 cap=True,
                 return_cap=True,
                 engine="triangle",
-                triangle_args="pYq",
-                prev_polys=prev_top_polys,
+                triangle_args="pYqa3",
+                # prev_polys=prev_top_polys,
             )
             # m1 = trimesh.intersections.slice_mesh_plane(
             #     mesh,
@@ -1345,7 +1464,7 @@ def slice_mesh_into_z_slabs_by_height(
                 cap=True,
                 return_cap=True,
                 engine="triangle",
-                triangle_args="pYq",
+                triangle_args="pYqa3",
             )
             prev_top_polys = vh_polygons
             # m2 = trimesh.intersections.slice_mesh_plane(
@@ -1705,16 +1824,6 @@ for i, slab in enumerate(slabs):
 
     tetgen_points = tetgen_mesh.grid.points
     tetgen_cells = tetgen_mesh.grid.cells
-
-    # grid_cyl = tetgen_mesh.grid               # pyvista.UnstructuredGrid in (u,v,w)
-    # grid_world = transform_tetgen_grid_from_cylindrical_like_old(
-    #     grid_cyl, cx, cz, R0, theta0
-    # )
-
-    # # If you still want arrays:
-    # tetgen_points_world = grid_world.points
-    # tetgen_cells = grid_world.cells
-    # tetgen_celltypes = grid_world.celltypes
 
     write_tetgen_wireframe_ply(
         f"{OUTPUT_DIR}/slices/slice_tet_{i:03d}.ply",
