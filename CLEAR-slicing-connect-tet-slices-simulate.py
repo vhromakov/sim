@@ -1,3 +1,4 @@
+import sys
 from typing import Any, List, Dict, Set, Optional
 from typing import List, Any
 from vtk.util import numpy_support
@@ -33,12 +34,13 @@ from shapely.geometry.polygon import orient
 WATERTIGHT_RESOLUTION = 50_000
 DECIMATE_NUM_FACES = 50_000
 CYLINDER_RADIUS = 199.82
-LAYER_HEIGHT = 1.1 # 1.1
+LAYER_HEIGHT =  0.5 # 1.1
 SHRINKAGE = 0.05
 SHRINKAGE_CURVE = [5, 4, 3, 2, 1]
 INPUT_STL = "MODELS/CSC16_U00P_.stl"
+# INPUT_STL = "MODELS/cube.stl"
 OUTPUT_DIR = "OUTPUT"
-SIMULATION = f"{OUTPUT_DIR}/simulation"
+SIMULATION = f"{OUTPUT_DIR}/simulation_teeth"
 
 
 def pymeshlab_decimate(
@@ -67,6 +69,7 @@ def pymeshlab_decimate(
         preservetopology=True,
         optimalplacement=True,
         planarquadric=True,
+        planarweight=0.1,
         autoclean=True,
     )
 
@@ -239,6 +242,7 @@ def compute_cylinder_center_from_bottom_z(pts: np.ndarray, radius: float):
 
 import numpy as np
 import math
+from typing import Tuple
 from typing import List
 
 def compute_base_nodes_on_cylinder_surface(
@@ -279,6 +283,265 @@ from typing import Any, List, Dict, Optional
 import numpy as np
 import math
 
+from collections import defaultdict
+from collections import defaultdict
+from typing import List, Tuple, Dict
+import numpy as np
+import math
+
+def compute_layer_top_faces_and_nodes_radial(
+    pts: np.ndarray,
+    tets_layer: List[Tuple[int, int, int, int]],
+    *,
+    cx: float,
+    cz: float,
+    R0: float,
+    w_tol: float = 1e-4,
+):
+    """
+    Top faces for a radial layer:
+      1) compute boundary faces of the layer (faces that appear once among layer tets)
+      2) compute face-centroid w = R0 - r(centroid)
+      3) pick faces with w near layer's max w (w >= w_max - w_tol)
+
+    Returns:
+      top_faces_0based : List[Tuple[int,int,int]]  (sorted indices inside each face)
+      top_nodes_1based : List[int]
+    """
+    tet_faces = [
+        (0, 1, 2),
+        (0, 1, 3),
+        (0, 2, 3),
+        (1, 2, 3),
+    ]
+
+    face_count = defaultdict(int)
+
+    for tet in tets_layer:
+        for f in tet_faces:
+            face = tuple(sorted((tet[f[0]], tet[f[1]], tet[f[2]])))
+            face_count[face] += 1
+
+    boundary_faces = [face for face, c in face_count.items() if c == 1]
+    if not boundary_faces:
+        return [], []
+
+    # compute w for each boundary face centroid
+    w_vals = []
+    for a, b, c in boundary_faces:
+        x = (pts[a, 0] + pts[b, 0] + pts[c, 0]) / 3.0
+        z = (pts[a, 2] + pts[b, 2] + pts[c, 2]) / 3.0
+        r = math.sqrt((x - cx) ** 2 + (z - cz) ** 2)
+        w = float(R0) - r
+        w_vals.append(w)
+
+    w_max = max(w_vals)
+
+    top_faces = []
+    for face, w in zip(boundary_faces, w_vals):
+        if w >= (w_max - w_tol):
+            top_faces.append(face)
+
+    top_nodes_1based = sorted({n + 1 for face in top_faces for n in face})
+    return top_faces, top_nodes_1based
+
+
+import os
+import numpy as np
+from typing import List, Tuple
+
+def write_tri_faces_ply(
+    ply_path: str,
+    pts: np.ndarray,
+    faces_0based: List[Tuple[int, int, int]],
+    *,
+    ascii: bool = True,
+):
+    """
+    Write a simple triangle PLY:
+      - vertices = pts (Nx3)
+      - faces    = faces_0based (Mx3) with 0-based vertex indices
+    """
+    os.makedirs(os.path.dirname(ply_path), exist_ok=True)
+
+    pts = np.asarray(pts, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("pts must be (N,3)")
+    for a, b, c in faces_0based:
+        if a < 0 or b < 0 or c < 0 or a >= len(pts) or b >= len(pts) or c >= len(pts):
+            raise ValueError(f"Face out of range: {(a,b,c)} with N={len(pts)}")
+
+    mode = "w" if ascii else "wb"
+    with open(ply_path, mode) as f:
+        if ascii:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {len(pts)}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write(f"element face {len(faces_0based)}\n")
+            f.write("property list uchar int vertex_indices\n")
+            f.write("end_header\n")
+            for x, y, z in pts:
+                f.write(f"{x:.9f} {y:.9f} {z:.9f}\n")
+            for a, b, c in faces_0based:
+                f.write(f"3 {a} {b} {c}\n")
+        else:
+            # Keep it simple: ASCII is easiest to inspect & debug
+            raise NotImplementedError("binary mode not implemented; use ascii=True")
+
+
+import os
+import numpy as np
+import trimesh
+from typing import List, Tuple
+
+def export_triangles_as_stl(
+    stl_path: str,
+    pts: np.ndarray,
+    faces_0based: List[Tuple[int, int, int]],
+):
+    """
+    Export given triangles (indices into pts) as a standalone STL mesh.
+    Remaps vertices to a compact set to keep files small.
+    """
+    os.makedirs(os.path.dirname(stl_path), exist_ok=True)
+
+    if not faces_0based:
+        # still write nothing? usually better to just skip
+        return False
+
+    pts = np.asarray(pts, dtype=float)
+    faces = np.asarray(faces_0based, dtype=np.int64)
+
+    # collect used vertices and remap to [0..K-1]
+    used = np.unique(faces.reshape(-1))
+    remap = {int(old): int(new) for new, old in enumerate(used)}
+
+    pts_small = pts[used]  # (K,3)
+    faces_small = np.vectorize(remap.get, otypes=[np.int64])(faces)  # (M,3)
+
+    m = trimesh.Trimesh(vertices=pts_small, faces=faces_small, process=False)
+    m.export(stl_path)
+    return True
+
+from collections import defaultdict
+from typing import Dict, List, Tuple, Any
+
+def compute_layer_interface_faces(
+    tets0: List[Tuple[int, int, int, int]],          # 0-based node ids
+    layer_to_eids: Dict[int, List[int]],             # 1-based element ids
+) -> Dict[Tuple[int, int], List[Tuple[int, int, int]]]:
+    """
+    Returns interface faces between adjacent layers, keyed by (li, lj) where lj > li.
+    Each face is a sorted (a,b,c) of 0-based node ids.
+
+    A tetra face in a valid tet mesh has 1 owner (boundary) or 2 owners (interior).
+    For an interface between layers, the two owners belong to different layers.
+    """
+    # map eid(1-based) -> layer index
+    eid_to_layer: Dict[int, int] = {}
+    for li, eids in layer_to_eids.items():
+        for eid in eids:
+            eid_to_layer[int(eid)] = int(li)
+
+    tet_faces = [
+        (0, 1, 2),
+        (0, 1, 3),
+        (0, 2, 3),
+        (1, 2, 3),
+    ]
+
+    # face -> list of owning layers (len 1 or 2)
+    face_layers: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+
+    for eid1, tet in enumerate(tets0, start=1):  # eid1 is 1-based
+        li = eid_to_layer.get(eid1, None)
+        if li is None:
+            # element not assigned to any layer; skip
+            continue
+        a, b, c, d = tet
+        nodes = (a, b, c, d)
+        for f in tet_faces:
+            face = tuple(sorted((nodes[f[0]], nodes[f[1]], nodes[f[2]])))
+            face_layers[face].append(li)
+
+    # collect interfaces where a face has exactly 2 owners, from different layers
+    interface: Dict[Tuple[int, int], List[Tuple[int, int, int]]] = defaultdict(list)
+
+    for face, owners in face_layers.items():
+        if len(owners) != 2:
+            continue
+        li, lj = owners[0], owners[1]
+        if li == lj:
+            continue
+        if li > lj:
+            li, lj = lj, li
+        interface[(li, lj)].append(face)
+
+    return interface
+
+from collections import defaultdict
+from typing import List, Tuple, Dict
+import numpy as np
+import math
+
+def compute_layer_boundary_faces(
+    tets_layer: List[Tuple[int,int,int,int]],
+) -> List[Tuple[int,int,int]]:
+    """
+    Boundary faces of a layer: faces that appear exactly once among layer tets.
+    Faces are returned as sorted tuples of 0-based node ids.
+    """
+    tet_faces = [(0,1,2),(0,1,3),(0,2,3),(1,2,3)]
+    face_count = defaultdict(int)
+
+    for tet in tets_layer:
+        for f in tet_faces:
+            face = tuple(sorted((tet[f[0]], tet[f[1]], tet[f[2]])))
+            face_count[face] += 1
+
+    return [face for face, c in face_count.items() if c == 1]
+
+
+def compute_layer_bottom_faces_and_nodes_radial(
+    pts: np.ndarray,
+    tets_layer: List[Tuple[int,int,int,int]],
+    *,
+    cx: float,
+    cz: float,
+    R0: float,
+    w_tol: float = 1e-3,
+):
+    """
+    "Bottom" of the first layer = boundary faces with w near layer's MIN w
+    where w = R0 - r(centroid). Cylinder surface -> w≈0.
+
+    Returns:
+      bottom_faces_0based : List[Tuple[int,int,int]]
+      bottom_nodes_1based : List[int]
+    """
+    boundary_faces = compute_layer_boundary_faces(tets_layer)
+    if not boundary_faces:
+        return [], []
+
+    w_vals = []
+    for a, b, c in boundary_faces:
+        x = (pts[a, 0] + pts[b, 0] + pts[c, 0]) / 3.0
+        z = (pts[a, 2] + pts[b, 2] + pts[c, 2]) / 3.0
+        r = math.sqrt((x - cx) ** 2 + (z - cz) ** 2)
+        w = float(R0) - r
+        w_vals.append(w)
+
+    w_min = min(w_vals)
+
+    bottom_faces = []
+    for face, w in zip(boundary_faces, w_vals):
+        if w <= (w_min + w_tol):
+            bottom_faces.append(face)
+
+    bottom_nodes_1based = sorted({n + 1 for f in bottom_faces for n in f})
+    return bottom_faces, bottom_nodes_1based
+
 
 def write_calculix_job_tet_layers(
     path: str,
@@ -317,28 +580,6 @@ def write_calculix_job_tet_layers(
         for k in range(0, len(ids), per_line):
             chunk = ids[k:k + per_line]
             fh.write(", ".join(str(x) for x in chunk) + "\n")
-
-    def compute_radial_surface_nodes(
-        pts_world: np.ndarray,
-        layer_nids_1based: List[int],
-        cx: float,
-        cz: float,
-        R0: float,
-        tol_w: float,
-    ) -> List[int]:
-        """
-        Nodes (subset of layer_nids_1based) that lie on cylinder surface (outer radial face),
-        using w = R0 - r and selecting w <= tol_w.
-        """
-        out = []
-        for nid1 in layer_nids_1based:
-            pid0 = int(nid1) - 1
-            x, _, z = pts_world[pid0]
-            r = math.sqrt((x - cx) ** 2 + (z - cz) ** 2)
-            w = float(R0) - r
-            if w <= tol_w:
-                out.append(int(nid1))
-        return sorted(set(out))
 
     # ------------------------ validate + parse mesh ------------------------
     pts = np.asarray(merged_points, dtype=float)
@@ -388,34 +629,60 @@ def write_calculix_job_tet_layers(
     if len(layer_idxs) < 2:
         raise ValueError("This schedule requires at least 2 layers (L0 and L1).")
 
-    # BASE nodes = radial-surface nodes from layer0 nodes
-    base_layer = layer_idxs[0]
-    layer0_nodes = layer_to_nids.get(base_layer, [])
-    if not layer0_nodes:
-        raise ValueError("Layer 0 node set is empty")
+    # Build per-layer tet list once
+    layer_to_tets = {}
+    for li, eids in layer_to_eids.items():
+        layer_to_tets[li] = [tets0[eid - 1] for eid in eids]  # eids are 1-based
 
-    base_nodes = compute_radial_surface_nodes(
-        pts_world=pts,
-        layer_nids_1based=layer0_nodes,
+    base_layer = layer_idxs[0]
+    tets_L0 = layer_to_tets.get(base_layer, [])
+    if not tets_L0:
+        raise ValueError("Layer 0 has no tets")
+
+    base_faces, base_nodes = compute_layer_bottom_faces_and_nodes_radial(
+        pts=pts,
+        tets_layer=tets_L0,
         cx=cx, cz=cz, R0=R0,
-        tol_w=base_tol_w,
+        w_tol=1e-3,  # tune if needed
     )
+
     if not base_nodes:
-        raise ValueError("BASE node set is empty after cylinder-surface filtering (increase base_tol_w?)")
+        raise ValueError("BASE is empty after bottom-face detection (try increasing w_tol)")
 
     # TOP radial nodes per layer (used for support freezing)
+    debug_dir = os.path.join(os.path.dirname(path), "debug_top_stl")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    base_stl = os.path.join(debug_dir, f"layer_{base_layer:03d}_base_bottom.stl")
+    export_triangles_as_stl(base_stl, pts, base_faces)
+    print(f"[BASEDBG] L{base_layer:03d}: bottom_faces={len(base_faces)} bottom_nodes={len(base_nodes)} -> {base_stl}")
+
+    # Build all interface faces once
+    interface_faces = compute_layer_interface_faces(tets0=tets0, layer_to_eids=layer_to_eids)
+
+    layer_top_faces: Dict[int, List[Tuple[int,int,int]]] = {}
     layer_top_nodes: Dict[int, List[int]] = {}
-    for li in layer_idxs:
-        nids = layer_to_nids.get(li, [])
-        if not nids:
+
+    for pos, li in enumerate(layer_idxs):
+        # "top of li" is interface with next layer in print order
+        if pos + 1 >= len(layer_idxs):
+            layer_top_faces[li] = []
             layer_top_nodes[li] = []
+            print(f"[TOPDBG] L{li:03d}: last layer -> no top interface")
             continue
-        layer_top_nodes[li] = compute_radial_surface_nodes(
-            pts_world=pts,
-            layer_nids_1based=nids,
-            cx=cx, cz=cz, R0=R0,
-            tol_w=base_tol_w,
-        )
+
+        lj = layer_idxs[pos + 1]
+        faces = interface_faces.get((li, lj), [])
+        layer_top_faces[li] = faces
+        layer_top_nodes[li] = sorted({n + 1 for f in faces for n in f})
+
+        stl_path = os.path.join(debug_dir, f"layer_{li:03d}_top_iface_L{li:03d}_L{lj:03d}.stl")
+        ok = export_triangles_as_stl(stl_path, pts, faces)
+
+        print(f"[TOPDBG] L{li:03d}: iface_with=L{lj:03d} top_faces={len(faces)} top_nodes={len(layer_top_nodes[li])}"
+            + (f" -> {stl_path}" if ok else " -> (empty)"))
+
+
 
     # ------------------------ write inp ------------------------
     time_per_step = 1.0
@@ -604,13 +871,19 @@ def write_calculix_job_tet_layers(
             )
             # Ensure last step always outputs
             # (we decide last step after loop condition; so handle at end too by forcing one more output step if needed)
+            f.write("*EL FILE\n")
+            f.write("S, E\n")
             f.write("*NODE FILE\n")
             if write_outputs:
                 f.write("U\n")
 
-            # BOUNDARY: BASE always frozen; freeze TOP of current support layer only
-            f.write("*BOUNDARY\n")
-            f.write("BASE, 1, 3, 0.\n")
+            # BOUNDARY:
+            # Use OP=NEW to explicitly "unfreeze" anything that was constrained in previous steps.
+            # Then re-apply only what should be constrained in THIS step.
+            f.write("*BOUNDARY, OP=NEW\n")
+            f.write("BASE, 1, 3, 0.\n")  # BASE always fixed
+
+            # freeze TOP of current support layer only (if any)
             if support_pos is not None:
                 sup_li = layer_idxs[support_pos]
                 if layer_top_nodes.get(sup_li):
@@ -648,6 +921,8 @@ def write_calculix_job_tet_layers(
             f.write("*STEP\n")
             f.write("*UNCOUPLED TEMPERATURE-DISPLACEMENT, SOLVER=PASTIX\n")
             f.write(f"{time_per_step:.6f}, {total_time:.6f}\n")
+            f.write("*EL FILE\n")
+            f.write("S, E\n")
             f.write("*NODE FILE\n")
             f.write("U\n")
             f.write("*BOUNDARY\n")
@@ -1275,6 +1550,10 @@ def slice_mesh_plane(
             plane_origin=origin,
             face_index=face_index,
         )
+        # vova = trimesh.Trimesh(vertices=vertices,  faces=faces, process=False)
+        # scene = trimesh.Scene()
+        # scene.add_geometry(trimesh.load_path(vova.vertices[vova.edges_unique]))
+        # scene.show()
         # check if cap arg specified
         if cap:
             if face_index:
@@ -1415,6 +1694,7 @@ def slice_mesh_into_z_slabs_by_height(
 
     prev_slab: trimesh.Trimesh | None = None  # previous slab waiting for its TOP cap
     prev_top_polys = None
+    remaining_mesh = None
 
     for i in range(n_layers):
         a0 = z0 + i * H
@@ -1426,59 +1706,35 @@ def slice_mesh_into_z_slabs_by_height(
         origin1 = mesh.centroid.copy()
         origin1[2] = float(a1)
 
-        # 1) Keep z >= a0, and generate the cap at z=a0 (this is the BOTTOM cap of current slab)
-        if i > 0:
-            m1, _ = slice_mesh_plane(
-                mesh,
-                plane_normal=n_pos,
-                plane_origin=origin0,
-                cap=True,
-                return_cap=True,
-                engine="triangle",
-                triangle_args="pYqa3",
-                # prev_polys=prev_top_polys,
-            )
-            # m1 = trimesh.intersections.slice_mesh_plane(
-            #     mesh,
-            #     plane_normal=n_pos,
-            #     plane_origin=origin0,
-            #     cap=True,
-            #     engine="triangle",
-            # )
-        else:
-            m1 = mesh
+        if remaining_mesh is None:
+            remaining_mesh = mesh
 
-        if m1 is None or len(m1.faces) == 0:
+        slab, polys = slice_mesh_plane(
+            remaining_mesh,
+            plane_normal=n_neg,
+            plane_origin=origin1,
+            cap=True,
+            return_cap=True,
+            engine="triangle",
+            triangle_args="pYqa3",
+        )
+
+        if i == (n_layers - 1):
+            slabs.append(remaining_mesh)
             continue
 
-        # 2) Keep z <= a1. Only the LAST slab needs an actual top cap computed here.
-        is_last = (i == n_layers - 1)
+        remaining_mesh, _ = slice_mesh_plane(
+            remaining_mesh,
+            plane_normal=n_pos,
+            plane_origin=origin1,
+            cap=True,
+            return_cap=True,
+            engine="triangle",
+            triangle_args="pYqa3",
+            prev_polys=polys
+        )
 
-        if (is_last):
-            m2 = m1
-        else:
-            m2, vh_polygons = slice_mesh_plane(
-                m1,
-                plane_normal=n_neg,
-                plane_origin=origin1,
-                cap=True,
-                return_cap=True,
-                engine="triangle",
-                triangle_args="pYqa3",
-            )
-            prev_top_polys = vh_polygons
-            # m2 = trimesh.intersections.slice_mesh_plane(
-            #     m1,
-            #     plane_normal=n_neg,
-            #     plane_origin=origin1,
-            #     cap=True,
-            #     engine="triangle",
-            # )
-
-        if m2 is None or len(m2.faces) == 0:
-            continue
-
-        slabs.append(m2)
+        slabs.append(slab)
         continue
 
         # ---- Reuse logic ----
@@ -1745,6 +2001,7 @@ def merge_tetgen_grids_with_layer_sets(
 
 # Input
 input_mesh = trimesh.load(INPUT_STL)
+# input_mesh = trimesh.load("MODELS/cut-test-2.stl")
 contact_point = find_bottom_contact_point(input_mesh)
 
 vw, fw = pcu.make_mesh_watertight(
@@ -1800,6 +2057,8 @@ repaired_mesh.export(f"{OUTPUT_DIR}/repaired_mesh.stl")
 # Slice
 slabs = slice_mesh_into_z_slabs_by_height(
     repaired_mesh,
+    # trimesh.load("MODELS/cut-test-2.stl"),
+    # trimesh.creation.box(extents=(20, 20, 20)),
     layer_height=LAYER_HEIGHT
 )
 
