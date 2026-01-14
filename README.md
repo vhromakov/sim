@@ -19,7 +19,10 @@ python stl_voxel_to_ccx_job.py MODELS/CSC16_U00P_.stl --out-dir OUTPUT --cube-si
 python TEST.py --input-stl MODELS/CSC16_U00P_.stl --ffd-json-1 OUTPUT/CSC16_U00P__json_lattice2_curved.json --ffd-json-2 OUTPUT/CSC16_U00P__json_lattice3_deformed.json --output-stl FFD.stl
 
 # Tets workflow (NEW) 15 min
-python stl_voxel_to_ccx_job_NO_CUBE.py MODELS/CSC16_U00P_.stl --out-dir OUTPUT --cube-size 0.5 --run-ccx --ccx-cmd "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe" --cyl-radius 199.82
+python stl_voxel_to_ccx_job_NO_CUBE.py MODELS/CSC16_U00P_.stl --out-dir OUTPUT --cube-size 3 --run-ccx --ccx-cmd "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe" --cyl-radius 199.82
+
+# HEX VTK workflow
+python stl_voxel_to_ccx_job_HEX_VTK.py MODELS/CSC16_U00P_.stl --out-dir OUTPUT --cube-size 1 --run-ccx --ccx-cmd "C:/Users/4y5t6/Downloads/PrePoMax v2.4.0/Solver/ccx_dynamic.exe" --cyl-radius 199.82
 
 # Convert to paraview
 python -m ccx2paraview donut_job.frd vtu
