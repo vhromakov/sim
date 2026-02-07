@@ -1,149 +1,220 @@
+#!/usr/bin/env python3
+"""
+Read an input mesh, split it into connected components, make each component
+watertight, then boolean-union all components into a single watertight mesh.
+
+Dependencies:
+    pip install trimesh point-cloud-utils pyvista
+
+Usage:
+    python mesh_heal_and_union.py INPUT.stl OUTPUT.stl
+"""
+
+import argparse
 import numpy as np
 import trimesh
-from trimesh import repair
 import point_cloud_utils as pcu
-import pymesh
+import pyvista as pv
 
 
-# ---------- Helpers ----------
-
-def compute_edge_stats(mesh: trimesh.Trimesh):
-    """Return (num_boundary_edges, num_nonmanifold_edges) for a triangle mesh."""
-    faces = mesh.faces
-
-    e01 = faces[:, [0, 1]]
-    e12 = faces[:, [1, 2]]
-    e20 = faces[:, [2, 0]]
-
-    edges = np.vstack((e01, e12, e20))
-    edges = np.sort(edges, axis=1)
-
-    edges_unique, counts = np.unique(edges, axis=0, return_counts=True)
-
-    num_boundary_edges = int(np.sum(counts == 1))
-    num_nonmanifold_edges = int(np.sum(counts > 2))
-    return num_boundary_edges, num_nonmanifold_edges
+# ----------------- Helpers -----------------
 
 
-def heal_component_trimesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+def make_component_watertight(tm: trimesh.Trimesh,
+                              resolution: int = 50_000) -> trimesh.Trimesh:
     """
-    'Current workflow' healing applied to a single connected component:
-    - remove duplicate/degenerate faces
-    - remove unreferenced verts, merge verts
-    - fix normals
-    - fill holes once
-    (We avoid crazy iterative nonmanifold surgery here, and let PyMesh+boolean
-     handle self-intersections.)
+    Make a single component watertight using point_cloud_utils.make_mesh_watertight.
     """
-    print("  [HEAL] faces(before):", len(mesh.faces), "verts:", len(mesh.vertices))
+    v = np.asarray(tm.vertices, dtype=float)
+    f = np.asarray(tm.faces, dtype=np.int64)
 
-    # Deduplicate faces
-    mesh.update_faces(mesh.unique_faces())
-    # Remove degenerate (zero-area) faces
-    mesh.update_faces(mesh.nondegenerate_faces())
-    mesh.remove_unreferenced_vertices()
-    mesh.merge_vertices()
-    repair.fix_normals(mesh)
+    if len(f) == 0:
+        # Nothing to heal
+        return tm.copy()
 
-    # Fill obvious boundary loops
-    repair.fill_holes(mesh)
-    mesh.remove_unreferenced_vertices()
+    v = np.ascontiguousarray(v)
+    f = np.ascontiguousarray(f)
 
-    nb, nn = compute_edge_stats(mesh)
-    print("  [HEAL] faces(after):", len(mesh.faces), "verts:", len(mesh.vertices))
-    print("  [HEAL] boundary_edges:", nb, "nonmanifold_edges:", nn)
-    print("  [HEAL] trimesh.is_watertight:", mesh.is_watertight)
-
-    return mesh
+    vw, fw = pcu.make_mesh_watertight(v, f, resolution)
+    healed = trimesh.Trimesh(vw, fw, process=False)
+    return healed
 
 
-def trimesh_to_pymesh(mesh: trimesh.Trimesh):
-    """Convert a Trimesh to a PyMesh mesh."""
-    v = np.asarray(mesh.vertices, dtype=np.float64)
-    f = np.asarray(mesh.faces, dtype=np.int64)
-    return pymesh.form_mesh(v, f)
+def trimesh_to_pv(tm: trimesh.Trimesh) -> pv.PolyData:
+    """
+    Convert a trimesh.Trimesh to pyvista.PolyData for boolean operations.
+    """
+    verts = np.asarray(tm.vertices, dtype=float)
+    faces = np.asarray(tm.faces, dtype=np.int64)
+
+    if faces.size == 0:
+        return pv.PolyData(verts)
+
+    n_faces = faces.shape[0]
+    # PyVista: [3, i0, i1, i2, 3, j0, j1, j2, ...]
+    faces_pv = np.hstack(
+        [np.full((n_faces, 1), 3, dtype=np.int64), faces]
+    ).ravel()
+
+    return pv.PolyData(verts, faces_pv)
 
 
-def pymesh_cleanup(mesh):
-    """Basic PyMesh cleanup after boolean."""
-    mesh, _ = pymesh.remove_duplicated_vertices(mesh, tol=1e-12)
-    mesh, _ = pymesh.remove_duplicated_faces(mesh)
-    mesh, _ = pymesh.remove_degenerated_triangles(mesh, 100)
-    mesh, _ = pymesh.remove_isolated_vertices(mesh)
-    mesh = pymesh.resolve_self_intersection(mesh)
-    mesh, _ = pymesh.remove_duplicated_vertices(mesh, tol=1e-12)
-    mesh, _ = pymesh.remove_duplicated_faces(mesh)
-    mesh, _ = pymesh.remove_isolated_vertices(mesh)
-    return mesh
+def pv_to_trimesh(poly: pv.PolyData) -> trimesh.Trimesh:
+    """
+    Convert pyvista.PolyData back to trimesh.Trimesh.
+    """
+    verts = np.asarray(poly.points, dtype=float)
+    faces = np.asarray(poly.faces, dtype=np.int64)
+
+    if faces.size == 0:
+        return trimesh.Trimesh(
+            vertices=verts,
+            faces=np.zeros((0, 3), dtype=np.int64),
+            process=False,
+        )
+
+    faces = faces.reshape(-1, 4)[:, 1:]
+    return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
 
-def pymesh_boolean_union(meshes):
-    """Boolean union of a list of PyMesh meshes."""
-    assert len(meshes) >= 1
-    acc = meshes[0]
-    for i, m in enumerate(meshes[1:], start=1):
-        print(f"[BOOL] Union {i}/{len(meshes)-1} ...")
-        acc = pymesh.boolean(acc, m, operation="union", engine="igl")
-        acc = pymesh_cleanup(acc)
-        print("       -> result verts:", acc.num_vertices, "faces:", acc.num_faces)
-    return acc
+def boolean_union_with_pyvista(meshes: list[trimesh.Trimesh]) -> trimesh.Trimesh:
+    """
+    Boolean-union a list of trimesh meshes using PyVista's boolean_union.
+    """
+    if not meshes:
+        raise ValueError("boolean_union_with_pyvista: no meshes provided")
+
+    print(f"[STEP] Boolean union of {len(meshes)} components with PyVista...")
+
+    pv_union = trimesh_to_pv(meshes[0])
+
+    for i, tm in enumerate(meshes[1:], start=1):
+        pv_m = trimesh_to_pv(tm)
+        print(
+            f"   - Union with component {i}: "
+            f"verts={len(tm.vertices)}, faces={len(tm.faces)}"
+        )
+
+        # boolean_union returns a new PolyData
+        pv_union = pv_union.boolean_union(pv_m, progress_bar=False)
+
+        if pv_union is None or pv_union.n_points == 0:
+            raise RuntimeError(f"PyVista boolean_union failed at step {i}")
+
+    union_tm = pv_to_trimesh(pv_union)
+    union_tm.remove_unreferenced_vertices()
+    return union_tm
 
 
+# ----------------- Main pipeline -----------------
 
-# ---------- MAIN ----------
 
-input_path = "MODELS/CSC16_U00P_.stl"
+def process_mesh(input_path: str,
+                 output_path: str,
+                 watertight_resolution: int = 50_000) -> None:
+    print(f"[INFO] Loading mesh: {input_path}")
 
-mesh = trimesh.load(input_path, process=False)
-if isinstance(mesh, trimesh.Scene):
-    mesh = trimesh.util.concatenate([g for g in mesh.geometry.values()])
+    # Load without processing so we can see original stats
+    mesh = trimesh.load(input_path, process=False)
 
-print("[INFO] Loaded:")
-print("  faces:", len(mesh.faces))
-print("  verts:", len(mesh.vertices))
-print("  watertight:", mesh.is_watertight)
+    if isinstance(mesh, trimesh.Scene):
+        print("[INFO] Input is a Scene, merging geometry into a single mesh...")
+        mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
 
-# Split into connected components BEFORE heavy surgery
-pieces = mesh.split()  # older trimesh versions: just split()
-print("[INFO] Split into", len(pieces), "components")
-
-healed_trimesh_components = []
-pymesh_components = []
-
-for idx, comp in enumerate(pieces):
-    print(f"\n[COMP {idx}] start:")
-    print("  faces:", len(comp.faces), "verts:", len(comp.vertices))
-    comp_healed = heal_component_trimesh(comp)
-    healed_trimesh_components.append(comp_healed)
-
-    pm = trimesh_to_pymesh(comp_healed)
     print(
-        f"  [COMP {idx}] PyMesh form: verts={pm.num_vertices}, faces={pm.num_faces}"
+        f"[INFO] Loaded mesh: "
+        f"verts={len(mesh.vertices)}, faces={len(mesh.faces)}, "
+        f"watertight={mesh.is_watertight}"
     )
-    pymesh_components.append(pm)
 
-if len(pymesh_components) == 0:
-    raise RuntimeError("No components found after split.")
+    # Build a processed version to weld duplicate vertices
+    print("[STEP] Merging duplicate vertices to build connectivity graph...")
+    mesh_proc = trimesh.Trimesh(
+        vertices=mesh.vertices,
+        faces=mesh.faces,
+        process=True,  # welds vertices & builds adjacency
+    )
 
-# Boolean union of all healed components
-print("\n[BOOL] Starting boolean union of all components...")
-union_pm = pymesh_boolean_union(pymesh_components)
-print("[BOOL] Final union:")
-print("  verts:", union_pm.num_vertices, "faces:", union_pm.num_faces)
+    print(
+        f"[INFO] After merge: "
+        f"verts={len(mesh_proc.vertices)}, faces={len(mesh_proc.faces)}, "
+        f"watertight={mesh_proc.is_watertight}"
+    )
 
-# Convert union back to numpy arrays / Trimesh / PCU
-union_v = union_pm.vertices
-union_f = union_pm.faces.astype(np.int64)
+    print("[STEP] Splitting into connected components...")
+    components = mesh_proc.split(only_watertight=False)
+    print(f"[INFO] Found {len(components)} components")
 
-union_trimesh = trimesh.Trimesh(union_v, union_f, process=False)
-nb, nn = compute_edge_stats(union_trimesh)
-print("\n[FINAL UNION STATS]")
-print("  faces:", len(union_trimesh.faces))
-print("  verts:", len(union_trimesh.vertices))
-print("  watertight (trimesh):", union_trimesh.is_watertight)
-print("  boundary edges:", nb)
-print("  nonmanifold edges:", nn)
+    healed_components: list[trimesh.Trimesh] = []
 
-# Export for your slicing/caps pipeline
-union_trimesh.export("WATER_union_components.ply")
-pcu.save_mesh_vf("WATER_union_components_pcuvf.ply", union_v, union_f)
+    for idx, comp in enumerate(components):
+        print(
+            f"[STEP] Component {idx}: "
+            f"verts={len(comp.vertices)}, faces={len(comp.faces)}, "
+            f"watertight={comp.is_watertight}"
+        )
+
+        try:
+            healed = make_component_watertight(
+                comp,
+                resolution=watertight_resolution,
+            )
+            print(
+                f"   -> Healed component {idx}: "
+                f"verts={len(healed.vertices)}, faces={len(healed.faces)}, "
+                f"watertight={healed.is_watertight}"
+            )
+        except Exception as e:
+            print(
+                f"   !! Failed to make component {idx} watertight, "
+                f"using original. Error: {e}"
+            )
+            healed = comp
+
+        healed_components.append(healed)
+
+    if len(healed_components) == 1:
+        print("[STEP] Only one component; skipping boolean union.")
+        union_tm = healed_components[0]
+    else:
+        print("[STEP] Performing boolean union of all healed components...")
+        union_tm = boolean_union_with_pyvista(healed_components)
+
+    union_tm.remove_unreferenced_vertices()
+
+    print(
+        f"[RESULT] Union mesh: "
+        f"verts={len(union_tm.vertices)}, faces={len(union_tm.faces)}, "
+        f"watertight={union_tm.is_watertight}"
+    )
+
+    print(f"[STEP] Exporting union mesh to: {output_path}")
+    union_tm.export(output_path)
+    print("[DONE]")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Split mesh into components, make each watertight, "
+            "and boolean-union them into a single mesh."
+        )
+    )
+    parser.add_argument("input", help="Input mesh file (STL/OBJ/PLY/...)")
+    parser.add_argument("output", help="Output mesh file (STL/OBJ/PLY/...)")
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=50_000,
+        help=(
+            "Resolution for point_cloud_utils.make_mesh_watertight "
+            "(default: 50000)"
+        ),
+    )
+
+    args = parser.parse_args()
+    process_mesh(args.input, args.output, watertight_resolution=args.resolution)
+
+
+if __name__ == "__main__":
+    main()

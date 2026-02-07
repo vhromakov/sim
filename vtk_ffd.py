@@ -22,6 +22,7 @@ def get_random_and_shifted_vertices_from_stl(
     stl_path: str,
     n_vertices: int,
     shift_factor: float,
+    vova: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Load an STL and return:
@@ -72,7 +73,7 @@ def get_random_and_shifted_vertices_from_stl(
     # Bounding-box center of the STL
     bbox_min, bbox_max = mesh.bounds  # each is (3,)
     center = 0.5 * (bbox_min + bbox_max)
-    center_x = center[0]
+    center_z = center[2]
 
     # If requested more than available, use all vertices
     if n_vertices >= num_vertices:
@@ -85,7 +86,10 @@ def get_random_and_shifted_vertices_from_stl(
     shifted_vertices = random_vertices.copy()
 
     # Mask: only shift points in the "left half" (x < center_x)
-    mask = random_vertices[:, 0] < center_x
+    if vova:
+        mask = random_vertices[:, 2] >= center_z
+    else:
+        mask = random_vertices[:, 2] < center_z
     if np.any(mask):
         direction_to_center = center - random_vertices[mask]
         shifted_vertices[mask] = random_vertices[mask] + shift_factor * direction_to_center
@@ -97,6 +101,7 @@ def get_random_and_shifted_vertices_from_stl(
 def deform_stl_with_tps(
     input_stl: str,
     output_stl: str,
+    vova: bool,
 ):
     """
     Use VTK Thin Plate Spline transform to deform an STL:
@@ -107,7 +112,7 @@ def deform_stl_with_tps(
     """
 
     # --- Load control point sets ---
-    pts1, pts2 = get_random_and_shifted_vertices_from_stl(input_stl, 10000, 0.3)
+    pts1, pts2 = get_random_and_shifted_vertices_from_stl(input_stl, 1000, 0.3, vova=vova)
 
     if pts1.shape != pts2.shape:
         raise ValueError(
@@ -168,10 +173,9 @@ def main():
             "two FFD JSON lattices (source → target)."
         )
     )
-    parser.add_argument("--input-stl", required=True, help="Input STL file")
+    parser.add_argument("input_stl", help="Input STL file")
     parser.add_argument(
-        "--output-stl",
-        required=True,
+        "output_stl",
         help="Output deformed STL file",
     )
 
@@ -180,6 +184,13 @@ def main():
     deform_stl_with_tps(
         input_stl=args.input_stl,
         output_stl=args.output_stl,
+        vova=False,
+    )
+
+    deform_stl_with_tps(
+        input_stl=args.output_stl,
+        output_stl=args.output_stl+"_2.stl",
+        vova=True,
     )
 
 

@@ -126,142 +126,142 @@ def param_to_world_cyl(
     return (x, y, z)
 
 
-# def _pick_columns_hex(
-#     available_cols: dict[tuple[int, int], int],  # (ix,iy) -> bottom iz
-#     *,
-#     spacing: int,
-#     snap_radius: int = 0,
-# ) -> list[tuple[int, int]]:
-#     """
-#     Choose (ix,iy) columns on a staggered/hex-like pattern inside the available footprint.
+def _pick_columns_hex(
+    available_cols: dict[tuple[int, int], int],  # (ix,iy) -> bottom iz
+    *,
+    spacing: int,
+    snap_radius: int = 0,
+) -> list[tuple[int, int]]:
+    """
+    Choose (ix,iy) columns on a staggered/hex-like pattern inside the available footprint.
 
-#     spacing: approximate center-to-center spacing in ix direction (in voxel columns)
-#     snap_radius: if a hex node doesn't exist in available_cols, try to snap to a nearby column
-#                  within +-snap_radius (Chebyshev neighborhood), picking the closest by Euclidean.
-#     """
-#     if spacing <= 0:
-#         raise ValueError("spacing must be > 0")
+    spacing: approximate center-to-center spacing in ix direction (in voxel columns)
+    snap_radius: if a hex node doesn't exist in available_cols, try to snap to a nearby column
+                 within +-snap_radius (Chebyshev neighborhood), picking the closest by Euclidean.
+    """
+    if spacing <= 0:
+        raise ValueError("spacing must be > 0")
 
-#     cols = set(available_cols.keys())
-#     if not cols:
-#         return []
+    cols = set(available_cols.keys())
+    if not cols:
+        return []
 
-#     ix_min = min(ix for ix, _ in cols)
-#     ix_max = max(ix for ix, _ in cols)
-#     iy_min = min(iy for _, iy in cols)
-#     iy_max = max(iy for _, iy in cols)
+    ix_min = min(ix for ix, _ in cols)
+    ix_max = max(ix for ix, _ in cols)
+    iy_min = min(iy for _, iy in cols)
+    iy_max = max(iy for _, iy in cols)
 
-#     dx = spacing
-#     # Hex vertical spacing ~ sqrt(3)/2 * dx
-#     dy = max(1, int(round(dx * 0.8660254037844386)))
-#     x_shift = dx // 2
+    dx = spacing
+    # Hex vertical spacing ~ sqrt(3)/2 * dx
+    dy = max(1, int(round(dx * 0.8660254037844386)))
+    x_shift = dx // 2
 
-#     chosen: set[tuple[int, int]] = set()
+    chosen: set[tuple[int, int]] = set()
 
-#     row = 0
-#     for iy in range(iy_min, iy_max + 1, dy):
-#         x0 = ix_min + (x_shift if (row & 1) else 0)
-#         for ix in range(x0, ix_max + 1, dx):
-#             p = (ix, iy)
-#             if p in available_cols:
-#                 chosen.add(p)
-#                 continue
+    row = 0
+    for iy in range(iy_min, iy_max + 1, dy):
+        x0 = ix_min + (x_shift if (row & 1) else 0)
+        for ix in range(x0, ix_max + 1, dx):
+            p = (ix, iy)
+            if p in available_cols:
+                chosen.add(p)
+                continue
 
-#             if snap_radius > 0:
-#                 best = None
-#                 best_d2 = None
-#                 for oy in range(-snap_radius, snap_radius + 1):
-#                     for ox in range(-snap_radius, snap_radius + 1):
-#                         q = (ix + ox, iy + oy)
-#                         if q not in available_cols:
-#                             continue
-#                         d2 = ox * ox + oy * oy
-#                         if best is None or d2 < best_d2:
-#                             best, best_d2 = q, d2
-#                 if best is not None:
-#                     chosen.add(best)
+            if snap_radius > 0:
+                best = None
+                best_d2 = None
+                for oy in range(-snap_radius, snap_radius + 1):
+                    for ox in range(-snap_radius, snap_radius + 1):
+                        q = (ix + ox, iy + oy)
+                        if q not in available_cols:
+                            continue
+                        d2 = ox * ox + oy * oy
+                        if best is None or d2 < best_d2:
+                            best, best_d2 = q, d2
+                if best is not None:
+                    chosen.add(best)
 
-#         row += 1
+        row += 1
 
-#     return sorted(chosen)
+    return sorted(chosen)
 
 
-# def add_pillars_and_base(
-#     indices: np.ndarray,
-#     *,
-#     pillar_layers: int,
-#     grid: str = "square",   # "square" or "hex"
-#     spacing: int = 4,
-#     snap_radius: int = 0,   # used for grid="hex"
-#     down_dir: int = +1,     # in your setup: DOWN = iz+1
-#     add_base: bool = True,
-#     base_pad: int = 1,
-# ) -> np.ndarray:
-#     """
-#     Adds pillars going DOWN from bottom and a 1-layer base plate.
+def add_pillars_and_base(
+    indices: np.ndarray,
+    *,
+    pillar_layers: int,
+    grid: str = "square",   # "square" or "hex"
+    spacing: int = 4,
+    snap_radius: int = 0,   # used for grid="hex"
+    down_dir: int = +1,     # in your setup: DOWN = iz+1
+    add_base: bool = True,
+    base_pad: int = 1,
+) -> np.ndarray:
+    """
+    Adds pillars going DOWN from bottom and a 1-layer base plate.
 
-#     - Pillars: all end at same iz_target; shortest pillar length = pillar_layers.
-#     - grid="hex": place pillars on a staggered/hex-like pattern.
-#     """
-#     idx = indices.astype(np.int64, copy=False)
-#     occ = set(map(tuple, idx.tolist()))
+    - Pillars: all end at same iz_target; shortest pillar length = pillar_layers.
+    - grid="hex": place pillars on a staggered/hex-like pattern.
+    """
+    idx = indices.astype(np.int64, copy=False)
+    occ = set(map(tuple, idx.tolist()))
 
-#     if pillar_layers <= 0 or not occ:
-#         return idx
+    if pillar_layers <= 0 or not occ:
+        return idx
 
-#     # --- bottom voxel per (ix,iy) column ---
-#     col_bottom: dict[tuple[int, int], int] = {}
-#     for (ix, iy, iz) in occ:
-#         k = (ix, iy)
-#         prev = col_bottom.get(k)
-#         if prev is None:
-#             col_bottom[k] = iz
-#         else:
-#             # down_dir=+1 => bottommost is MAX iz; down_dir=-1 => bottommost is MIN iz
-#             col_bottom[k] = max(prev, iz) if down_dir == +1 else min(prev, iz)
+    # --- bottom voxel per (ix,iy) column ---
+    col_bottom: dict[tuple[int, int], int] = {}
+    for (ix, iy, iz) in occ:
+        k = (ix, iy)
+        prev = col_bottom.get(k)
+        if prev is None:
+            col_bottom[k] = iz
+        else:
+            # down_dir=+1 => bottommost is MAX iz; down_dir=-1 => bottommost is MIN iz
+            col_bottom[k] = max(prev, iz) if down_dir == +1 else min(prev, iz)
 
-#     # --- choose which columns to support ---
-#     if grid == "square":
-#         chosen_cols = [(ix, iy) for (ix, iy) in col_bottom.keys()
-#                        if (ix % spacing == 0 and iy % spacing == 0)]
-#     elif grid == "hex":
-#         chosen_cols = _pick_columns_hex(col_bottom, spacing=spacing, snap_radius=snap_radius)
-#     else:
-#         raise ValueError(f"Unknown grid={grid!r}")
+    # --- choose which columns to support ---
+    if grid == "square":
+        chosen_cols = [(ix, iy) for (ix, iy) in col_bottom.keys()
+                       if (ix % spacing == 0 and iy % spacing == 0)]
+    elif grid == "hex":
+        chosen_cols = _pick_columns_hex(col_bottom, spacing=spacing, snap_radius=snap_radius)
+    else:
+        raise ValueError(f"Unknown grid={grid!r}")
 
-#     if not chosen_cols:
-#         return idx
+    if not chosen_cols:
+        return idx
 
-#     seeds = [(ix, iy, col_bottom[(ix, iy)]) for (ix, iy) in chosen_cols]
+    seeds = [(ix, iy, col_bottom[(ix, iy)]) for (ix, iy) in chosen_cols]
 
-#     # --- shared target base height ---
-#     seed_iz = np.array([s[2] for s in seeds], dtype=np.int64)
-#     lowest_seed_iz = int(seed_iz.max() if down_dir == +1 else seed_iz.min())
-#     iz_target = lowest_seed_iz + down_dir * pillar_layers
+    # --- shared target base height ---
+    seed_iz = np.array([s[2] for s in seeds], dtype=np.int64)
+    lowest_seed_iz = int(seed_iz.max() if down_dir == +1 else seed_iz.min())
+    iz_target = lowest_seed_iz + down_dir * pillar_layers
 
-#     # --- add pillar voxels down to iz_target ---
-#     for (ix, iy, iz0) in seeds:
-#         iz = iz0 + down_dir
-#         while (iz - iz_target) * down_dir <= 0:
-#             occ.add((ix, iy, int(iz)))
-#             iz += down_dir
+    # --- add pillar voxels down to iz_target ---
+    for (ix, iy, iz0) in seeds:
+        iz = iz0 + down_dir
+        while (iz - iz_target) * down_dir <= 0:
+            occ.add((ix, iy, int(iz)))
+            iz += down_dir
 
-#     # --- add rectangular 1-layer base plate at iz_target ---
-#     if add_base:
-#         ix_all = idx[:, 0]
-#         iy_all = idx[:, 1]
-#         ix_min = int(ix_all.min()) - base_pad
-#         ix_max = int(ix_all.max()) + base_pad
-#         iy_min = int(iy_all.min()) - base_pad
-#         iy_max = int(iy_all.max()) + base_pad
+    # --- add rectangular 1-layer base plate at iz_target ---
+    if add_base:
+        ix_all = idx[:, 0]
+        iy_all = idx[:, 1]
+        ix_min = int(ix_all.min()) - base_pad
+        ix_max = int(ix_all.max()) + base_pad
+        iy_min = int(iy_all.min()) - base_pad
+        iy_max = int(iy_all.max()) + base_pad
 
-#         for ix in range(ix_min, ix_max + 1):
-#             for iy in range(iy_min, iy_max + 1):
-#                 occ.add((ix, iy, iz_target))
+        for ix in range(ix_min, ix_max + 1):
+            for iy in range(iy_min, iy_max + 1):
+                occ.add((ix, iy, iz_target))
 
-#     out = np.array(list(occ), dtype=np.int64)
-#     order = np.lexsort((out[:, 0], out[:, 1], out[:, 2]))
-#     return out[order]
+    out = np.array(list(occ), dtype=np.int64)
+    order = np.lexsort((out[:, 0], out[:, 1], out[:, 2]))
+    return out[order]
 
 
 # ============================================================
@@ -494,16 +494,16 @@ def generate_global_cubic_hex_mesh(
     indices = vox.sparse_indices  # (N,3) with (ix,iy,iz) in param grid
 
     # --- add pillars + base ---
-    # indices = add_pillars_and_base(
-    #     indices,
-    #     pillar_layers=5,     # shortest pillar length
-    #     grid="hex",
-    #     spacing=6,            # bigger => fewer pillars
-    #     snap_radius=1,        # helps keep coverage on irregular footprints
-    #     down_dir=+1,
-    #     add_base=True,
-    #     base_pad=1,
-    # )
+    indices = add_pillars_and_base(
+        indices,
+        pillar_layers=7,     # shortest pillar length
+        grid="hex",
+        spacing=6,            # bigger => fewer pillars
+        snap_radius=1,        # helps keep coverage on irregular footprints
+        down_dir=+1,
+        add_base=True,
+        base_pad=1,
+    )
 
     total_voxels = indices.shape[0]
     log(f"[VOXEL] Total filled voxels (STL cubes): {total_voxels}")

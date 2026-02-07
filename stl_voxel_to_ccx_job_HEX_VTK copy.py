@@ -24,15 +24,10 @@ Pipeline (cylindrical workflow only):
         * <job_name>_lattice_orig.ply  (original lattice nodes)
         * <job_name>_lattice_def.ply   (deformed lattice nodes)
 """
-# VTK (hex grid + locator interpolation)
+
 from vtkmodules.vtkCommonCore import vtkPoints, vtkDoubleArray
 from vtkmodules.vtkCommonDataModel import vtkUnstructuredGrid, vtkGenericCell
-from vtkmodules.vtkCommonDataModel import vtkCellLocator  # fallback if Static isn't available
-try:
-    from vtkmodules.vtkCommonDataModel import vtkStaticCellLocator
-    _HAS_STATIC_LOCATOR = True
-except Exception:
-    _HAS_STATIC_LOCATOR = False
+from vtkmodules.vtkCommonDataModel import vtkStaticCellLocator
 
 import numpy as np
 
@@ -51,6 +46,13 @@ import os
 import json
 import numpy as np
 
+import os
+import json
+import numpy as np
+
+import os
+import re
+from typing import Dict, Tuple, Optional, List
 
 def log(msg):
     now = datetime.now().strftime("%H:%M:%S")
@@ -124,10 +126,594 @@ def param_to_world_cyl(
     return (x, y, z)
 
 
+# def _pick_columns_hex(
+#     available_cols: dict[tuple[int, int], int],  # (ix,iy) -> bottom iz
+#     *,
+#     spacing: int,
+#     snap_radius: int = 0,
+# ) -> list[tuple[int, int]]:
+#     """
+#     Choose (ix,iy) columns on a staggered/hex-like pattern inside the available footprint.
+
+#     spacing: approximate center-to-center spacing in ix direction (in voxel columns)
+#     snap_radius: if a hex node doesn't exist in available_cols, try to snap to a nearby column
+#                  within +-snap_radius (Chebyshev neighborhood), picking the closest by Euclidean.
+#     """
+#     if spacing <= 0:
+#         raise ValueError("spacing must be > 0")
+
+#     cols = set(available_cols.keys())
+#     if not cols:
+#         return []
+
+#     ix_min = min(ix for ix, _ in cols)
+#     ix_max = max(ix for ix, _ in cols)
+#     iy_min = min(iy for _, iy in cols)
+#     iy_max = max(iy for _, iy in cols)
+
+#     dx = spacing
+#     # Hex vertical spacing ~ sqrt(3)/2 * dx
+#     dy = max(1, int(round(dx * 0.8660254037844386)))
+#     x_shift = dx // 2
+
+#     chosen: set[tuple[int, int]] = set()
+
+#     row = 0
+#     for iy in range(iy_min, iy_max + 1, dy):
+#         x0 = ix_min + (x_shift if (row & 1) else 0)
+#         for ix in range(x0, ix_max + 1, dx):
+#             p = (ix, iy)
+#             if p in available_cols:
+#                 chosen.add(p)
+#                 continue
+
+#             if snap_radius > 0:
+#                 best = None
+#                 best_d2 = None
+#                 for oy in range(-snap_radius, snap_radius + 1):
+#                     for ox in range(-snap_radius, snap_radius + 1):
+#                         q = (ix + ox, iy + oy)
+#                         if q not in available_cols:
+#                             continue
+#                         d2 = ox * ox + oy * oy
+#                         if best is None or d2 < best_d2:
+#                             best, best_d2 = q, d2
+#                 if best is not None:
+#                     chosen.add(best)
+
+#         row += 1
+
+#     return sorted(chosen)
+
+
+# def add_pillars_and_base(
+#     indices: np.ndarray,
+#     *,
+#     pillar_layers: int,
+#     grid: str = "square",   # "square" or "hex"
+#     spacing: int = 4,
+#     snap_radius: int = 0,   # used for grid="hex"
+#     down_dir: int = +1,     # in your setup: DOWN = iz+1
+#     add_base: bool = True,
+#     base_pad: int = 1,
+# ) -> np.ndarray:
+#     """
+#     Adds pillars going DOWN from bottom and a 1-layer base plate.
+
+#     - Pillars: all end at same iz_target; shortest pillar length = pillar_layers.
+#     - grid="hex": place pillars on a staggered/hex-like pattern.
+#     """
+#     idx = indices.astype(np.int64, copy=False)
+#     occ = set(map(tuple, idx.tolist()))
+
+#     if pillar_layers <= 0 or not occ:
+#         return idx
+
+#     # --- bottom voxel per (ix,iy) column ---
+#     col_bottom: dict[tuple[int, int], int] = {}
+#     for (ix, iy, iz) in occ:
+#         k = (ix, iy)
+#         prev = col_bottom.get(k)
+#         if prev is None:
+#             col_bottom[k] = iz
+#         else:
+#             # down_dir=+1 => bottommost is MAX iz; down_dir=-1 => bottommost is MIN iz
+#             col_bottom[k] = max(prev, iz) if down_dir == +1 else min(prev, iz)
+
+#     # --- choose which columns to support ---
+#     if grid == "square":
+#         chosen_cols = [(ix, iy) for (ix, iy) in col_bottom.keys()
+#                        if (ix % spacing == 0 and iy % spacing == 0)]
+#     elif grid == "hex":
+#         chosen_cols = _pick_columns_hex(col_bottom, spacing=spacing, snap_radius=snap_radius)
+#     else:
+#         raise ValueError(f"Unknown grid={grid!r}")
+
+#     if not chosen_cols:
+#         return idx
+
+#     seeds = [(ix, iy, col_bottom[(ix, iy)]) for (ix, iy) in chosen_cols]
+
+#     # --- shared target base height ---
+#     seed_iz = np.array([s[2] for s in seeds], dtype=np.int64)
+#     lowest_seed_iz = int(seed_iz.max() if down_dir == +1 else seed_iz.min())
+#     iz_target = lowest_seed_iz + down_dir * pillar_layers
+
+#     # --- add pillar voxels down to iz_target ---
+#     for (ix, iy, iz0) in seeds:
+#         iz = iz0 + down_dir
+#         while (iz - iz_target) * down_dir <= 0:
+#             occ.add((ix, iy, int(iz)))
+#             iz += down_dir
+
+#     # --- add rectangular 1-layer base plate at iz_target ---
+#     if add_base:
+#         ix_all = idx[:, 0]
+#         iy_all = idx[:, 1]
+#         ix_min = int(ix_all.min()) - base_pad
+#         ix_max = int(ix_all.max()) + base_pad
+#         iy_min = int(iy_all.min()) - base_pad
+#         iy_max = int(iy_all.max()) + base_pad
+
+#         for ix in range(ix_min, ix_max + 1):
+#             for iy in range(iy_min, iy_max + 1):
+#                 occ.add((ix, iy, iz_target))
+
+#     out = np.array(list(occ), dtype=np.int64)
+#     order = np.lexsort((out[:, 0], out[:, 1], out[:, 2]))
+#     return out[order]
+
+
 # ============================================================
 #  Voxel mesh -> CalculiX job (cylindrical only, rewritten
 #  around gen_grid.py voxelization pipeline)
 # ============================================================
+
+def snap_boundary_hex_points_to_mesh_surface_xy(
+    *,
+    mesh_param_rot: trimesh.Trimesh,
+    vox: trimesh.voxel.VoxelGrid,
+    filled_voxel_indices: np.ndarray,
+    vertex_index_map: Dict[Tuple[int, int, int], int],
+    vertices_world: List[Tuple[float, float, float]],
+    half: float,
+    v_offset: float,
+    cx_cyl: float,
+    cz_cyl: float,
+    R0: float,
+    max_snap: Optional[float] = None,
+    snap_eps: Optional[float] = None,
+    # --- DEBUG OUTPUTS (optional) ---
+    debug_dir: Optional[str] = None,
+    debug_tag: str = "",
+    debug_max_pairs: int = 200_000,
+    debug_max_boundary_voxels: int = 200_000,
+) -> None:
+    """
+    Move ONLY boundary lattice vertices (hex corner nodes on the *voxelized* surface)
+    onto the original STL surface, *without changing height*.
+
+    (This is the "previous version" you asked to understand: per-boundary-node nearest
+    cross-section polyline at same w, no “cap-local” clipping.)
+
+    How snapping works
+    ------------------
+    Work in rotated cylindrical param coordinates (u, v_rot, w), where w is kept fixed:
+      1) For each boundary lattice node (kx,ky,kz) we compute its param coordinate:
+            (u0, v0, w0) = voxel_center(kx,ky,kz) - (half,half,half)
+      2) Slice the param-space STL mesh with plane w=w0 to get cross-section polylines.
+      3) Find closest point (u1,v1) to (u0,v0) on those polylines.
+      4) Map (u1, v1, w0) back to WORLD using param_to_world_cyl,
+         undoing v_offset: v_unrot = v_rot - v_offset.
+
+    Boundary detection
+    ------------------
+    We do NOT query inside/outside against the STL mesh.
+    A lattice node is considered boundary if any of its 8 incident voxels is missing.
+
+    Clamping
+    --------
+    We skip snapping if the nearest point is farther than max_snap (default 2*cube_size).
+
+    Debug outputs
+    -------------
+    If debug_dir is provided, we output FOUR PLYs:
+
+      (1) Target surface mesh we snap to (WORLD):
+          snap_target_mesh_world{tag}.ply
+          = mesh_param_rot mapped to WORLD via param_to_world_cyl (with v_offset undone)
+
+      (2) Pair lines: original->snapped vertex segments (WORLD):
+          snap_pairs{tag}.ply
+          = two point sets + edges connecting each original to its snapped position
+
+      (3) Boundary hexes wireframe BEFORE snapping (WORLD):
+          boundary_hexes_before{tag}.ply
+          = boundary voxels as cubes (points + edges)
+
+      (4) Boundary hexes wireframe AFTER snapping (WORLD):
+          boundary_hexes_after{tag}.ply
+          = same edges, but with updated vertex positions
+
+    Notes
+    -----
+    - Debug outputs are in the voxelization world frame (before you subtract y_offset later).
+    - Wireframe “boundary hexes” are determined from filled voxel indices:
+        a voxel is boundary if any of its 6 face-neighbors is missing.
+      Each boundary voxel is emitted as a cube wireframe (12 edges).
+    """
+
+    import os
+    import numpy as np
+
+    cube_size = float(2.0 * half)
+    if max_snap is None:
+        max_snap = float(2.0 * cube_size)
+    if snap_eps is None:
+        snap_eps = float(cube_size * 1e-4)
+
+    max_snap2 = float(max_snap * max_snap)
+
+    # Fast voxel occupancy set
+    filled = set(map(tuple, np.asarray(filled_voxel_indices, dtype=int).tolist()))
+
+    # -------------------------
+    # DEBUG: writers
+    # -------------------------
+    def _ensure_dir(p: str) -> str:
+        os.makedirs(p, exist_ok=True)
+        return p
+
+    def _write_ply_points_edges_with_colors(
+        path: str,
+        A_pts: List[Tuple[float, float, float]],
+        B_pts: List[Tuple[float, float, float]],
+    ) -> None:
+        """
+        ASCII PLY with:
+          - vertices: [A0..A(n-1), B0..B(n-1)]
+          - edges: (Ai -> Bi)
+          - per-vertex RGB: A=red, B=green
+        """
+        n = len(A_pts)
+        assert len(B_pts) == n
+        verts = A_pts + B_pts
+        colors = [(255, 0, 0)] * n + [(0, 255, 0)] * n
+        edges = [(i, i + n) for i in range(n)]
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {len(verts)}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write(f"element edge {len(edges)}\n")
+            f.write("property int vertex1\nproperty int vertex2\n")
+            f.write("end_header\n")
+            for (x, y, z), (r, g, b) in zip(verts, colors):
+                f.write(f"{x:.9f} {y:.9f} {z:.9f} {r} {g} {b}\n")
+            for i0, i1 in edges:
+                f.write(f"{i0} {i1}\n")
+
+    def _write_ply_wireframe_compact(
+        path: str,
+        verts_world: List[Tuple[float, float, float]],
+        edges_vid1based: List[Tuple[int, int]],
+    ) -> None:
+        """
+        Write ASCII PLY wireframe (vertices + edges), but *compact*:
+        only vertices referenced by edges are written.
+
+        edges_vid1based: list of (a,b) where a,b are 1-based indices into verts_world.
+        """
+        used = set()
+        for a, b in edges_vid1based:
+            used.add(a)
+            used.add(b)
+        used_list = sorted(used)  # 1-based
+        remap = {vid: i for i, vid in enumerate(used_list)}  # 1-based -> 0-based compact
+
+        verts_out = [verts_world[vid - 1] for vid in used_list]
+        edges_out = [(remap[a], remap[b]) for (a, b) in edges_vid1based]
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {len(verts_out)}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write(f"element edge {len(edges_out)}\n")
+            f.write("property int vertex1\nproperty int vertex2\n")
+            f.write("end_header\n")
+            for (x, y, z) in verts_out:
+                f.write(f"{x:.9f} {y:.9f} {z:.9f}\n")
+            for i0, i1 in edges_out:
+                f.write(f"{i0} {i1}\n")
+
+    # -------------------------
+    # Debug: compute boundary voxel wireframe edges (shared for before/after)
+    # -------------------------
+    boundary_hex_edges_vid1based: List[Tuple[int, int]] = []
+    if debug_dir is not None:
+        # A voxel is boundary if any of its 6 face neighbors is missing
+        def is_boundary_voxel(ix: int, iy: int, iz: int) -> bool:
+            return (
+                (ix - 1, iy, iz) not in filled or (ix + 1, iy, iz) not in filled or
+                (ix, iy - 1, iz) not in filled or (ix, iy + 1, iz) not in filled or
+                (ix, iy, iz - 1) not in filled or (ix, iy, iz + 1) not in filled
+            )
+
+        boundary_voxels = []
+        for (ix, iy, iz) in filled:
+            ix = int(ix); iy = int(iy); iz = int(iz)
+            if is_boundary_voxel(ix, iy, iz):
+                boundary_voxels.append((ix, iy, iz))
+
+        # Downsample boundary voxels if needed
+        if len(boundary_voxels) > int(debug_max_boundary_voxels):
+            stride = int(np.ceil(len(boundary_voxels) / float(debug_max_boundary_voxels)))
+            boundary_voxels = boundary_voxels[::stride]
+            log(f"[VOXEL][SNAPDBG] Downsample boundary voxels for wireframe: stride={stride}")
+
+        # Collect unique edges (dedup by sorted pair of vertex ids)
+        edge_set = set()
+
+        def add_edge(a: int, b: int):
+            if a <= 0 or b <= 0:
+                return
+            if a == b:
+                return
+            key = (a, b) if a < b else (b, a)
+            edge_set.add(key)
+
+        # Cube edges in terms of the 8 corners
+        cube_edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),   # bottom loop
+            (4, 5), (5, 6), (6, 7), (7, 4),   # top loop
+            (0, 4), (1, 5), (2, 6), (3, 7),   # verticals
+        ]
+
+        for (ix, iy, iz) in boundary_voxels:
+            keys = [
+                (ix,   iy,   iz),
+                (ix+1, iy,   iz),
+                (ix+1, iy+1, iz),
+                (ix,   iy+1, iz),
+                (ix,   iy,   iz+1),
+                (ix+1, iy,   iz+1),
+                (ix+1, iy+1, iz+1),
+                (ix,   iy+1, iz+1),
+            ]
+            vids = []
+            ok = True
+            for k in keys:
+                vid = vertex_index_map.get(k)
+                if vid is None:
+                    ok = False
+                    break
+                vids.append(int(vid))
+            if not ok:
+                continue
+
+            for a_i, b_i in cube_edges:
+                add_edge(vids[a_i], vids[b_i])
+
+        boundary_hex_edges_vid1based = list(edge_set)
+
+    # If debug enabled, store "before" vertex positions for boundary wireframe output
+    vertices_world_before = list(vertices_world) if (debug_dir is not None) else None
+
+    # -------------------------
+    # Boundary-node detection (node interior iff all 8 incident voxels exist)
+    # -------------------------
+    def is_boundary_node(kx: int, ky: int, kz: int) -> bool:
+        for dx in (0, -1):
+            for dy in (0, -1):
+                for dz in (0, -1):
+                    if (kx + dx, ky + dy, kz + dz) not in filled:
+                        return True
+        return False
+
+    # Section cache (per w): A (S,2), AB (S,2), L2 (S,)
+    section_cache: Dict[float, Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+
+    def w_key(w: float) -> float:
+        return float(round(float(w), 8))
+
+    def build_section_segments_uv(w: float) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        def try_section(w_try: float):
+            try:
+                sec = mesh_param_rot.section(
+                    plane_origin=(0.0, 0.0, float(w_try)),
+                    plane_normal=(0.0, 0.0, 1.0),
+                )
+            except Exception:
+                return None
+            if sec is None:
+                return None
+            polys3 = sec.discrete
+            if polys3 is None or len(polys3) == 0:
+                return None
+
+            A_list, AB_list, L2_list = [], [], []
+            for poly3 in polys3:
+                if poly3 is None or len(poly3) < 2:
+                    continue
+                poly2 = np.asarray(poly3, dtype=np.float64)[:, :2]
+                if poly2.shape[0] < 2:
+                    continue
+
+                A = poly2[:-1]
+                B = poly2[1:]
+                AB = B - A
+                L2 = np.einsum("ij,ij->i", AB, AB)
+                m = L2 > 1e-24
+                if np.any(m):
+                    A_list.append(A[m])
+                    AB_list.append(AB[m])
+                    L2_list.append(L2[m])
+
+            if not A_list:
+                return None
+
+            return (
+                np.concatenate(A_list, axis=0),
+                np.concatenate(AB_list, axis=0),
+                np.concatenate(L2_list, axis=0),
+            )
+
+        out = try_section(w)
+        if out is not None:
+            return out
+        out = try_section(w + snap_eps)
+        if out is not None:
+            return out
+        return try_section(w - snap_eps)
+
+    def closest_point_on_segments(
+        q_uv: np.ndarray,
+        A: np.ndarray,
+        AB: np.ndarray,
+        L2: np.ndarray,
+    ) -> Tuple[np.ndarray, float]:
+        AQ = q_uv[None, :] - A
+        t = np.einsum("ij,ij->i", AQ, AB) / L2
+        t = np.clip(t, 0.0, 1.0)
+        proj = A + AB * t[:, None]
+        d2 = np.einsum("ij,ij->i", proj - q_uv, proj - q_uv)
+        k = int(np.argmin(d2))
+        return proj[k], float(d2[k])
+
+    # -------------------------
+    # Main snapping loop
+    # -------------------------
+    moved = 0
+    skipped_no_section = 0
+    skipped_too_far = 0
+
+    # For debug PLY: original and snapped positions (world)
+    dbg_orig_world: List[Tuple[float, float, float]] = []
+    dbg_snap_world: List[Tuple[float, float, float]] = []
+
+    for (kx, ky, kz), vid_1based in vertex_index_map.items():
+        kx = int(kx); ky = int(ky); kz = int(kz)
+        vid_1based = int(vid_1based)
+
+        if not is_boundary_node(kx, ky, kz):
+            continue
+
+        # Reconstruct param coordinate (rotated frame) for this lattice node.
+        center = vox.indices_to_points(np.array([[kx, ky, kz]], dtype=float))[0]
+        u0 = float(center[0] - half)
+        v0 = float(center[1] - half)  # rotated v
+        w0 = float(center[2] - half)
+
+        wk = w_key(w0)
+        if wk not in section_cache:
+            section_cache[wk] = build_section_segments_uv(w0)
+        segs = section_cache[wk]
+        if segs is None:
+            skipped_no_section += 1
+            continue
+
+        A, AB, L2 = segs
+        uv_closest, d2 = closest_point_on_segments(
+            np.array([u0, v0], dtype=np.float64),
+            A, AB, L2,
+        )
+        if d2 > max_snap2:
+            skipped_too_far += 1
+            continue
+
+        u1 = float(uv_closest[0])
+        v1 = float(uv_closest[1])
+
+        old_world = vertices_world[vid_1based - 1]
+
+        # Map snapped param -> world (undo v_offset)
+        p_world = (u1, v1 - float(v_offset), w0)
+        x, y, z = param_to_world_cyl(p_world, float(cx_cyl), float(cz_cyl), float(R0))
+        new_world = (float(x), float(y), float(z))
+
+        vertices_world[vid_1based - 1] = new_world
+        moved += 1
+
+        if debug_dir is not None:
+            dbg_orig_world.append(old_world)
+            dbg_snap_world.append(new_world)
+
+    log(
+        "[VOXEL] Boundary snap done: "
+        f"moved={moved}, skipped_no_section={skipped_no_section}, "
+        f"skipped_too_far={skipped_too_far}, max_snap={max_snap:.6f}"
+    )
+
+    # -------------------------
+    # DEBUG OUTPUTS
+    # -------------------------
+    if debug_dir is None:
+        return
+
+    debug_dir = _ensure_dir(debug_dir)
+    tag = f"_{debug_tag}" if debug_tag else ""
+
+    # (1) Target mesh we snap to: mesh_param_rot mapped back to WORLD
+    try:
+        m = mesh_param_rot.copy()
+        v = np.asarray(m.vertices, dtype=np.float64)
+        vv = np.empty_like(v)
+        for i in range(v.shape[0]):
+            u = float(v[i, 0])
+            vrot = float(v[i, 1])
+            w = float(v[i, 2])
+            x, y, z = param_to_world_cyl((u, vrot - float(v_offset), w), float(cx_cyl), float(cz_cyl), float(R0))
+            vv[i] = (x, y, z)
+        m.vertices = vv
+        target_mesh_path = os.path.join(debug_dir, f"snap_target_mesh_world{tag}.ply")
+        m.export(target_mesh_path)
+        log(f"[VOXEL][SNAPDBG] Wrote target surface mesh: {target_mesh_path}")
+    except Exception as e:
+        log(f"[VOXEL][SNAPDBG] Failed to write target mesh: {e}")
+
+    # (2) Pairs PLY: original->snapped segments
+    try:
+        n = len(dbg_orig_world)
+        if n == 0:
+            log("[VOXEL][SNAPDBG] No moved points; not writing snap_pairs PLY.")
+        else:
+            if n > int(debug_max_pairs):
+                stride = int(np.ceil(n / float(debug_max_pairs)))
+                dbg_orig_world = dbg_orig_world[::stride]
+                dbg_snap_world = dbg_snap_world[::stride]
+                log(f"[VOXEL][SNAPDBG] Downsample snap pairs: {n} -> {len(dbg_orig_world)} (stride={stride})")
+
+            pairs_path = os.path.join(debug_dir, f"snap_pairs{tag}.ply")
+            _write_ply_points_edges_with_colors(pairs_path, dbg_orig_world, dbg_snap_world)
+            log(f"[VOXEL][SNAPDBG] Wrote snap pairs PLY: {pairs_path}")
+    except Exception as e:
+        log(f"[VOXEL][SNAPDBG] Failed to write snap_pairs PLY: {e}")
+
+    # (3) Boundary hexes BEFORE snapping
+    try:
+        if vertices_world_before is not None and boundary_hex_edges_vid1based:
+            out_path = os.path.join(debug_dir, f"boundary_hexes_before{tag}.ply")
+            _write_ply_wireframe_compact(out_path, vertices_world_before, boundary_hex_edges_vid1based)
+            log(f"[VOXEL][SNAPDBG] Wrote boundary hex wireframe BEFORE snap: {out_path}")
+        else:
+            log("[VOXEL][SNAPDBG] No boundary hex edges (or no 'before' vertices); skipping boundary_hexes_before.")
+    except Exception as e:
+        log(f"[VOXEL][SNAPDBG] Failed to write boundary_hexes_before: {e}")
+
+    # (4) Boundary hexes AFTER snapping
+    try:
+        if boundary_hex_edges_vid1based:
+            out_path = os.path.join(debug_dir, f"boundary_hexes_after{tag}.ply")
+            _write_ply_wireframe_compact(out_path, vertices_world, boundary_hex_edges_vid1based)
+            log(f"[VOXEL][SNAPDBG] Wrote boundary hex wireframe AFTER snap: {out_path}")
+        else:
+            log("[VOXEL][SNAPDBG] No boundary hex edges; skipping boundary_hexes_after.")
+    except Exception as e:
+        log(f"[VOXEL][SNAPDBG] Failed to write boundary_hexes_after: {e}")
+
 
 def generate_global_cubic_hex_mesh(
     input_stl: str,
@@ -149,6 +735,12 @@ def generate_global_cubic_hex_mesh(
           inward_offset = sagitta so that midpoint of a 1-voxel chord lies on R0.
     - We rotate the mesh in param space so that the lowest point ends up at angle 0
       (v=0), then undo this rotation when mapping voxels back to world.
+
+    PATCH (new helper call):
+      After we build the hex lattice, we "snap" ONLY boundary lattice vertices
+      (vertices that lie on the boundary of the voxelized solid) onto the original
+      STL surface, *but only in the cylindrical XY plane* (u-v plane in param space),
+      keeping w fixed (no up/down motion).
     """
 
     mesh = trimesh.load(input_stl)
@@ -338,41 +930,6 @@ def generate_global_cubic_hex_mesh(
 
     mesh.vertices = verts_param
 
-    # ----------------------------------------------------------
-    # Create bounding-box mesh of the transformed STL in param space
-    # ----------------------------------------------------------
-    bounds_param = mesh.bounds  # [[xmin, ymin, zmin], [xmax, ymax, zmax]]
-    min_x, min_y, min_w = bounds_param[0]
-    max_x, max_y, max_w = bounds_param[1]
-
-    bbox_corners = np.array([
-        [min_x, min_y, min_w],
-        [max_x, min_y, min_w],
-        [max_x, max_y, min_w],
-        [min_x, max_y, min_w],
-        [min_x, min_y, max_w],
-        [max_x, min_y, max_w],
-        [max_x, max_y, max_w],
-        [min_x, max_y, max_w],
-    ])
-
-    bbox_faces = np.array([
-        [0, 1, 2], [0, 2, 3],  # bottom
-        [4, 5, 6], [4, 6, 7],  # top
-        [0, 1, 5], [0, 5, 4],  # side
-        [1, 2, 6], [1, 6, 5],  # side
-        [2, 3, 7], [2, 7, 6],  # side
-        [3, 0, 4], [3, 4, 7],  # side
-    ])
-
-    bbox_mesh_param = trimesh.Trimesh(
-        vertices=bbox_corners,
-        faces=bbox_faces,
-        process=False
-    )
-
-    log(f"[VOXEL] Created param-space bounding box mesh: {bbox_mesh_param.bounds}")
-
     # --- Tangential (v) extents of the STL in param space -------------
     v_min_mesh = float(verts_param[:, 1].min())
     v_max_mesh = float(verts_param[:, 1].max())
@@ -387,22 +944,12 @@ def generate_global_cubic_hex_mesh(
     vox.fill()
 
     indices = vox.sparse_indices  # (N,3) with (ix,iy,iz) in param grid
+
     total_voxels = indices.shape[0]
     log(f"[VOXEL] Total filled voxels (STL cubes): {total_voxels}")
 
     order = np.lexsort((indices[:, 0], indices[:, 1], indices[:, 2]))
     indices_sorted = indices[order]
-
-    # --- Voxelization in param coordinates (BBOX) ---
-    log(f"[VOXEL] Voxelizing bounding-box with cube size = {cube_size} ...")
-    vox_bbox = bbox_mesh_param.voxelized(pitch=cube_size)
-    vox_bbox.fill()
-
-    indices_bbox = vox_bbox.sparse_indices
-    log(f"[VOXEL] Total filled bbox voxels: {indices_bbox.shape[0]}")
-
-    order_bbox = np.lexsort((indices_bbox[:, 0], indices_bbox[:, 1], indices_bbox[:, 2]))
-    indices_bbox_sorted = indices_bbox[order_bbox]
 
     # --- Map iz -> slice "position" in param space: w_center (STL) ---
     unique_iz = np.unique(indices_sorted[:, 2])
@@ -421,23 +968,6 @@ def generate_global_cubic_hex_mesh(
         iz_to_slice[int(iz)] = slice_idx
         z_slices.append(pos)
 
-    # --- Map iz -> slice "position" in param space: w_center (BBOX) ---
-    unique_iz_bbox = np.unique(indices_bbox_sorted[:, 2])
-    layer_info_bbox: List[Tuple[int, float]] = []
-    for iz in unique_iz_bbox:
-        idx_arr = np.array([[0, 0, iz]], dtype=float)
-        pt = vox_bbox.indices_to_points(idx_arr)[0]
-        slice_coord = float(pt[2])
-        layer_info_bbox.append((int(iz), slice_coord))
-
-    layer_info_bbox.sort(key=lambda x: x[1], reverse=True)
-
-    iz_to_slice_bbox: Dict[int, int] = {}
-    z_slices_bbox: List[float] = []
-    for slice_idx, (iz, pos) in enumerate(layer_info_bbox):
-        iz_to_slice_bbox[int(iz)] = slice_idx
-        z_slices_bbox.append(pos)
-
     # --- Prepare lattice structures (STL) ---
     vertex_index_map: Dict[Tuple[int, int, int], int] = {}
     vertices: List[Tuple[float, float, float]] = []
@@ -453,25 +983,6 @@ def generate_global_cubic_hex_mesh(
         idx = len(vertices) + 1
         vertex_index_map[key] = idx
         vertices.append(coord)
-        return idx
-
-    # --- Prepare lattice structures (BBOX) ---
-    vertex_index_map_bbox: Dict[Tuple[int, int, int], int] = {}
-    vertices_bbox: List[Tuple[float, float, float]] = []
-    hexes_bbox: List[Tuple[int, int, int, int, int, int, int, int]] = []
-    slice_to_eids_bbox: Dict[int, List[int]] = {
-        i: [] for i in range(len(z_slices_bbox))
-    }
-
-    def get_vertex_index_bbox(
-        key: Tuple[int, int, int],
-        coord: Tuple[float, float, float],
-    ) -> int:
-        if key in vertex_index_map_bbox:
-            return vertex_index_map_bbox[key]
-        idx = len(vertices_bbox) + 1
-        vertex_index_map_bbox[key] = idx
-        vertices_bbox.append(coord)
         return idx
 
     # --- Build voxel-node lattice & hex connectivity (STL) ---
@@ -524,55 +1035,23 @@ def generate_global_cubic_hex_mesh(
         slice_idx = iz_to_slice[int(iz)]
         slice_to_eids[slice_idx].append(eid)
 
-    # --- Build voxel-node lattice & hex connectivity (BBOX) ---
-    log("[VOXEL] Building voxel-node lattice (curved hexa nodes) for BBOX ...")
-
-    for (ix, iy, iz) in indices_bbox_sorted:
-        center_param = vox_bbox.indices_to_points(
-            np.array([[ix, iy, iz]], dtype=float)
-        )[0]
-        u_c, v_c, w_c = center_param
-
-        # Undo the tangential rotation before mapping back to world
-        v_c -= v_offset
-
-        u0, u1 = u_c - half, u_c + half
-        v0, v1 = v_c - half, v_c + half
-        w0, w1 = w_c - half, w_c + half
-
-        p0 = (u0, v0, w0)
-        p1 = (u1, v0, w0)
-        p2 = (u1, v1, w0)
-        p3 = (u0, v1, w0)
-        p4 = (u0, v0, w1)
-        p5 = (u1, v0, w1)
-        p6 = (u1, v1, w1)
-        p7 = (u0, v1, w1)
-
-        x0, y0, z0 = param_to_world_cyl(p0, cx_cyl, cz_cyl, R0)
-        x1, y1, z1 = param_to_world_cyl(p1, cx_cyl, cz_cyl, R0)
-        x2, y2, z2 = param_to_world_cyl(p2, cx_cyl, cz_cyl, R0)
-        x3, y3, z3 = param_to_world_cyl(p3, cx_cyl, cz_cyl, R0)
-        x4, y4, z4 = param_to_world_cyl(p4, cx_cyl, cz_cyl, R0)
-        x5, y5, z5 = param_to_world_cyl(p5, cx_cyl, cz_cyl, R0)
-        x6, y6, z6 = param_to_world_cyl(p6, cx_cyl, cz_cyl, R0)
-        x7, y7, z7 = param_to_world_cyl(p7, cx_cyl, cz_cyl, R0)
-
-        v0_idx = get_vertex_index_bbox((ix,   iy,   iz),   (x0, y0, z0))
-        v1_idx = get_vertex_index_bbox((ix+1, iy,   iz),   (x1, y1, z1))
-        v2_idx = get_vertex_index_bbox((ix+1, iy+1, iz),   (x2, y2, z2))
-        v3_idx = get_vertex_index_bbox((ix,   iy+1, iz),   (x3, y3, z3))
-        v4_idx = get_vertex_index_bbox((ix,   iy,   iz+1), (x4, y4, z4))
-        v5_idx = get_vertex_index_bbox((ix+1, iy,   iz+1), (x5, y5, z5))
-        v6_idx = get_vertex_index_bbox((ix+1, iy+1, iz+1), (x6, y6, z6))
-        v7_idx = get_vertex_index_bbox((ix,   iy+1, iz+1), (x7, y7, z7))
-
-        hexes_bbox.append((v0_idx, v1_idx, v2_idx, v3_idx,
-                           v4_idx, v5_idx, v6_idx, v7_idx))
-
-        eid = len(hexes_bbox)
-        slice_idx = iz_to_slice_bbox[int(iz)]
-        slice_to_eids_bbox[slice_idx].append(eid)
+    # --- NEW: snap boundary lattice nodes to STL surface (in param XY, w fixed) ---
+    snap_boundary_hex_points_to_mesh_surface_xy(
+        mesh_param_rot=mesh,            # param-rot mesh
+        vox=vox,
+        filled_voxel_indices=indices_sorted,
+        vertex_index_map=vertex_index_map,
+        vertices_world=vertices,
+        half=half,
+        v_offset=v_offset,
+        cx_cyl=cx_cyl,
+        cz_cyl=cz_cyl,
+        R0=R0,
+        max_snap=2.0 * cube_size,
+        snap_eps=cube_size * 1e-4,
+        debug_dir=f"./OUTPUT/debug_snap",
+        debug_tag="stl",                # optional label in filenames
+    )
 
     # Store cylindrical parameters + v_offset + y_offset
     cyl_params = (cx_cyl, cz_cyl, R0, v_offset, y_offset)
@@ -581,14 +1060,9 @@ def generate_global_cubic_hex_mesh(
         f"[VOXEL] Built STL mesh (voxelization frame): {len(vertices)} nodes, "
         f"{len(hexes)} hex elements, {len(z_slices)} radial slices."
     )
-    log(
-        f"[VOXEL] Built BBOX mesh (voxelization frame): {len(vertices_bbox)} nodes, "
-        f"{len(hexes_bbox)} hex elements, {len(z_slices_bbox)} radial slices."
-    )
 
     # --- Undo Y-shift for returned data so voxels sit back where STL was ---
     vertices = [(x, y - y_offset, z) for (x, y, z) in vertices]
-    vertices_bbox = [(x, y - y_offset, z) for (x, y, z) in vertices_bbox]
 
     if lowest_point_world is not None:
         lx, ly, lz = lowest_point_world
@@ -611,17 +1085,6 @@ def generate_global_cubic_hex_mesh(
         "(original STL frame)"
     )
 
-    indices_bbox_sorted = indices_bbox_sorted[:, [1, 0, 2]]
-    # indices_bbox_sorted = indices_bbox_sorted[::-1]
-    vertex_index_map_bbox = {
-        (iy, ix, iz): idx
-        for (ix, iy, iz), idx in vertex_index_map_bbox.items()
-    }
-    # vertex_index_map_bbox = {
-    #     k: vertex_index_map_bbox[k]
-    #     for k in reversed(list(vertex_index_map_bbox.keys()))
-    # }
-
     return (
         # STL mesh results
         vertices,
@@ -635,15 +1098,6 @@ def generate_global_cubic_hex_mesh(
         edge_right_world,
         indices_sorted,      # for STL debug export
         vox,                 # for STL debug export
-
-        # BBOX mesh results
-        vertices_bbox,
-        hexes_bbox,
-        slice_to_eids_bbox,
-        z_slices_bbox,
-        indices_bbox_sorted, # for BBOX debug export
-        vox_bbox,            # for BBOX debug export
-        vertex_index_map_bbox,
     )
 
 
@@ -976,15 +1430,6 @@ def run_calculix(job_name: str, ccx_cmd: str = "ccx"):
 
     return rc == 0
 
-
-import os
-import json
-import numpy as np
-
-import os
-import re
-from typing import Dict, Tuple, Optional, List
-
 _FLOAT_RE = re.compile(r'[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[Ee][+-]?\d+)?')
 
 def read_ccx_frd_last_displacements(
@@ -1134,8 +1579,6 @@ def deform_stl_with_hex_displacements_vtk(
     input_stl: str,
     output_stl: str,
     grid: vtkUnstructuredGrid,
-    use_closest_fallback: bool = True,
-    locator_tol2: float = 1e-12,
 ):
     """
     For each STL vertex:
@@ -1152,10 +1595,7 @@ def deform_stl_with_hex_displacements_vtk(
     nV = V.shape[0]
 
     # locator
-    if _HAS_STATIC_LOCATOR:
-        locator = vtkStaticCellLocator()
-    else:
-        locator = vtkCellLocator()
+    locator = vtkStaticCellLocator()
     locator.SetDataSet(grid)
     locator.BuildLocator()
 
@@ -1166,8 +1606,6 @@ def deform_stl_with_hex_displacements_vtk(
     generic = vtkGenericCell()
 
     out = V.copy()
-    misses = 0
-    used_closest = 0
 
     # reusable buffers
     pcoords = [0.0, 0.0, 0.0]
@@ -1177,7 +1615,7 @@ def deform_stl_with_hex_displacements_vtk(
         x = [float(V[i, 0]), float(V[i, 1]), float(V[i, 2])]
 
         # FindCell returns cellId or -1
-        cell_id = locator.FindCell(x, locator_tol2, generic, pcoords, weights)
+        cell_id = locator.FindCell(x, 0, generic, pcoords, weights)
 
         if cell_id >= 0:
             # interpolate from the found cell using weights
@@ -1191,65 +1629,14 @@ def deform_stl_with_hex_displacements_vtk(
                 du[2] += weights[k] * uz
             out[i, :] += du
             continue
-
-        # outside
-        misses += 1
-        if not use_closest_fallback:
-            continue
-
-        # closest-point fallback:
-        # - find closest point + owning cell
-        closest = [0.0, 0.0, 0.0]
-        cell_id_ref = vtkmodules.vtkCommonCore.reference(0)  # may fail depending on VTK build
-        sub_id_ref = vtkmodules.vtkCommonCore.reference(0)
-        dist2_ref = vtkmodules.vtkCommonCore.reference(0.0)
-
-        # If reference() is not available in your VTK build, use a simpler approach:
-        #   - skip the closest fallback OR
-        #   - use grid.FindCell() route.
-        #
-        # We'll implement a robust fallback without reference() by using FindClosestPoint signature
-        # that returns values via mutable containers, if available.
-        try:
-            cell_id_holder = [0]
-            sub_id_holder = [0]
-            dist2_holder = [0.0]
-            locator.FindClosestPoint(x, closest, cell_id_holder, sub_id_holder, dist2_holder)
-            cid = int(cell_id_holder[0])
-        except Exception:
-            # If VTK binding signature differs, just leave vertex unchanged
-            continue
-
-        if cid < 0:
-            continue
-
-        used_closest += 1
-
-        # get the cell and compute weights at closest point
-        grid.GetCell(cid, generic)
-        cp = closest
-        closest_point = [0.0, 0.0, 0.0]
-        sub_id = 0
-        dist2 = 0.0
-        weights2 = [0.0] * 8
-        ok = generic.EvaluatePosition(cp, closest_point, sub_id, pcoords, dist2, weights2)
-
-        pid_list = generic.GetPointIds()
-        du = np.zeros(3, dtype=np.float64)
-        for k in range(8):
-            pid = pid_list.GetId(k)
-            ux, uy, uz = u_arr.GetTuple3(pid)
-            du[0] += weights2[k] * ux
-            du[1] += weights2[k] * uy
-            du[2] += weights2[k] * uz
-
-        out[i, :] += du
+        else:
+            raise RuntimeError("Couldn't find cell for point")
 
     mesh.vertices = out
     mesh.export(output_stl)
 
     log(f"[VTK] Deformed STL written: {output_stl}")
-    log(f"[VTK] Vertices: {nV}, misses: {misses}, used_closest: {used_closest}")
+    log(f"[VTK] Vertices: {nV}")
 
 
 # ============================================================
@@ -1344,15 +1731,6 @@ def main():
         edge_right_point,
         indices_sorted,
         vox,
-
-        # BBOX mesh results
-        vertices_bbox,
-        hexes_bbox,
-        slice_to_eids_bbox,
-        z_slices_bbox,
-        indices_bbox_sorted, # for BBOX debug export
-        vox_bbox,            # for BBOX debug export
-        vertex_index_map_bbox,
     ) = generate_global_cubic_hex_mesh(
         args.input_stl,
         args.cube_size,
@@ -1369,7 +1747,7 @@ def main():
         hexes,
         slice_to_eids,
         z_slices,
-        shrinkage_curve=[1],
+        shrinkage_curve=[5, 4, 3, 2, 1],
         cure_shrink_per_unit=0.05,  # 3%
         output_stride=args.output_stride,
     )
@@ -1377,6 +1755,10 @@ def main():
     # 3) Optional run + PyGeM FFD deformation + lattice export
     if args.run_ccx:
         ok = run_calculix(utd_job, ccx_cmd=args.ccx_cmd)
+        if not ok:
+            log("[RUN] UTD job failed, skipping FFD.")
+            return
+
         # Read last-step displacements from FRD
         frd_path = utd_job + ".frd"
         disp = read_ccx_frd_last_displacements(frd_path, expected_nodes=len(vertices))
@@ -1392,7 +1774,6 @@ def main():
             input_stl=args.input_stl,
             output_stl=out_deformed,
             grid=grid,
-            use_closest_fallback=True,
         )
 
 

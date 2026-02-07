@@ -47,6 +47,8 @@ import trimesh
 import os
 import json
 import numpy as np
+import vtk
+from vtk.util import numpy_support
 
 
 def log(msg):
@@ -1803,25 +1805,27 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world, cyl_params
         log(f"[MC-VOLUME] Wrote pre-TetGen volume slice {slice_idx} STL to: {vol_path}")
 
         # --------- TetGen volumetric mesh for this slice --------------------
-        try:
-            tet = tetgen.TetGen(vol_mesh.vertices, vol_mesh.faces)
-            tet_out = tet.tetrahedralize(
-                # order=2,
-                # mindihedral=10,
-                # minratio=1.5,
-                # steinerleft=-1,
-                quality=False,
-                nobisect=True,
-            )
-            tet_points = np.asarray(tet_out[0], dtype=float)
-            tet_elements = np.asarray(tet_out[1], dtype=int)
-            log(
-                f"[MC-TETGEN] Slice {slice_idx}: "
-                f"{tet_points.shape[0]} nodes, {tet_elements.shape[0]} tets"
-            )
-        except Exception as e:
-            log(f"[MC-TETGEN] TetGen tetrahedralize() failed on slice {slice_idx}: {e}")
-            continue
+        # try:
+        tet = tetgen.TetGen(vol_mesh.vertices, vol_mesh.faces)
+        tet_out = tet.tetrahedralize(
+            # order=2,
+            # mindihedral=10,
+            # minratio=1.5,
+            # steinerleft=-1,
+            quality=False,
+            nobisect=True,
+        )
+        tet_points = np.asarray(tet_out[0], dtype=float)
+        tet_elements = np.asarray(tet_out[1], dtype=int)
+        VH_tet_points = tet.grid.points
+        VH_tet_elements = tet.grid.cells
+        log(
+            f"[MC-TETGEN] Slice {slice_idx}: "
+            f"{tet_points.shape[0]} nodes, {tet_elements.shape[0]} tets"
+        )
+        # except Exception as e:
+        #     log(f"[MC-TETGEN] TetGen tetrahedralize() failed on slice {slice_idx}: {e}")
+        #     continue
 
         # Build unique edges from local tets (for per-slice PLY)
         edges_set: set[tuple[int, int]] = set()
@@ -1861,7 +1865,7 @@ def export_mc_slices_as_stl(args, indices_sorted, vox, mc_mesh_world, cyl_params
             eid = len(global_elements)
             slice_to_tet_eids[slice_idx].append(eid)
 
-    return global_vertices, global_elements, slice_to_tet_eids, slice_to_side_surface_points_world
+    return global_vertices, global_elements, slice_to_tet_eids, slice_to_side_surface_points_world, VH_tet_points, VH_tet_elements
 
 
 def write_layer_displacements_json(
@@ -1900,6 +1904,380 @@ def write_layer_displacements_json(
 
     log(f"[LAYER-DISP] Wrote JSON: {out_path} (layers={len(layers_json)})")
 
+
+def build_cell_locator(ug: vtk.vtkUnstructuredGrid):
+    """
+    Fast point->containing-cell queries.
+    """
+    loc = vtk.vtkCellLocator()
+    loc.SetDataSet(ug)
+    loc.BuildLocator()
+    return loc
+
+
+def read_ccx_frd_displacements(vtk_grid, frd_path: str):
+    """
+    Robust CCX FRD DISP reader:
+    - finds the LAST '-4  DISP' block
+    - parses each '-1' line as: node_id + 3 floats (spacing may be missing)
+    """
+    float_re = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[Ee][-+]?\d+)?")
+
+    in_disp = False
+    disp_last = {}
+
+    with open(frd_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            u = line.upper()
+
+            if u.startswith(" -4") and "DISP" in u:
+                in_disp = True
+                disp_last = {}      # start new block; keep the last one
+                continue
+
+            if in_disp and u.strip().startswith("-3"):
+                in_disp = False
+                continue
+
+            if not in_disp:
+                continue
+
+            # data lines begin with -1
+            if not line.lstrip().startswith("-1"):
+                continue
+
+            # split off the leading "-1" and grab node id + remainder
+            # Example: "-1      1562-4.05E-01 2.48E-01-3.22E-01"
+            m = re.match(r"^\s*-1\s*(\d+)\s*(.*)$", line)
+            if not m:
+                continue
+
+            nid = int(m.group(1))
+            tail = m.group(2)
+
+            nums = float_re.findall(tail)
+            if len(nums) < 3:
+                continue
+
+            ux, uy, uz = map(float, nums[:3])
+            disp_last[nid] = np.array([ux, uy, uz], dtype=float)
+
+    if not disp_last:
+        raise RuntimeError(f"No DISP block parsed from FRD: {frd_path}")
+
+    print("[CHK] ug points:", vtk_grid.GetNumberOfPoints())
+    print("[CHK] disp entries:", len(disp_last))
+    print("[CHK] disp id range:", min(disp_last), max(disp_last))
+    # how many nodes are missing?
+    missing = 0
+    for pid in range(vtk_grid.GetNumberOfPoints()):
+        if (pid+1) not in disp_last:
+            missing += 1
+    print("[CHK] missing disp for nodes:", missing)
+
+    return disp_last
+
+
+def interpolate_displacement_at_point(
+    ug: vtk.vtkUnstructuredGrid,
+    locator: vtk.vtkCellLocator,
+    disp_by_nid: dict,
+    p: np.ndarray,
+):
+    """
+    Find containing tet for point p, compute linear-tet weights, return interpolated displacement.
+
+    Returns:
+      u (np.ndarray shape (3,)) if inside some tet
+      None if not found / outside
+    """
+    # Find closest cell candidate first
+    closest_point = [0.0, 0.0, 0.0]
+    cell_id = vtk.reference(0)
+    sub_id = vtk.reference(0)
+    dist2 = vtk.reference(0.0)
+
+    locator.FindClosestPoint(p.tolist(), closest_point, cell_id, sub_id, dist2)
+
+    cid = int(cell_id)
+    if cid < 0:
+        return None
+
+    cell = ug.GetCell(cid)  # should be vtkTetra
+    if cell.GetNumberOfPoints() != 4:
+        return None
+
+    # EvaluatePosition gives us:
+    # - inside/outside
+    # - param coords (unused)
+    # - interpolation weights for the 4 vertices (these are the C3D4 shape functions)
+    closest = [0.0, 0.0, 0.0]
+    pcoords = [0.0, 0.0, 0.0]
+    weights = [0.0] * 4
+    dist2_eval = vtk.reference(0.0)
+
+    inside = cell.EvaluatePosition(p.tolist(), closest, sub_id, pcoords, dist2_eval, weights)
+    if inside != 1:
+        return None
+
+    # Map weights to displacement via node ids.
+    # IMPORTANT: your disp dict is 1-based node ids; VTK points are 0-based.
+    u = np.zeros(3, dtype=float)
+    for local_i in range(4):
+        pid0 = int(cell.GetPointId(local_i))        # 0-based
+        nid1 = pid0 + 1                             # 1-based (CCX)
+        if nid1 not in disp_by_nid:
+            # If your FRD doesn't include all nodes, treat missing as zero
+            continue
+        u += float(weights[local_i]) * disp_by_nid[nid1]
+
+    return u
+
+
+def deform_stl_by_tet_field(
+    stl_in: str,
+    stl_out: str,
+    ug: vtk.vtkUnstructuredGrid,
+    disp_by_nid: dict,
+    scale: float = 1.0,
+    outside_mode: str = "keep",  # "keep" or "nearest"
+):
+    """
+    Deform STL vertices by interpolating displacements from tet mesh.
+
+    outside_mode:
+      - "keep": if vertex is outside tet mesh -> no displacement
+      - "nearest": if outside -> use displacement of closest tet cell (still via closest cell weights, but clamped)
+                   (more aggressive; may distort edges)
+    """
+    locator = build_cell_locator(ug)
+
+    reader = vtk.vtkSTLReader()
+    reader.SetFileName(stl_in)
+    reader.Update()
+    poly = reader.GetOutput()
+
+    pts = poly.GetPoints()
+    n = pts.GetNumberOfPoints()
+
+    new_pts = vtk.vtkPoints()
+    new_pts.SetNumberOfPoints(n)
+
+    missed = 0
+    for i in range(n):
+        x, y, z = pts.GetPoint(i)
+        p = np.array([x, y, z], dtype=float)
+
+        u = interpolate_displacement_at_point(ug, locator, disp_by_nid, p)
+        if u is None:
+            missed += 1
+            if outside_mode == "keep":
+                new_pts.SetPoint(i, x, y, z)
+                continue
+            elif outside_mode == "nearest":
+                # fallback: just use closest-point cell weights even if outside
+                # (we already used closest cell; re-evaluate weights; if still fails, keep)
+                u = np.zeros(3, dtype=float)
+                # brute: use closest cell without inside test
+                closest_point = [0.0, 0.0, 0.0]
+                cell_id = vtk.reference(0)
+                sub_id = vtk.reference(0)
+                dist2 = vtk.reference(0.0)
+                locator.FindClosestPoint(p.tolist(), closest_point, cell_id, sub_id, dist2)
+                cid = int(cell_id)
+                if cid >= 0:
+                    cell = ug.GetCell(cid)
+                    # Use the closest point on the cell for stable weights
+                    q = np.array(closest_point, dtype=float)
+                    closest = [0.0, 0.0, 0.0]
+                    pcoords = [0.0, 0.0, 0.0]
+                    weights = [0.0] * 4
+                    dist2_eval = vtk.reference(0.0)
+                    inside2 = cell.EvaluatePosition(q.tolist(), closest, sub_id, pcoords, dist2_eval, weights)
+                    if cell.GetNumberOfPoints() == 4:
+                        for local_i in range(4):
+                            pid0 = int(cell.GetPointId(local_i))
+                            nid1 = pid0 + 1
+                            if nid1 in disp_by_nid:
+                                u += float(weights[local_i]) * disp_by_nid[nid1]
+                    new_pts.SetPoint(i, *(p + scale * u))
+                    continue
+
+                new_pts.SetPoint(i, x, y, z)
+                continue
+            else:
+                raise ValueError("outside_mode must be 'keep' or 'nearest'")
+
+        new_pts.SetPoint(i, *(p + scale * u))
+
+    out_poly = vtk.vtkPolyData()
+    out_poly.ShallowCopy(poly)
+    out_poly.SetPoints(new_pts)
+
+    writer = vtk.vtkSTLWriter()
+    writer.SetFileName(stl_out)
+    writer.SetInputData(out_poly)
+    writer.SetFileTypeToBinary()
+    writer.Write()
+
+    print(f"[DEFORM] STL verts={n}, missed(outside)={missed} ({missed/max(1,n)*100:.2f}%)")
+    print(f"[DEFORM] wrote: {stl_out}")
+
+
+def vtk_grid_from_tetgen(grid_points, grid_cells) -> vtk.vtkUnstructuredGrid:
+    """
+    Accepts:
+      - tetgen.TetGen object (has .tetrahedralize() or .grid)
+      - pyvista.UnstructuredGrid-like (has .points and .cells)
+
+    Returns: vtk.vtkUnstructuredGrid with VTKTETRA cells
+    """
+    print("vh1")
+    # pts = np.asarray(grid_points, dtype=float)
+    # cells = np.asarray(grid_cells, dtype=np.int64)
+    pts = grid_points
+    cells = grid_cells
+
+    # Convert PyVista cell buffer: [4, a,b,c,d, 4, a,b,c,d, ...]
+    tet_conn = []
+    i = 0
+    while i < len(cells):
+        # n = int(cells[i])
+        # if n != 4:
+        #     raise ValueError(f"Non-tet cell encountered (n={n}). Need pure tetra mesh.")
+        a, b, c, d = cells[i]
+        tet_conn.append((a, b, c, d))
+        i += 1 + 4
+
+    print("vh2")
+    # VTK points
+    vtk_pts = vtk.vtkPoints()
+    vtk_pts.SetData(numpy_support.numpy_to_vtk(pts, deep=True))
+
+    # VTK cells
+    ug = vtk.vtkUnstructuredGrid()
+    ug.SetPoints(vtk_pts)
+
+    print("vh3")
+    # Insert tetra cells
+    for (a, b, c, d) in tet_conn:
+        tet = vtk.vtkTetra()
+        tet.GetPointIds().SetId(0, a)
+        tet.GetPointIds().SetId(1, b)
+        tet.GetPointIds().SetId(2, c)
+        tet.GetPointIds().SetId(3, d)
+        ug.InsertNextCell(tet.GetCellType(), tet.GetPointIds())
+
+    print("vh4")
+    ug.Modified()      # let VTK know cells/points changed
+    print("vh5")
+    # ug.BuildLinks()    # optional but useful for some queries
+    print("vh6")
+    return ug
+
+
+def _ensure_dir(path: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+def write_ply_points(path: str, points_xyz: np.ndarray):
+    """
+    Write a point-cloud PLY (ASCII) with vertex positions only.
+    """
+    _ensure_dir(path)
+    pts = np.asarray(points_xyz, dtype=float)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {len(pts)}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("end_header\n")
+        for x, y, z in pts:
+            f.write(f"{x:.6f} {y:.6f} {z:.6f}\n")
+
+
+def write_ply_vector_lines(path: str, p0: np.ndarray, p1: np.ndarray):
+    """
+    Write a PLY with 2*N vertices (p0 then p1) and N line edges connecting (2*i)->(2*i+1).
+    Great for visualizing displacement vectors.
+    """
+    _ensure_dir(path)
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    assert p0.shape == p1.shape and p0.ndim == 2 and p0.shape[1] == 3
+
+    n = p0.shape[0]
+    verts = np.vstack([p0, p1])  # 2N x 3
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {2*n}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write(f"element edge {n}\n")
+        f.write("property int vertex1\nproperty int vertex2\n")
+        f.write("end_header\n")
+
+        for x, y, z in verts:
+            f.write(f"{x:.6f} {y:.6f} {z:.6f}\n")
+
+        # edges connect i -> i+n (i.e. pre -> post)
+        for i in range(n):
+            f.write(f"{i} {i+n}\n")
+
+def export_tet_displacement_debug(
+    ug: vtk.vtkUnstructuredGrid,
+    disp_by_nid: dict,
+    out_prefix: str = "DEBUG/tet",
+    scale: float = 1.0,
+    stride: int = 1,
+):
+    """
+    Exports PLY debug artifacts for tet nodal displacement field.
+
+    - Uses ug points as pre positions.
+    - Uses disp_by_nid[nid] where nid = pid+1 (CCX 1-based).
+    - Writes vector lines (pre->post) for a subset of nodes.
+
+    stride: additionally downsample nodes (1 = all)
+    """
+    npts = ug.GetNumberOfPoints()
+    pre = np.zeros((npts, 3), dtype=float)
+    post = np.zeros((npts, 3), dtype=float)
+    mag = np.zeros((npts,), dtype=float)
+
+    missing = 0
+    for pid in range(npts):
+        x, y, z = ug.GetPoint(pid)
+        pre[pid] = (x, y, z)
+        nid = pid + 1
+        d = disp_by_nid.get(nid)
+        if d is None:
+            missing += 1
+            d = np.zeros(3, dtype=float)
+        post[pid] = pre[pid] + scale * np.asarray(d, dtype=float)
+        mag[pid] = float(np.linalg.norm(d))
+
+    print(f"[DBG] Tet nodes: {npts}, missing disp entries: {missing}")
+    print(f"[DBG] Disp magnitude: min={mag.min():.6e} max={mag.max():.6e} mean={mag.mean():.6e}")
+
+    # Choose nodes to export: take largest displacements first (more informative)
+    idx = np.argsort(-mag)
+
+    # downsample
+    if stride > 1:
+        idx = idx[::stride]
+
+    pre_sel = pre[idx]
+    post_sel = post[idx]
+
+    write_ply_points(out_prefix + "_nodes_pre.ply", pre_sel)
+    write_ply_points(out_prefix + "_nodes_post.ply", post_sel)
+    write_ply_vector_lines(out_prefix + "_disp_vectors.ply", pre_sel, post_sel)
+
+    # Extra: print bbox so you can see if “half” is outside / zero
+    mn = pre_sel.min(axis=0); mx = pre_sel.max(axis=0)
+    print(f"[DBG] Exported vectors: {len(idx)}")
+    print(f"[DBG] Export bbox (pre): min={mn}, max={mx}")
 
 
 # ============================================================
@@ -2002,7 +2380,7 @@ def main():
     )
     export_slices_as_stl(args, vertices, slice_to_eids, hexes)  # optional hex debug
 
-    tet_vertices, tet_elements, tet_slice_to_eids, slice_to_side_surface_pts = export_mc_slices_as_stl(
+    tet_vertices, tet_elements, tet_slice_to_eids, slice_to_side_surface_pts, VH_tet_points, VH_tet_elements = export_mc_slices_as_stl(
         args, indices_sorted, vox, mc_mesh_world, cyl_params
     )
 
@@ -2029,8 +2407,8 @@ def main():
         tet_elements,
         tet_slice_to_eids,
         z_slices,
-        shrinkage_curve=[5, 4, 3, 2, 1],
-        cure_shrink_per_unit=0.5,  # 3%
+        shrinkage_curve=[1],
+        cure_shrink_per_unit=0.1,  # 3%
         cyl_params=cyl_params,
         cube_size=args.cube_size,
         output_stride=args.output_stride,
@@ -2043,6 +2421,31 @@ def main():
             log("[RUN] UTD job failed, skipping FFD.")
             return
         
+        vtk_grid = vtk_grid_from_tetgen(tet_vertices, tet_elements)
+        print(f"{vtk_grid}")
+        displacements = read_ccx_frd_displacements(vtk_grid, f"{utd_job}.frd")
+        print(f"{displacements}")
+
+        export_tet_displacement_debug(
+            vtk_grid,
+            displacements,
+            out_prefix="DEBUG/tet",
+            scale=1.0,
+            stride=1,
+        )
+
+        deform_stl_by_tet_field(
+            args.input_stl,
+            f"{out_dir}/deformed_stl.stl",
+            vtk_grid,
+            displacements,
+            scale=1.0,
+            outside_mode="keep"
+        )
+        return
+
+
+
         frd_path = utd_job + ".frd"
         disp = read_frd_displacements(frd_path)
 
